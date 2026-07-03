@@ -2748,7 +2748,7 @@ function App() {
           <div className="flex w-full flex-col gap-3 px-4 py-3 sm:px-6">
             <div className="grid gap-3 xl:grid-cols-[1fr_auto_1fr] xl:items-center">
               <div className="min-w-0">
-                <h1 className="text-xl font-semibold tracking-normal">NewsLabs</h1>
+                <h1 className="text-xl font-semibold tracking-normal">News Labs Company</h1>
               </div>
               <nav aria-label="News categories" className="flex flex-wrap items-center justify-center gap-1 sm:gap-3">
                 {clientTopCategories.map((category) => (
@@ -3267,7 +3267,7 @@ function App() {
         <div className="flex w-full flex-col gap-3 px-4 py-3 sm:px-6">
           <div className="grid gap-3 xl:grid-cols-[1fr_auto_1fr] xl:items-center">
             <div className="min-w-0">
-              <h1 className="text-xl font-semibold tracking-normal">NewsLabs</h1>
+              <h1 className="text-xl font-semibold tracking-normal">News Labs Company</h1>
               <p className="text-sm text-muted-foreground">
                 Market news dashboard
               </p>
