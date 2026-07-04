@@ -28,3 +28,21 @@ Prefer `SUPABASE_SERVICE_ROLE_KEY` only for this local backend proxy. Do not exp
 Run [`supabase/schema.sql`](./supabase/schema.sql) in the Supabase SQL editor. It creates `public.market_news_articles` with normalized columns and a `raw_json` JSONB column for the full provider payload.
 
 The current SQL allows writes with the publishable key so the local dashboard can save articles immediately. For a production backend, prefer a service-role key on the server and remove the anon write policies.
+
+## Cloudflare Pages
+
+Cloudflare Pages serves the Vite build as a static site, so the local Vite proxy in [`vite.config.ts`](./vite.config.ts) does not run there. This repo includes Pages Functions for the Supabase article routes:
+
+- `GET /api/articles/saved`
+- `POST /api/articles/save`
+- `PUT /api/articles/saved/:id`
+- `DELETE /api/articles/saved/:id`
+
+Add these variables in **Cloudflare Pages > Settings > Environment variables** for Production and Preview:
+
+```env
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+```
+
+Use `SUPABASE_ANON_KEY` only if you intentionally want the anon policies in [`supabase/schema.sql`](./supabase/schema.sql) to handle writes. Keep `SUPABASE_SERVICE_ROLE_KEY` only in Cloudflare/server-side environments, never in frontend `VITE_` variables.

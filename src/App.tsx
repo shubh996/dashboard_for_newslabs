@@ -5,7 +5,6 @@ import {
   Bookmark,
   CalendarClock,
   Check,
-  CircleUserRound,
   Database,
   ExternalLink,
   FileJson,
@@ -158,6 +157,22 @@ type ClientRailView = 'latest' | 'search' | 'bookmarks' | 'liked' | 'reported'
 type DashboardCategoryId = 'all-us' | 'ai-infra' | 'digital-assets' | 'power-grid' | 'mega-cap' | 'wall-street' | 'health-innovation'
 type TradeDestination = 'trading212' | 'robinhood' | 'tradingview'
 type AiDestination = 'perplexity' | 'chatgpt' | 'grok' | 'gemini'
+type StockAnalysisDestination = 'tradingview' | 'yahoo-finance'
+type ApiCallStatus = 'pending' | 'success' | 'error'
+
+type ApiCallLog = {
+  id: string
+  method: string
+  url: string
+  status: ApiCallStatus
+  startedAt: string
+  durationMs?: number
+  httpStatus?: number
+  ok?: boolean
+  requestBodyPreview?: string
+  responsePreview?: string
+  error?: string
+}
 
 const providers: Array<{ id: ProviderId; label: string; hint: string }> = [
   
@@ -207,6 +222,11 @@ const aiDestinations: Array<{ id: AiDestination; label: string }> = [
   { id: 'chatgpt', label: 'ChatGPT' },
   { id: 'grok', label: 'Grok' },
   { id: 'gemini', label: 'Gemini' },
+]
+
+const stockAnalysisDestinations: Array<{ id: StockAnalysisDestination; label: string }> = [
+  { id: 'tradingview', label: 'TradingView' },
+  { id: 'yahoo-finance', label: 'Yahoo Finance' },
 ]
 
 const previewMinWidth = 380
@@ -419,6 +439,23 @@ const tradingViewSymbolOverrides: Record<string, string> = {
   SPY: 'AMEX:SPY',
 }
 
+const yahooFinanceSymbolOverrides: Record<string, string> = {
+  '^DJI': '^DJI',
+  '^GSPC': '^GSPC',
+  '^IXIC': '^IXIC',
+  '^NDX': '^NDX',
+  '^NYA': '^NYA',
+  '^RUT': '^RUT',
+  '^SPX': '^GSPC',
+  DJI: '^DJI',
+  GSPC: '^GSPC',
+  IXIC: '^IXIC',
+  NDX: '^NDX',
+  NYA: '^NYA',
+  RUT: '^RUT',
+  SPX: '^GSPC',
+}
+
 function cleanArticleImageUrl(value: string) {
   const imageUrl = value.trim()
   if (!imageUrl) return ''
@@ -491,6 +528,18 @@ function tradingViewSymbolPageUrl(ticker: string) {
   return `https://www.tradingview.com/symbols/${tradingViewSymbol(ticker).replace(':', '-')}/`
 }
 
+function yahooFinanceSymbol(ticker: string) {
+  const cleanTicker = ticker.trim().toUpperCase()
+  const symbol = cleanTicker.includes(':') ? cleanTicker.split(':').pop() || cleanTicker : cleanTicker
+  const displaySymbol = displayTicker(symbol)
+  return yahooFinanceSymbolOverrides[symbol] ?? yahooFinanceSymbolOverrides[displaySymbol] ?? displaySymbol.replace(/_/g, '-')
+}
+
+function yahooFinanceSymbolUrl(ticker: string) {
+  const symbol = yahooFinanceSymbol(ticker)
+  return `https://finance.yahoo.com/quote/${encodeURIComponent(symbol)}/`
+}
+
 function trading212InstrumentUrl(ticker: string) {
   const symbol = displayTicker(ticker).replace(/_/g, '.')
   return `https://www.trading212.com/trading-instruments/invest/${encodeURIComponent(symbol)}`
@@ -505,6 +554,11 @@ function tradeDestinationUrl(ticker: string, destination: TradeDestination) {
   if (destination === 'robinhood') return robinhoodInstrumentUrl(ticker)
   if (destination === 'tradingview') return tradingViewSymbolPageUrl(ticker)
   return trading212InstrumentUrl(ticker)
+}
+
+function stockAnalysisDestinationUrl(ticker: string, destination: StockAnalysisDestination) {
+  if (destination === 'yahoo-finance') return yahooFinanceSymbolUrl(ticker)
+  return tradingViewSymbolPageUrl(ticker)
 }
 
 function destinationLabel<T extends string>(items: Array<{ id: T; label: string }>, id: T) {
@@ -1013,6 +1067,46 @@ function articleStorageKey(article: Pick<NewsArticle, 'url'> | null | undefined)
   return article?.url?.trim().toLowerCase() || ''
 }
 
+function tickerMatchKey(ticker: string) {
+  return displayTicker(ticker).replace(/[^A-Z0-9]/g, '')
+}
+
+function articleMatchesLinkedTickers(article: NewsArticle, linkedTickerKeys: Set<string>) {
+  return article.tickers.some((ticker) => linkedTickerKeys.has(tickerMatchKey(ticker)))
+}
+
+function truncateApiPreview(value: string) {
+  return value.length > 2500 ? `${value.slice(0, 2500)}...` : value
+}
+
+function formatApiPreview(value: string) {
+  if (!value.trim()) return ''
+
+  try {
+    return truncateApiPreview(JSON.stringify(JSON.parse(value), null, 2))
+  } catch {
+    return truncateApiPreview(value)
+  }
+}
+
+function apiRequestBodyPreview(body: BodyInit | null | undefined) {
+  if (!body) return ''
+  if (typeof body === 'string') return truncateApiPreview(body)
+  if (body instanceof URLSearchParams) return truncateApiPreview(body.toString())
+  if (body instanceof FormData) return '[FormData]'
+  if (body instanceof Blob) return `[Blob ${body.size} bytes]`
+  return `[${body.constructor.name}]`
+}
+
+function apiUrlLabel(value: string) {
+  try {
+    const url = new URL(value, window.location.origin)
+    return `${url.pathname}${url.search}`
+  } catch {
+    return value
+  }
+}
+
 function isTextEntryTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) return false
   const tagName = target.tagName.toLowerCase()
@@ -1051,9 +1145,18 @@ function App() {
   const [showNormalizedJson, setShowNormalizedJson] = useState(false)
   const [articleEditMode, setArticleEditMode] = useState(false)
   const [editingTickerIndex, setEditingTickerIndex] = useState<number | null>(null)
+  const [apiDebugPanelOpen, setApiDebugPanelOpen] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem('newslabs-api-debug-panel') === 'true'
+  })
+  const [apiCallLogs, setApiCallLogs] = useState<ApiCallLog[]>([])
   const [marketNews, setMarketNews] = useState<NewsArticle[]>([])
   const [marketNewsLoading, setMarketNewsLoading] = useState(false)
   const [marketNewsError, setMarketNewsError] = useState('')
+  const [linkedStoryNewsStoryKey, setLinkedStoryNewsStoryKey] = useState('')
+  const [linkedStoryNews, setLinkedStoryNews] = useState<NewsArticle[]>([])
+  const [linkedStoryNewsLoading, setLinkedStoryNewsLoading] = useState(false)
+  const [linkedStoryNewsError, setLinkedStoryNewsError] = useState('')
   const [momentumPoints, setMomentumPoints] = useState<MomentumPoint[]>([])
   const [momentumLoading, setMomentumLoading] = useState(false)
   const [momentumError, setMomentumError] = useState('')
@@ -1078,6 +1181,11 @@ function App() {
     if (typeof window === 'undefined') return 'perplexity'
     const stored = window.localStorage.getItem('newslabs-ai-destination')
     return aiDestinations.some((item) => item.id === stored) ? stored as AiDestination : 'perplexity'
+  })
+  const [stockAnalysisDestination, setStockAnalysisDestination] = useState<StockAnalysisDestination>(() => {
+    if (typeof window === 'undefined') return 'tradingview'
+    const stored = window.localStorage.getItem('newslabs-stock-analysis-destination')
+    return stockAnalysisDestinations.some((item) => item.id === stored) ? stored as StockAnalysisDestination : 'tradingview'
   })
   const [previewWidth, setPreviewWidth] = useState(() => {
     if (typeof window === 'undefined') return 520
@@ -1151,6 +1259,64 @@ function App() {
     save: () => {},
     update: () => {},
   })
+
+  const trackedFetch = useCallback(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const startedAtMs = Date.now()
+    const id = `${startedAtMs}-${Math.random().toString(36).slice(2)}`
+    const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase()
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const requestBodyPreview = apiRequestBodyPreview(init?.body ?? null)
+
+    setApiCallLogs((current) => [
+      {
+        id,
+        method,
+        url,
+        status: 'pending' as const,
+        startedAt: new Date(startedAtMs).toISOString(),
+        requestBodyPreview,
+      },
+      ...current,
+    ].slice(0, 80))
+
+    try {
+      const response = await fetch(input, init)
+      let responsePreview = ''
+
+      try {
+        responsePreview = formatApiPreview(await response.clone().text())
+      } catch {
+        responsePreview = '[Unable to read response preview]'
+      }
+
+      setApiCallLogs((current) => current.map((item) => (
+        item.id === id
+          ? {
+              ...item,
+              status: response.ok ? 'success' : 'error',
+              durationMs: Date.now() - startedAtMs,
+              httpStatus: response.status,
+              ok: response.ok,
+              responsePreview,
+            }
+          : item
+      )))
+
+      return response
+    } catch (fetchError) {
+      setApiCallLogs((current) => current.map((item) => (
+        item.id === id
+          ? {
+              ...item,
+              status: 'error',
+              durationMs: Date.now() - startedAtMs,
+              error: fetchError instanceof Error ? fetchError.message : 'Request failed',
+            }
+          : item
+      )))
+      throw fetchError
+    }
+  }, [])
 
   const selectedArticle = useMemo(() => {
     return data?.articles.find((article) => article.id === selectedId) ?? data?.articles[0] ?? null
@@ -1252,9 +1418,16 @@ function App() {
   const isSavedArticleSelected = savedMode && Boolean(selectedArticle?.savedRowId)
   const selectedSavedMatch = !isSavedArticleSelected && selectedArticle ? savedArticleIndex[articleStorageKey(selectedArticle)] ?? null : null
   const clientTickers = useMemo(() => {
-    if (clientMode && !savedMode) return []
     return uniqueTickerList(selectedArticle?.tickers ?? [])
-  }, [clientMode, savedMode, selectedArticle])
+  }, [selectedArticle])
+  const linkedStoryTickers = useMemo(() => {
+    if (!selectedArticle) return []
+
+    return uniqueTickerList(selectedArticle.tickers)
+  }, [selectedArticle])
+  const linkedStoryRequestKey = selectedArticle
+    ? [selectedArticle.id, selectedArticle.title, selectedArticle.tickers.join('|')].join('|')
+    : ''
   const marketTickers = useMemo(() => {
     return clientTickers.length ? clientTickers : marketFallbackTickers
   }, [clientTickers])
@@ -1363,6 +1536,14 @@ function App() {
   }, [aiDestination])
 
   useEffect(() => {
+    window.localStorage.setItem('newslabs-stock-analysis-destination', stockAnalysisDestination)
+  }, [stockAnalysisDestination])
+
+  useEffect(() => {
+    window.localStorage.setItem('newslabs-api-debug-panel', String(apiDebugPanelOpen))
+  }, [apiDebugPanelOpen])
+
+  useEffect(() => {
     if (!clientMode || activeClientCategory === 'all') return
     if (!clientArticles.length) return
     if (selectedId && clientArticles.some((article) => article.id === selectedId)) return
@@ -1402,7 +1583,7 @@ function App() {
               query: ticker,
               limit: showingAllMarketTickers ? '6' : '50',
             })
-            const response = await fetch(`/api/providers/yahoo-finance/news?${params}`, {
+            const response = await trackedFetch(`/api/providers/yahoo-finance/news?${params}`, {
               signal: controller.signal,
             })
             const body = await response.json()
@@ -1436,7 +1617,39 @@ function App() {
     void fetchMarketNews()
 
     return () => controller.abort()
-  }, [activeMarketTickerValue, marketTickers, showingAllMarketTickers])
+  }, [activeMarketTickerValue, marketTickers, showingAllMarketTickers, trackedFetch])
+
+  useEffect(() => {
+    const requestKey = linkedStoryRequestKey
+
+    if (!requestKey || !selectedArticle || !linkedStoryTickers.length) {
+      setLinkedStoryNewsStoryKey('')
+      setLinkedStoryNews([])
+      setLinkedStoryNewsError('')
+      setLinkedStoryNewsLoading(false)
+      return
+    }
+
+    setLinkedStoryNewsStoryKey(requestKey)
+    setLinkedStoryNewsLoading(false)
+    setLinkedStoryNewsError('')
+
+    const linkedTickerKeys = new Set(linkedStoryTickers.map(tickerMatchKey).filter(Boolean))
+    const selectedUrlKey = articleStorageKey(selectedArticle)
+    const seen = new Set<string>()
+    const platformArticles = data?.articles ?? []
+    const articles = platformArticles
+      .filter((article) => article.id !== selectedArticle.id && articleStorageKey(article) !== selectedUrlKey)
+      .filter((article) => articleMatchesLinkedTickers(article, linkedTickerKeys))
+      .filter((article) => {
+        const key = articleStorageKey(article) || article.id
+        if (!key || seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    setLinkedStoryNews(articles)
+  }, [data, linkedStoryRequestKey, linkedStoryTickers, selectedArticle])
 
   useEffect(() => {
     if (showingAllMarketTickers || !activeMarketTickerValue) {
@@ -1456,7 +1669,7 @@ function App() {
           query: activeMarketTickerValue,
           days: '30',
         })
-        const response = await fetch(`/api/market/momentum?${params}`, {
+        const response = await trackedFetch(`/api/market/momentum?${params}`, {
           signal: controller.signal,
         })
         const body = await response.json()
@@ -1478,7 +1691,7 @@ function App() {
     void fetchMomentum()
 
     return () => controller.abort()
-  }, [activeMarketTickerValue, showingAllMarketTickers])
+  }, [activeMarketTickerValue, showingAllMarketTickers, trackedFetch])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1491,7 +1704,7 @@ function App() {
           query: socialQuery,
           limit: '20',
         })
-        const response = await fetch(`/api/social/x?${params}`, {
+        const response = await trackedFetch(`/api/social/x?${params}`, {
           signal: controller.signal,
         })
         const body = await response.json()
@@ -1516,7 +1729,7 @@ function App() {
     void fetchSocialPosts()
 
     return () => controller.abort()
-  }, [socialQuery])
+  }, [socialQuery, trackedFetch])
 
   useEffect(() => {
     if (!clientMode) return
@@ -1704,7 +1917,7 @@ function App() {
         query: effectiveQuery,
         limit: String(limitRef.current),
       })
-      const response = await fetch(`/api/providers/${nextProvider}/news?${params}`)
+      const response = await trackedFetch(`/api/providers/${nextProvider}/news?${params}`)
       const body = await response.json()
 
       if (!response.ok) {
@@ -1722,7 +1935,7 @@ function App() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [trackedFetch])
 
   async function fetchSavedArticles() {
     setLoading(true)
@@ -1733,7 +1946,7 @@ function App() {
       const params = new URLSearchParams({
         limit: String(Math.max(limitRef.current, 50)),
       })
-      const response = await fetch(`/api/articles/saved?${params}`)
+      const response = await trackedFetch(`/api/articles/saved?${params}`)
       const body = await response.json()
 
       if (!response.ok) {
@@ -1766,7 +1979,7 @@ function App() {
       const params = new URLSearchParams({
         limit: '500',
       })
-      const response = await fetch(`/api/articles/saved?${params}`)
+      const response = await trackedFetch(`/api/articles/saved?${params}`)
       const body = await response.json()
 
       if (!response.ok) {
@@ -1824,7 +2037,7 @@ function App() {
     setSaveMessage('')
 
     try {
-      const response = await fetch('/api/articles/save', {
+      const response = await trackedFetch('/api/articles/save', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ article: editedArticleDraft(selectedArticle) }),
@@ -1854,7 +2067,7 @@ function App() {
     const article = editedArticleDraft(selectedArticle)
 
     try {
-      const response = await fetch(`/api/articles/saved/${selectedArticle.savedRowId}`, {
+      const response = await trackedFetch(`/api/articles/saved/${selectedArticle.savedRowId}`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ article }),
@@ -1891,7 +2104,7 @@ function App() {
     setSaveMessage('')
 
     try {
-      const response = await fetch(`/api/articles/saved/${savedRowId}`, {
+      const response = await trackedFetch(`/api/articles/saved/${savedRowId}`, {
         method: 'DELETE',
       })
       const body = await response.json()
@@ -2332,6 +2545,35 @@ function App() {
               onCheckedChange={setClientModeRoute}
             />
           </div>
+          <div className="flex items-center justify-between gap-3 px-2 py-2">
+            <Label htmlFor="api-debug-toggle" className="text-sm">
+              API debug column
+            </Label>
+            <Switch
+              id="api-debug-toggle"
+              checked={apiDebugPanelOpen}
+              onCheckedChange={setApiDebugPanelOpen}
+            />
+          </div>
+          <DropdownMenuSeparator />
+          <div className="space-y-2 px-2 py-2">
+            <div className="text-sm font-medium">Analyze stocks in</div>
+            <div className="grid grid-cols-2 gap-2">
+              {stockAnalysisDestinations.map((destination) => (
+                <Button
+                  key={destination.id}
+                  className="justify-between"
+                  onClick={() => setStockAnalysisDestination(destination.id)}
+                  size="sm"
+                  type="button"
+                  variant={stockAnalysisDestination === destination.id ? 'secondary' : 'outline'}
+                >
+                  <span>{destination.label}</span>
+                  {stockAnalysisDestination === destination.id ? <Check className="size-4" /> : null}
+                </Button>
+              ))}
+            </div>
+          </div>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => void fetchSavedArticles()}>
             <Database />
@@ -2339,6 +2581,99 @@ function App() {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+    )
+  }
+
+  function renderApiDebugPanel() {
+    const pendingCount = apiCallLogs.filter((item) => item.status === 'pending').length
+    const errorCount = apiCallLogs.filter((item) => item.status === 'error').length
+
+    return (
+      <Card className="min-h-[520px] overflow-hidden xl:h-full xl:w-[380px] xl:flex-none">
+        <CardHeader className="gap-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <CardTitle className="text-base">API Calls</CardTitle>
+              <CardDescription>
+                {apiCallLogs.length} total · {pendingCount} pending · {errorCount} errors
+              </CardDescription>
+            </div>
+            <Button
+              disabled={!apiCallLogs.length}
+              onClick={() => setApiCallLogs([])}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              Clear
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="p-0">
+          <ScrollArea className="min-h-[430px] xl:h-[calc(100svh-208px)]">
+            <div className="space-y-3 p-4 pt-0">
+              {apiCallLogs.length ? (
+                apiCallLogs.map((call) => (
+                  <div key={call.id} className="rounded-md border bg-muted/10 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <Badge
+                            className={cn(
+                              call.status === 'success' && 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+                              call.status === 'error' && 'border-red-500/40 bg-red-500/15 text-red-700 dark:text-red-300',
+                            )}
+                            variant="outline"
+                          >
+                            {call.status}
+                          </Badge>
+                          <Badge variant="secondary">{call.method}</Badge>
+                          {call.httpStatus ? <Badge variant="outline">{call.httpStatus}</Badge> : null}
+                        </div>
+                        <div className="mt-2 break-all font-mono text-[11px] leading-4 text-foreground">
+                          {apiUrlLabel(call.url)}
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right text-[11px] text-muted-foreground">
+                        <div>{new Date(call.startedAt).toLocaleTimeString()}</div>
+                        {typeof call.durationMs === 'number' ? <div>{call.durationMs} ms</div> : null}
+                      </div>
+                    </div>
+
+                    {call.requestBodyPreview ? (
+                      <details className="mt-3">
+                        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">Request</summary>
+                        <pre className="mt-2 max-h-44 overflow-auto rounded-md bg-background p-2 text-[11px] leading-4 text-muted-foreground">
+                          {call.requestBodyPreview}
+                        </pre>
+                      </details>
+                    ) : null}
+
+                    {call.responsePreview ? (
+                      <details className="mt-3">
+                        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">Response</summary>
+                        <pre className="mt-2 max-h-64 overflow-auto rounded-md bg-background p-2 text-[11px] leading-4 text-muted-foreground">
+                          {call.responsePreview}
+                        </pre>
+                      </details>
+                    ) : null}
+
+                    {call.error ? (
+                      <div className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">
+                        {call.error}
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-md border p-4 text-sm text-muted-foreground">
+                  No API calls yet.
+                </div>
+              )}
+            </div>
+          </ScrollArea>
+        </CardContent>
+      </Card>
     )
   }
 
@@ -2358,7 +2693,7 @@ function App() {
     if (marketNewsLoading || momentumLoading) {
       return (
         <div className="space-y-4 px-4 pb-4 pt-6">
-          <h3 className="px-1 text-base font-semibold tracking-normal">Momentum Timeline</h3>
+          <CardTitle className="text-base">Momentum Timeline</CardTitle>
           <div className="space-y-3">
             {Array.from({ length: 5 }).map((_, index) => (
               <div key={index} className="space-y-2 rounded-md bg-card/40 p-3">
@@ -2375,7 +2710,7 @@ function App() {
     if (marketNewsError || momentumError) {
       return (
         <div className="space-y-4 px-4 pb-4 pt-6">
-          <h3 className="px-1 text-base font-semibold tracking-normal">Momentum Timeline</h3>
+          <CardTitle className="text-base">Momentum Timeline</CardTitle>
           <Alert variant="destructive">
             <AlertCircle />
             <AlertTitle>Momentum</AlertTitle>
@@ -2388,7 +2723,7 @@ function App() {
     if (showingAllMarketTickers) {
       return (
         <div className="space-y-4 px-4 pb-4 pt-6">
-          <h3 className="px-1 text-base font-semibold tracking-normal">Momentum Timeline</h3>
+          <CardTitle className="text-base">Momentum Timeline</CardTitle>
           <div className="rounded-lg border bg-muted/10 p-4">
             <div className="text-sm font-medium text-foreground">Pick a ticker to open its 30-day catalyst trail.</div>
             <p className="mt-1 text-sm text-muted-foreground">
@@ -2416,7 +2751,7 @@ function App() {
     if (!timelineItems.length) {
       return (
         <div className="space-y-4 px-4 pb-4 pt-6">
-          <h3 className="px-1 text-base font-semibold tracking-normal">Momentum Timeline</h3>
+          <CardTitle className="text-base">Momentum Timeline</CardTitle>
           <div className="rounded-lg border p-4 text-sm text-muted-foreground">
             No 30-day close-to-close movement data found for this ticker yet.
           </div>
@@ -2426,7 +2761,7 @@ function App() {
 
     return (
       <div className="space-y-4 px-4 pb-4 pt-6">
-        <h3 className="px-1 text-base font-semibold tracking-normal">Momentum Timeline</h3>
+        <CardTitle className="text-base">Momentum Timeline</CardTitle>
         <div className="relative space-y-0 pl-3 before:absolute before:bottom-0 before:left-[4.8rem] before:top-0 before:w-px before:bg-border">
           {timelineItems.map((point) => {
             const articles = newsByDate[point.date] ?? []
@@ -2484,13 +2819,17 @@ function App() {
   }
 
   function renderLinkedMarketNews() {
-    const visibleNews = sortNewsByLatest(marketNews)
+    const linkedStoryNewsCurrent = linkedStoryNewsStoryKey === linkedStoryRequestKey
+    const visibleNews = linkedStoryNewsCurrent ? sortNewsByLatest(linkedStoryNews) : []
+    const currentLinkedStoryNewsLoading = Boolean(linkedStoryRequestKey) && (!linkedStoryNewsCurrent || linkedStoryNewsLoading)
+    const currentLinkedStoryNewsError = linkedStoryNewsCurrent ? linkedStoryNewsError : ''
 
     return (
       <section className="space-y-3">
         <Separator className="mt-2" />
-        <h3 className="text-base font-semibold tracking-normal">Linked News</h3>
-        {marketNewsLoading ? (
+        
+        <CardTitle className="text-base">Linked News</CardTitle>
+        {currentLinkedStoryNewsLoading ? (
           <div className="space-y-3">
             {Array.from({ length: 6 }).map((_, index) => (
               <div key={index} className="flex gap-3">
@@ -2502,8 +2841,8 @@ function App() {
               </div>
             ))}
           </div>
-        ) : marketNewsError ? (
-          <div className="text-sm text-muted-foreground">{marketNewsError}</div>
+        ) : currentLinkedStoryNewsError ? (
+          <div className="text-sm text-muted-foreground">{currentLinkedStoryNewsError}</div>
         ) : visibleNews.length ? (
           <div className="space-y-3">
             {visibleNews.map((article) => (
@@ -2551,6 +2890,11 @@ function App() {
     className?: string
     scrollClassName?: string
   } = {}) {
+    const stockAnalysisLabel = destinationLabel(stockAnalysisDestinations, stockAnalysisDestination)
+    const stockAnalysisUrl = activeMarketTickerValue
+      ? stockAnalysisDestinationUrl(activeMarketTickerValue, stockAnalysisDestination)
+      : ''
+
     return (
       <Card className={cn('min-h-[520px] overflow-hidden border-0 bg-transparent shadow-none xl:h-full', className)}>
         <CardHeader className="gap-2 px-3 pt-0 sm:px-3">
@@ -2602,14 +2946,15 @@ function App() {
                 <div className="relative px-4">
                   <Button
                     asChild
-                    aria-label={`Open ${displayTicker(activeMarketTickerValue)} on TradingView`}
+                    aria-label={`View ${displayTicker(activeMarketTickerValue)} in ${stockAnalysisLabel}`}
                     className="absolute right-6 top-2 z-10 bg-background/90 shadow-sm backdrop-blur hover:bg-background"
-                    size="icon-sm"
-                    title={`Open ${displayTicker(activeMarketTickerValue)} on TradingView`}
+                    size="sm"
+                    title={`View ${displayTicker(activeMarketTickerValue)} in ${stockAnalysisLabel}`}
                     variant="outline"
                   >
-                    <a href={tradingViewSymbolPageUrl(activeMarketTickerValue)} rel="noreferrer" target="_blank">
+                    <a href={stockAnalysisUrl} rel="noreferrer" target="_blank">
                       <ExternalLink />
+                      View in {stockAnalysisLabel}
                     </a>
                   </Button>
                   <TradingViewComparisonChart
@@ -2623,14 +2968,15 @@ function App() {
                 <div className="relative px-4">
                   <Button
                     asChild
-                    aria-label={`Open ${displayTicker(activeMarketTickerValue)} on TradingView`}
+                    aria-label={`View ${displayTicker(activeMarketTickerValue)} in ${stockAnalysisLabel}`}
                     className="absolute right-6 top-2 z-10 bg-background/90 shadow-sm backdrop-blur hover:bg-background"
-                    size="icon-sm"
-                    title={`Open ${displayTicker(activeMarketTickerValue)} on TradingView`}
+                    size="sm"
+                    title={`View ${displayTicker(activeMarketTickerValue)} in ${stockAnalysisLabel}`}
                     variant="outline"
                   >
-                    <a href={tradingViewSymbolPageUrl(activeMarketTickerValue)} rel="noreferrer" target="_blank">
+                    <a href={stockAnalysisUrl} rel="noreferrer" target="_blank">
                       <ExternalLink />
+                      View in {stockAnalysisLabel}
                     </a>
                   </Button>
                   <TradingViewSymbolOverview
@@ -2772,7 +3118,9 @@ function App() {
                   </Button>
                 ))}
               </nav>
-              <div />
+              <div className="flex items-center justify-start xl:justify-end">
+                {renderSettingsMenu()}
+              </div>
             </div>
           </div>
         </header>
@@ -2828,21 +3176,21 @@ function App() {
                   </span>
                 </Button>
                 <Button
-                  aria-label="Profile"
+                  aria-label="Settings"
                   className={cn(
                     'h-10 w-full justify-start gap-3 overflow-hidden px-2',
                     clientProfilePanelOpen && 'bg-muted text-foreground',
                   )}
-                  title="Profile"
+                  title="Settings"
                   type="button"
                   variant="ghost"
                   onClick={() => setClientProfilePanelOpen(true)}
                 >
-                  <CircleUserRound className="size-4 shrink-0" />
+                  <Settings className="size-4 shrink-0" />
                   <span
                     className="w-0 overflow-hidden whitespace-nowrap text-sm opacity-0 transition-all group-hover:w-32 group-hover:opacity-100"
                   >
-                    Profile
+                    Settings
                   </span>
                 </Button>
               </div>
@@ -2855,7 +3203,7 @@ function App() {
           >
             <CardHeader className="gap-1">
               <CardTitle className="text-base">
-                {clientProfilePanelOpen ? 'Profile' : activeClientRailView === 'search' ? 'Search' : activeClientRailView === 'bookmarks' ? 'Saved' : activeClientRailView === 'liked' ? 'Liked' : activeClientRailView === 'reported' ? 'Reported' : 'Latest'}
+                {clientProfilePanelOpen ? 'Settings' : activeClientRailView === 'search' ? 'Search' : activeClientRailView === 'bookmarks' ? 'Saved' : activeClientRailView === 'liked' ? 'Liked' : activeClientRailView === 'reported' ? 'Reported' : 'Latest'}
               </CardTitle>
               {!clientProfilePanelOpen && activeClientRailView === 'search' ? (
                 <div className="relative pt-2">
@@ -2928,6 +3276,25 @@ function App() {
                           >
                             <span>{destination.label}</span>
                             {tradeDestination === destination.id ? <Check className="size-4" /> : null}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-xs font-medium uppercase text-muted-foreground">Analyze stocks in</div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        {stockAnalysisDestinations.map((destination) => (
+                          <Button
+                            key={destination.id}
+                            className="justify-between"
+                            onClick={() => setStockAnalysisDestination(destination.id)}
+                            size="sm"
+                            type="button"
+                            variant={stockAnalysisDestination === destination.id ? 'secondary' : 'outline'}
+                          >
+                            <span>{destination.label}</span>
+                            {stockAnalysisDestination === destination.id ? <Check className="size-4" /> : null}
                           </Button>
                         ))}
                       </div>
@@ -3251,6 +3618,7 @@ function App() {
             <GripVertical className="size-4" />
           </Button>
           {renderSocialPanel()}
+          {apiDebugPanelOpen ? renderApiDebugPanel() : null}
             </>
           )}
         </section>

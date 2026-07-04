@@ -617,6 +617,11 @@ app.get('/api/providers/:providerId/news', async (request, response) => {
     const providerId = request.params.providerId
     const query = String(request.query.query || '').trim()
     const limit = Math.min(Math.max(Number(request.query.limit || 12), 1), 50)
+    if (providerId === 'yahoo-finance') {
+      response.set('Cache-Control', 'no-store, max-age=0')
+      response.set('Pragma', 'no-cache')
+      response.set('Expires', '0')
+    }
     const result = await getProviderNews(providerId, query, limit)
 
     response.json({
