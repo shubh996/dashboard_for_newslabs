@@ -8,7 +8,19 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': 'http://localhost:3001',
+      // Object form so Yahoo Finance SSE (/api/yahoo/.../stream) is not buffered.
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes) => {
+            if (proxyRes.headers['content-type']?.includes('text/event-stream')) {
+              proxyRes.headers['cache-control'] = 'no-cache, no-transform'
+              proxyRes.headers['x-accel-buffering'] = 'no'
+            }
+          })
+        },
+      },
     },
   },
   resolve: {

@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
 import express from 'express'
 import { createClient } from '@supabase/supabase-js'
+import edgarRouter from './edgar/index.js'
+import yahooRouter from './yahoo/index.js'
+import { getYahooSession, fetchYahooQuoteSummary, yahooRaw } from './yahooClient.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(__dirname, '..')
@@ -14,7 +17,10 @@ dotenv.config({ path: path.join(projectRoot, '.env') })
 const app = express()
 const port = Number(process.env.API_PORT || 3001)
 
-app.use(express.json({ limit: '4mb' }))
+// A politician's full disclosed-trades bundle (e.g. a prolific filer with
+// thousands of trades) can comfortably exceed a few MB of JSON once saved to
+// Supabase -- 4mb was rejecting real save payloads with a 413.
+app.use(express.json({ limit: '25mb' }))
 
 const providerConfigs = {
   'alpha-vantage': {
@@ -88,6 +94,63 @@ async function fetchJson(url) {
   }
 
   return body
+}
+
+async function fetchYahooTimeseries(symbol, types) {
+  let session = await getYahooSession()
+  const period2 = Math.floor(Date.now() / 1000)
+  const period1 = period2 - 60 * 60 * 24 * 365 * 12
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const url = new URL(`https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(symbol)}`)
+    url.searchParams.set('symbol', symbol)
+    url.searchParams.set('type', types.join(','))
+    url.searchParams.set('period1', String(period1))
+    url.searchParams.set('period2', String(period2))
+    url.searchParams.set('crumb', session.crumb)
+
+    const response = await fetch(url, {
+      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/json', cookie: session.cookie },
+    })
+    const body = await response.json().catch(() => ({}))
+
+    if (body?.finance?.error?.code === 'Unauthorized' && attempt === 0) {
+      session = await getYahooSession(true)
+      continue
+    }
+    if (body?.finance?.error) throw new Error(body.finance.error.description || 'Yahoo Finance request failed')
+
+    return Array.isArray(body?.timeseries?.result) ? body.timeseries.result : []
+  }
+
+  throw new Error('Yahoo Finance request failed')
+}
+
+function alignTimeseries(result, prefix) {
+  const seriesByField = {}
+  const dateSet = new Set()
+
+  for (const entry of result) {
+    const key = Object.keys(entry).find((candidate) => candidate.startsWith(prefix) && candidate !== 'meta' && candidate !== 'timestamp')
+    if (!key) continue
+    const field = key.slice(prefix.length).replace(/^./, (char) => char.toLowerCase())
+    const points = Array.isArray(entry[key]) ? entry[key] : []
+    const byDate = {}
+    for (const point of points) {
+      if (!point?.asOfDate) continue
+      dateSet.add(point.asOfDate)
+      byDate[point.asOfDate] = yahooRaw(point.reportedValue)
+    }
+    seriesByField[field] = byDate
+  }
+
+  const dates = Array.from(dateSet).sort()
+  const series = {}
+  for (const [field, byDate] of Object.entries(seriesByField)) {
+    series[field] = dates.map((date) => (date in byDate ? byDate[date] : null))
+  }
+
+  return { dates, series }
 }
 
 async function fetchXJson(url) {
@@ -461,7 +524,14 @@ async function getProviderNews(providerId, query, limit) {
   if (providerId === 'polygon') {
     const key = requiredKey(providerId)
     const tickers = tickerListFromQuery(query)
+    const redact = (url) => {
+      const copy = new URL(url.toString())
+      if (copy.searchParams.has('apiKey')) copy.searchParams.set('apiKey', '***')
+      return copy.toString()
+    }
 
+    // Multi-ticker: one Polygon request per ticker (can look like "many calls").
+    // Prefer single-ticker or empty query for a true 1-shot refresh from the UI.
     if (tickers.length > 1) {
       const perTickerLimit = Math.max(4, Math.ceil(limit / tickers.length) + 2)
       const responses = await Promise.all(
@@ -473,7 +543,7 @@ async function getProviderNews(providerId, query, limit) {
           url.searchParams.set('sort', 'published_utc')
           url.searchParams.set('ticker', ticker)
 
-          return { ticker, body: await fetchJson(url) }
+          return { ticker, upstreamUrl: redact(url), body: await fetchJson(url) }
         }),
       )
       const articles = uniqueArticles(
@@ -483,7 +553,16 @@ async function getProviderNews(providerId, query, limit) {
         }),
       ).sort(sortArticlesByPublishedAt)
 
-      return { raw: { query, responses }, articles: articles.slice(0, limit) }
+      return {
+        raw: { query, responses: responses.map(({ ticker, upstreamUrl, body }) => ({ ticker, upstreamUrl, body })) },
+        articles: articles.slice(0, limit),
+        upstream: {
+          provider: 'polygon',
+          mode: 'multi-ticker',
+          count: responses.length,
+          urls: responses.map((item) => item.upstreamUrl),
+        },
+      }
     }
 
     const url = new URL('https://api.polygon.io/v2/reference/news')
@@ -494,7 +573,16 @@ async function getProviderNews(providerId, query, limit) {
     if (tickers[0]) url.searchParams.set('ticker', tickers[0])
     const body = await fetchJson(url)
     const results = Array.isArray(body.results) ? body.results : []
-    return { raw: body, articles: results.slice(0, limit).map(normalizePolygon) }
+    return {
+      raw: body,
+      articles: results.slice(0, limit).map(normalizePolygon),
+      upstream: {
+        provider: 'polygon',
+        mode: tickers[0] ? 'single-ticker' : 'latest-all',
+        count: 1,
+        urls: [redact(url)],
+      },
+    }
   }
 
   if (providerId === 'finnhub') {
@@ -616,7 +704,7 @@ app.get('/api/providers/:providerId/news', async (request, response) => {
   try {
     const providerId = request.params.providerId
     const query = String(request.query.query || '').trim()
-    const limit = Math.min(Math.max(Number(request.query.limit || 12), 1), 50)
+    const limit = Math.min(Math.max(Number(request.query.limit || 12), 1), 100)
     if (providerId === 'yahoo-finance') {
       response.set('Cache-Control', 'no-store, max-age=0')
       response.set('Pragma', 'no-cache')
@@ -631,6 +719,8 @@ app.get('/api/providers/:providerId/news', async (request, response) => {
       count: result.articles.length,
       articles: result.articles,
       raw: result.raw,
+      // Exact upstream hit(s) for transparent UI (apiKey redacted).
+      upstream: result.upstream || null,
     })
   } catch (error) {
     response.status(500).json({
@@ -689,6 +779,317 @@ app.get('/api/market/momentum', async (request, response) => {
   }
 })
 
+app.get('/api/market/fundamentals', async (request, response) => {
+  try {
+    const query = String(request.query.query || '').trim()
+    const symbol = yahooChartSymbol(query)
+    if (!symbol) {
+      response.json({ query, symbol, profile: null, stats: null })
+      return
+    }
+
+    const result = await fetchYahooQuoteSummary(symbol, ['assetProfile', 'summaryDetail', 'defaultKeyStatistics', 'financialData', 'price'])
+    const profileModule = result.assetProfile || {}
+    const summary = result.summaryDetail || {}
+    const stats = result.defaultKeyStatistics || {}
+    const financial = result.financialData || {}
+    const price = result.price || {}
+
+    response.json({
+      query,
+      symbol,
+      profile: {
+        sector: profileModule.sector || null,
+        industry: profileModule.industry || null,
+        longBusinessSummary: profileModule.longBusinessSummary || null,
+        fullTimeEmployees: yahooRaw(profileModule.fullTimeEmployees),
+        website: profileModule.website || null,
+        city: profileModule.city || null,
+        state: profileModule.state || null,
+        country: profileModule.country || null,
+      },
+      stats: {
+        currentPrice: yahooRaw(financial.currentPrice) ?? yahooRaw(price.regularMarketPrice),
+        marketCap: yahooRaw(summary.marketCap) ?? yahooRaw(price.marketCap),
+        trailingPE: yahooRaw(summary.trailingPE),
+        forwardPE: yahooRaw(summary.forwardPE),
+        trailingEps: yahooRaw(stats.trailingEps),
+        forwardEps: yahooRaw(stats.forwardEps),
+        dividendYield: yahooRaw(summary.dividendYield),
+        beta: yahooRaw(summary.beta),
+        fiftyTwoWeekLow: yahooRaw(summary.fiftyTwoWeekLow),
+        fiftyTwoWeekHigh: yahooRaw(summary.fiftyTwoWeekHigh),
+        fiftyDayAverage: yahooRaw(summary.fiftyDayAverage),
+        twoHundredDayAverage: yahooRaw(summary.twoHundredDayAverage),
+        priceToBook: yahooRaw(stats.priceToBook),
+        pegRatio: yahooRaw(stats.pegRatio),
+        bookValue: yahooRaw(stats.bookValue),
+        sharesOutstanding: yahooRaw(stats.sharesOutstanding),
+        averageVolume: yahooRaw(summary.averageVolume),
+        profitMargins: yahooRaw(stats.profitMargins),
+      },
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch fundamentals',
+    })
+  }
+})
+
+app.get('/api/market/analyst', async (request, response) => {
+  try {
+    const query = String(request.query.query || '').trim()
+    const symbol = yahooChartSymbol(query)
+    if (!symbol) {
+      response.json({ query, symbol, consensus: null, trend: [], ratings: [] })
+      return
+    }
+
+    const result = await fetchYahooQuoteSummary(symbol, ['financialData', 'recommendationTrend', 'upgradeDowngradeHistory'])
+    const financial = result.financialData || {}
+    const trend = Array.isArray(result.recommendationTrend?.trend) ? result.recommendationTrend.trend : []
+    const history = Array.isArray(result.upgradeDowngradeHistory?.history) ? result.upgradeDowngradeHistory.history : []
+
+    const currentPrice = yahooRaw(financial.currentPrice)
+
+    response.json({
+      query,
+      symbol,
+      consensus: {
+        currentPrice,
+        targetLow: yahooRaw(financial.targetLowPrice),
+        targetMean: yahooRaw(financial.targetMeanPrice),
+        targetMedian: yahooRaw(financial.targetMedianPrice),
+        targetHigh: yahooRaw(financial.targetHighPrice),
+        recommendationKey: financial.recommendationKey || null,
+        recommendationMean: yahooRaw(financial.recommendationMean),
+        numberOfAnalystOpinions: yahooRaw(financial.numberOfAnalystOpinions),
+      },
+      trend: trend.map((point) => ({
+        period: point.period,
+        strongBuy: yahooRaw(point.strongBuy) || 0,
+        buy: yahooRaw(point.buy) || 0,
+        hold: yahooRaw(point.hold) || 0,
+        sell: yahooRaw(point.sell) || 0,
+        strongSell: yahooRaw(point.strongSell) || 0,
+      })),
+      ratings: history
+        .map((entry) => {
+          const priceTarget = Number.isFinite(entry.currentPriceTarget) && entry.currentPriceTarget > 0 ? entry.currentPriceTarget : null
+          const priorTarget = Number.isFinite(entry.priorPriceTarget) && entry.priorPriceTarget > 0 ? entry.priorPriceTarget : null
+          return {
+            firm: entry.firm || 'Unknown',
+            toGrade: entry.toGrade || null,
+            fromGrade: entry.fromGrade || null,
+            action: entry.action || null,
+            priceTarget,
+            priorPriceTarget: priorTarget,
+            upsidePercent: priceTarget && currentPrice ? ((priceTarget - currentPrice) / currentPrice) * 100 : null,
+            date: Number.isFinite(entry.epochGradeDate) ? new Date(entry.epochGradeDate * 1000).toISOString().slice(0, 10) : null,
+          }
+        })
+        .sort((a, b) => (a.date && b.date ? b.date.localeCompare(a.date) : 0)),
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch analyst data',
+    })
+  }
+})
+
+app.get('/api/market/holders', async (request, response) => {
+  try {
+    const query = String(request.query.query || '').trim()
+    const symbol = yahooChartSymbol(query)
+    if (!symbol) {
+      response.json({ query, symbol, breakdown: null, institutional: [], insiders: [] })
+      return
+    }
+
+    const result = await fetchYahooQuoteSummary(symbol, ['majorHoldersBreakdown', 'institutionOwnership', 'insiderHolders'])
+    const breakdown = result.majorHoldersBreakdown || {}
+    const institutional = Array.isArray(result.institutionOwnership?.ownershipList) ? result.institutionOwnership.ownershipList : []
+    const insiders = Array.isArray(result.insiderHolders?.holders) ? result.insiderHolders.holders : []
+
+    response.json({
+      query,
+      symbol,
+      breakdown: {
+        insidersPercentHeld: yahooRaw(breakdown.insidersPercentHeld),
+        institutionsPercentHeld: yahooRaw(breakdown.institutionsPercentHeld),
+        institutionsCount: yahooRaw(breakdown.institutionsCount),
+      },
+      institutional: institutional.map((holder) => ({
+        organization: holder.organization || 'Unknown',
+        reportDate: holder.reportDate?.fmt || null,
+        position: yahooRaw(holder.position),
+        value: yahooRaw(holder.value),
+        pctHeld: yahooRaw(holder.pctHeld),
+        pctChange: yahooRaw(holder.pctChange),
+      })),
+      insiders: insiders.map((holder) => ({
+        name: holder.name || 'Unknown',
+        relation: holder.relation || null,
+        transactionDescription: holder.transactionDescription || null,
+        latestTransDate: holder.latestTransDate?.fmt || null,
+        positionDirect: yahooRaw(holder.positionDirect),
+        positionIndirect: yahooRaw(holder.positionIndirect),
+      })),
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch holders data',
+    })
+  }
+})
+
+const financialsTimeseriesTypes = {
+  income: [
+    'TotalRevenue',
+    'CostOfRevenue',
+    'GrossProfit',
+    'SellingGeneralAndAdministration',
+    'ResearchAndDevelopment',
+    'OperatingExpense',
+    'OperatingIncome',
+    'InterestExpense',
+    'PretaxIncome',
+    'TaxProvision',
+    'NetIncome',
+    'BasicEPS',
+    'DilutedEPS',
+    'EBITDA',
+  ],
+  balance: [
+    'TotalAssets',
+    'CurrentAssets',
+    'TotalLiabilitiesNetMinorityInterest',
+    'CurrentLiabilities',
+    'TotalDebt',
+    'CommonStockEquity',
+    'TotalEquityGrossMinorityInterest',
+    'RetainedEarnings',
+    'WorkingCapital',
+  ],
+  cashflow: [
+    'OperatingCashFlow',
+    'InvestingCashFlow',
+    'FinancingCashFlow',
+    'CapitalExpenditure',
+    'FreeCashFlow',
+    'DepreciationAndAmortization',
+  ],
+}
+
+app.get('/api/market/financials', async (request, response) => {
+  try {
+    const query = String(request.query.query || '').trim()
+    const period = request.query.period === 'quarterly' ? 'quarterly' : 'annual'
+    const symbol = yahooChartSymbol(query)
+    if (!symbol) {
+      response.json({ query, symbol, period, dates: [], income: {}, balance: {}, cashflow: {} })
+      return
+    }
+
+    const prefix = period === 'quarterly' ? 'quarterly' : 'annual'
+    const allTypes = [...financialsTimeseriesTypes.income, ...financialsTimeseriesTypes.balance, ...financialsTimeseriesTypes.cashflow]
+      .map((type) => `${prefix}${type}`)
+
+    const result = await fetchYahooTimeseries(symbol, allTypes)
+    const { dates, series } = alignTimeseries(result, prefix)
+
+    const pick = (types) => {
+      const picked = {}
+      for (const type of types) {
+        const field = `${type.charAt(0).toLowerCase()}${type.slice(1)}`
+        picked[field] = series[field] || dates.map(() => null)
+      }
+      return picked
+    }
+
+    response.json({
+      query,
+      symbol,
+      period,
+      dates,
+      income: pick(financialsTimeseriesTypes.income),
+      balance: pick(financialsTimeseriesTypes.balance),
+      cashflow: pick(financialsTimeseriesTypes.cashflow),
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch financials',
+    })
+  }
+})
+
+app.get('/api/market/earnings', async (request, response) => {
+  try {
+    const query = String(request.query.query || '').trim()
+    const period = request.query.period === 'quarterly' ? 'quarterly' : 'annual'
+    const symbol = yahooChartSymbol(query)
+    if (!symbol) {
+      response.json({ query, symbol, period, eps: [], revenue: [] })
+      return
+    }
+
+    if (period === 'annual') {
+      const result = await fetchYahooTimeseries(symbol, ['annualBasicEPS', 'annualDilutedEPS', 'annualTotalRevenue'])
+      const { dates, series } = alignTimeseries(result, 'annual')
+      const epsSeries = series.dilutedEPS || series.basicEPS || dates.map(() => null)
+
+      response.json({
+        query,
+        symbol,
+        period,
+        eps: dates.map((date, index) => ({ date, estimate: null, actual: epsSeries[index] ?? null })),
+        revenue: dates.map((date, index) => ({ date, estimate: null, actual: (series.totalRevenue || [])[index] ?? null })),
+      })
+      return
+    }
+
+    const [quoteResult, timeseriesResult] = await Promise.all([
+      fetchYahooQuoteSummary(symbol, ['earningsHistory', 'earningsTrend']),
+      fetchYahooTimeseries(symbol, ['quarterlyTotalRevenue']),
+    ])
+
+    const history = Array.isArray(quoteResult.earningsHistory?.history) ? quoteResult.earningsHistory.history : []
+    const trend = Array.isArray(quoteResult.earningsTrend?.trend) ? quoteResult.earningsTrend.trend : []
+    const upcoming = trend.find((point) => point.period === '0q')
+
+    const { dates: revenueDates, series: revenueSeries } = alignTimeseries(timeseriesResult, 'quarterly')
+    const revenueByDate = {}
+    revenueDates.forEach((date, index) => {
+      revenueByDate[date] = (revenueSeries.totalRevenue || [])[index] ?? null
+    })
+
+    const eps = history.map((entry) => ({
+      date: entry.quarter?.fmt || null,
+      estimate: yahooRaw(entry.epsEstimate),
+      actual: yahooRaw(entry.epsActual),
+    }))
+    const revenue = history.map((entry) => ({
+      date: entry.quarter?.fmt || null,
+      estimate: null,
+      actual: entry.quarter?.fmt ? revenueByDate[entry.quarter.fmt] ?? null : null,
+    }))
+
+    if (upcoming?.endDate) {
+      const alreadyCovered = eps.some((point) => point.date === upcoming.endDate)
+      if (!alreadyCovered) {
+        eps.push({ date: upcoming.endDate, estimate: yahooRaw(upcoming.earningsEstimate?.avg), actual: null })
+        revenue.push({ date: upcoming.endDate, estimate: yahooRaw(upcoming.revenueEstimate?.avg), actual: null })
+      }
+    }
+
+    response.json({ query, symbol, period, eps, revenue })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch earnings',
+    })
+  }
+})
+
 app.get('/api/social/x', async (request, response) => {
   try {
     const query = compactText(String(request.query.query || 'stocks OR markets')).slice(0, 420)
@@ -732,13 +1133,15 @@ app.get('/api/social/x', async (request, response) => {
 
 app.get('/api/articles/saved', async (request, response) => {
   try {
-    const limit = Math.min(Math.max(Number(request.query.limit || 50), 1), 200)
+    const limit = Math.min(Math.max(Number(request.query.limit || 10), 1), 200)
+    const offset = Math.max(Number(request.query.offset || 0), 0)
     const supabase = getSupabase()
     const { data, error } = await supabase
       .from('market_news_articles')
       .select('*')
+      .order('published_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
-      .limit(limit)
+      .range(offset, offset + limit - 1)
 
     if (error) throw error
 
@@ -747,6 +1150,8 @@ app.get('/api/articles/saved', async (request, response) => {
       provider: 'supabase',
       query: '',
       limit,
+      offset,
+      hasMore: articles.length === limit,
       count: articles.length,
       articles,
       raw: data || [],
@@ -868,6 +1273,10 @@ app.post('/api/articles/save', async (request, response) => {
     })
   }
 })
+
+app.use('/api/edgar', edgarRouter)
+// Yahoo Finance ticker data — separate router + Supabase table from SEC EDGAR.
+app.use('/api/yahoo', yahooRouter)
 
 app.listen(port, () => {
   console.log(`News dashboard API listening on http://localhost:${port}`)
