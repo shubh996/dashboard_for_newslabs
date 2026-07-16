@@ -392,7 +392,8 @@ const tradingViewExchangeMap: Record<string, string> = {
 
 const nasdaqCompositeTicker = 'IXIC'
 const nasdaqCompositeSymbol = 'NASDAQ:IXIC'
-const marketFallbackTickers = ['IXIC', 'GSPC', 'NDX', 'DJI', 'RUT', 'NYA']
+// Liquid ETFs (not raw index symbols) so TradingView embeds resolve reliably.
+const marketFallbackTickers = ['SPY', 'QQQ', 'DIA', 'IWM', 'MDY']
 const indexTickerMetadata: Record<string, { name: string; type: string }> = {
   '^DJI': { name: 'Dow Jones Industrial Average', type: 'Index' },
   '^GSPC': { name: 'S&P 500', type: 'Index' },
@@ -412,17 +413,18 @@ const indexTickerMetadata: Record<string, { name: string; type: string }> = {
 const tradingViewSymbolOverrides: Record<string, string> = {
   '^DJI': 'TVC:DJI',
   '^GSPC': 'TVC:SPX',
-  '^IXIC': nasdaqCompositeSymbol,
-  '^NDX': 'NASDAQ:NDX',
+  '^IXIC': 'TVC:IXIC',
+  '^NDX': 'TVC:NDX',
   '^NYA': 'TVC:NYA',
   '^RUT': 'TVC:RUT',
   '^SPX': 'TVC:SPX',
   DIA: 'AMEX:DIA',
   DJI: 'TVC:DJI',
   GSPC: 'TVC:SPX',
-  IXIC: nasdaqCompositeSymbol,
+  IXIC: 'TVC:IXIC',
   IWM: 'AMEX:IWM',
-  NDX: 'NASDAQ:NDX',
+  MDY: 'AMEX:MDY',
+  NDX: 'TVC:NDX',
   NYA: 'TVC:NYA',
   QQQ: 'NASDAQ:QQQ',
   RUT: 'TVC:RUT',
@@ -2157,10 +2159,16 @@ function App() {
         offset: String(offset),
       })
       const response = await trackedFetch(`/api/articles/saved?${params}`)
-      const body = await response.json()
+      const body = await response.json().catch(() => ({}))
 
       if (!response.ok) {
-        throw new Error(body.error || 'Unable to fetch saved Supabase articles.')
+        // 404 = API route missing on the host (e.g. CF Functions not deployed / env not set).
+        const detail =
+          body?.error ||
+          (response.status === 404
+            ? 'Saved-articles API not found (404). On Cloudflare Pages, ensure Functions are enabled and SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are set.'
+            : `Unable to fetch saved Supabase articles (${response.status}).`)
+        throw new Error(detail)
       }
 
       // Drop stale non-append responses (e.g. React StrictMode double mount).

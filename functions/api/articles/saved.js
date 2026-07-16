@@ -1,4 +1,4 @@
-import { errorResponse, json, normalizeSupabaseRow, supabaseFetch } from '../../../_shared/supabase.js'
+import { errorResponse, json, normalizeSupabaseRow, supabaseFetch } from '../../_shared/supabase.js'
 
 export async function onRequestGet({ env, request }) {
   try {
@@ -27,4 +27,10 @@ export async function onRequestGet({ env, request }) {
   } catch (error) {
     return errorResponse(error, 'Unable to fetch saved Supabase articles')
   }
+}
+
+/** CF Pages sometimes hits generic onRequest for directory-style routes. */
+export async function onRequest(context) {
+  if (context.request.method === 'GET') return onRequestGet(context)
+  return json({ error: 'Method not allowed' }, { status: 405 })
 }
