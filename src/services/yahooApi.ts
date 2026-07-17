@@ -17,11 +17,14 @@ async function getJson<T>(url: string): Promise<T> {
 
 async function getJsonOrNull<T>(url: string): Promise<T | null> {
   const response = await fetch(url)
-  if (response.status === 404) return null
-  const body = await response.json().catch(() => ({}))
+  // Missing snapshot: server returns 200 + null (preferred) or legacy 404.
+  if (response.status === 404 || response.status === 204) return null
+  const body = await response.json().catch(() => null)
   if (!response.ok) {
-    throw new Error(body?.error || `Request failed: ${url}`)
+    const errBody = body && typeof body === 'object' ? (body as { error?: string }) : null
+    throw new Error(errBody?.error || `Request failed: ${url}`)
   }
+  if (body == null) return null
   return body as T
 }
 
@@ -131,6 +134,15 @@ export function fetchYahooQuote(ticker: string) {
 
 export function getSavedYahooTicker(ticker: string) {
   return getJsonOrNull<YahooSavedSnapshot>(`/api/yahoo/${encodeURIComponent(ticker)}/saved`)
+}
+
+/** Batch lookup — which tickers already have a yahoo_finance_snapshots row. */
+export async function getSavedYahooTickerMap(tickers: string[]): Promise<Record<string, boolean>> {
+  const clean = [...new Set(tickers.map((t) => t.trim().toUpperCase()).filter(Boolean))].slice(0, 80)
+  if (!clean.length) return {}
+  const params = new URLSearchParams({ tickers: clean.join(',') })
+  const body = await getJson<{ saved?: Record<string, boolean> }>(`/api/yahoo/saved-status?${params}`)
+  return body.saved ?? {}
 }
 
 export function searchYahooSaved(query: string) {

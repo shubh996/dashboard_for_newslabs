@@ -22,8 +22,10 @@ create unique index if not exists yahoo_finance_snapshots_ticker_key
 create index if not exists yahoo_finance_snapshots_ticker_updated_idx
   on public.yahoo_finance_snapshots (ticker, updated_at desc);
 
-create index if not exists yahoo_finance_snapshots_data_idx
-  on public.yahoo_finance_snapshots using gin (data);
+-- Do NOT add a GIN index on data/raw_json. Large Yahoo snapshots (~1–2MB) make
+-- every upsert rebuild the index and hit statement_timeout (57014) on Supabase.
+-- If you already created it from an older schema, drop it:
+drop index if exists public.yahoo_finance_snapshots_data_idx;
 
 alter table public.yahoo_finance_snapshots enable row level security;
 

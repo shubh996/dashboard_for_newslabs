@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom'
 import {
   AlertCircle,
   ArrowUpRight,
-  Bell,
   Bookmark,
   Camera,
   CalendarClock,
@@ -30,7 +29,8 @@ import {
   X,
 } from 'lucide-react'
 
-import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { useBottomToast } from '@/components/ui/bottom-toast'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -51,7 +51,7 @@ import { cn } from '@/lib/utils'
 import { supabase, supabaseAuthConfigured } from '@/lib/supabaseClient'
 import {
   fetchYahooQuote,
-  getSavedYahooTicker,
+  getSavedYahooTickerMap,
   resolveYahooLogoUrl,
   type YahooLiveQuote,
 } from '@/services/yahooApi'
@@ -1058,6 +1058,7 @@ function clientModeFromPath() {
 
 function App() {
   const navigate = useNavigate()
+  const { toast: showBottomToast } = useBottomToast()
   const [activeSource, setActiveSource] = useState<SourceTabId>('supabase')
   const [activeDashboardCategory, setActiveDashboardCategory] = useState<DashboardCategoryId>('all-us')
   const [query, setQuery] = useState('')
@@ -1086,13 +1087,6 @@ function App() {
   const [loadingMoreSaved, setLoadingMoreSaved] = useState(false)
   const [hasMoreSaved, setHasMoreSaved] = useState(false)
   const [error, setError] = useState('')
-  const [saveMessage, setSaveMessage] = useState('')
-  /** Top-of-screen toast (shadcn Alert) for save/delete feedback. */
-  const [topAlert, setTopAlert] = useState<{
-    title: string
-    description?: string
-    variant?: 'default' | 'destructive'
-  } | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedMode, setSavedMode] = useState(true)
   const [savedArticleIndex, setSavedArticleIndex] = useState<Record<string, NewsArticle>>({})
@@ -1400,27 +1394,23 @@ function App() {
     }
 
     let cancelled = false
-    void Promise.all(
-      symbols.map(async (symbol) => {
-        try {
-          const saved = await getSavedYahooTicker(symbol)
-          return [symbol, Boolean(saved)] as const
-        } catch {
-          return [symbol, false] as const
-        }
-      }),
-    ).then((entries) => {
-      // Merge lookup results without clobbering optimistic true flags from an in-session save.
-      if (cancelled) return
-      setYahooSavedByTicker((current) => {
-        const next = { ...current }
-        for (const [symbol, saved] of entries) {
-          if (saved) next[symbol] = true
-          else if (current[symbol] !== true) next[symbol] = false
-        }
-        return next
+    void getSavedYahooTickerMap(symbols)
+      .then((savedMap) => {
+        // Merge lookup results without clobbering optimistic true flags from an in-session save.
+        if (cancelled) return
+        setYahooSavedByTicker((current) => {
+          const next = { ...current }
+          for (const symbol of symbols) {
+            const saved = Boolean(savedMap[symbol])
+            if (saved) next[symbol] = true
+            else if (current[symbol] !== true) next[symbol] = false
+          }
+          return next
+        })
       })
-    })
+      .catch(() => {
+        /* ignore batch lookup failures — icons stay unchanged */
+      })
 
     return () => {
       cancelled = true
@@ -1696,20 +1686,6 @@ function App() {
     }
   }, [selectedId])
 
-  useEffect(() => {
-    if (!topAlert) return
-    const timer = window.setTimeout(() => setTopAlert(null), 4500)
-    return () => window.clearTimeout(timer)
-  }, [topAlert])
-
-  function showTopAlert(
-    title: string,
-    description?: string,
-    variant: 'default' | 'destructive' = 'default',
-  ) {
-    setTopAlert({ title, description, variant })
-  }
-
   function preserveNewsListScroll(run: () => void) {
     const container = newsListScrollRef.current
     const scrollTop = container?.scrollTop ?? 0
@@ -1882,7 +1858,6 @@ function App() {
   const fetchNews = useCallback(async (nextProvider: ProviderId, queryOverride?: string) => {
     setLoading(true)
     setError('')
-    setSaveMessage('')
     setHasMoreSaved(false)
     hasMoreSavedRef.current = false
     savedOffsetRef.current = 0
@@ -1965,6 +1940,12 @@ function App() {
       })
       setSelectedId(articles[0]?.id ?? null)
       setLoadingStatus('')
+      showBottomToast({
+        title: 'News refreshed',
+        description: effectiveQuery
+          ? `Loaded ${articles.length} Polygon articles for “${effectiveQuery.slice(0, 40)}${effectiveQuery.length > 40 ? '…' : ''}”.`
+          : `Loaded ${articles.length} latest Polygon articles.`,
+      })
     } catch (fetchError) {
       const durationMs = Date.now() - startedAtMs
       const message = fetchError instanceof Error ? fetchError.message : 'Unable to fetch provider news.'
@@ -1982,11 +1963,12 @@ function App() {
       setData(null)
       setSelectedId(null)
       setError(message)
+      showBottomToast({ title: 'Refresh failed', description: message, variant: 'destructive' })
       setLoadingStatus('')
     } finally {
       setLoading(false)
     }
-  }, [trackedFetch])
+  }, [trackedFetch, showBottomToast])
 
   function compressImageFile(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -2125,8 +2107,11 @@ function App() {
       })
       if (updateError) throw updateError
       setProfileEditOpen(false)
+      showBottomToast({ title: 'Profile updated', description: 'Your name and photo are saved.' })
     } catch (updateError) {
-      setProfileError(updateError instanceof Error ? updateError.message : 'Could not save your profile.')
+      const message = updateError instanceof Error ? updateError.message : 'Could not save your profile.'
+      setProfileError(message)
+      showBottomToast({ title: 'Profile save failed', description: message, variant: 'destructive' })
     } finally {
       setProfileSaving(false)
     }
@@ -2150,7 +2135,6 @@ function App() {
 
     const generation = savedFetchGenerationRef.current
     setError('')
-    setSaveMessage('')
 
     try {
       const offset = append ? savedOffsetRef.current : 0
@@ -2215,13 +2199,28 @@ function App() {
           return nextIndex
         })
       }
+
+      // Only toast explicit loads/refreshes — not silent infinite-scroll appends.
+      if (!append) {
+        showBottomToast({
+          title: 'Saved stories loaded',
+          description:
+            pageArticles.length > 0
+              ? `Loaded ${pageArticles.length} stories from Supabase.`
+              : 'No saved stories in Supabase yet.',
+        })
+      }
     } catch (fetchError) {
+      const message =
+        fetchError instanceof Error ? fetchError.message : 'Unable to fetch saved Supabase articles.'
       if (!append && generation === savedFetchGenerationRef.current) {
         setData(null)
         setSelectedId(null)
-        setError(fetchError instanceof Error ? fetchError.message : 'Unable to fetch saved Supabase articles.')
+        setError(message)
+        showBottomToast({ title: 'Supabase load failed', description: message, variant: 'destructive' })
       } else if (append) {
-        setError(fetchError instanceof Error ? fetchError.message : 'Unable to fetch saved Supabase articles.')
+        setError(message)
+        showBottomToast({ title: 'Load more failed', description: message, variant: 'destructive' })
       }
     } finally {
       if (append) {
@@ -2231,7 +2230,7 @@ function App() {
         setLoading(false)
       }
     }
-  }, [trackedFetch])
+  }, [trackedFetch, showBottomToast])
 
   async function refreshSavedArticleIndex() {
     try {
@@ -2293,7 +2292,6 @@ function App() {
     if (!selectedArticle) return
 
     setSaving(true)
-    setSaveMessage('')
 
     try {
       const response = await trackedFetch('/api/articles/save', {
@@ -2331,12 +2329,13 @@ function App() {
         })
       }
       await refreshSavedArticleIndex()
-      setSaveMessage('Saved to Supabase.')
-      showTopAlert('Saved to Supabase', 'This story is now in your database. You can delete it anytime.', 'default')
+      showBottomToast({
+        title: 'Story saved',
+        description: 'Saved to Supabase. You can delete it anytime from the header.',
+      })
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : 'Unable to save article.'
-      setSaveMessage(message)
-      showTopAlert('Save failed', message, 'destructive')
+      showBottomToast({ title: 'Save failed', description: message, variant: 'destructive' })
     } finally {
       setSaving(false)
     }
@@ -2348,7 +2347,6 @@ function App() {
     if (!options?.force && !editDirty) return
 
     setSaving(true)
-    setSaveMessage('')
 
     const article = editedArticleDraft(selectedArticle)
     const previousSelectedId = selectedArticle.id
@@ -2392,13 +2390,14 @@ function App() {
         setSelectedId(previousSelectedId)
         setStoryEditOpen(false)
       })
-      setSaveMessage('Saved changes to Supabase.')
-      showTopAlert('Saved to Supabase', 'Your story (including image URL) is saved.')
+      showBottomToast({
+        title: 'Story updated',
+        description: 'Changes (title, image, tickers, etc.) saved to Supabase.',
+      })
       await refreshSavedArticleIndex()
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : 'Unable to update saved article.'
-      setSaveMessage(message)
-      showTopAlert('Save failed', message, 'destructive')
+      showBottomToast({ title: 'Update failed', description: message, variant: 'destructive' })
     } finally {
       setSaving(false)
     }
@@ -2410,7 +2409,6 @@ function App() {
     if (!shouldDelete) return
 
     setSaving(true)
-    setSaveMessage('')
 
     const deletedArticle = selectedArticle
     const storageKey = deletedArticle ? articleStorageKey(deletedArticle) : ''
@@ -2490,8 +2488,10 @@ function App() {
         }
       })
 
-      setSaveMessage('Deleted from Supabase.')
-      showTopAlert('Deleted from Supabase', 'Story removed from your database. You can save it again anytime.', 'default')
+      showBottomToast({
+        title: 'Story deleted',
+        description: 'Removed from Supabase. Save again anytime to restore it.',
+      })
       await refreshSavedArticleIndex()
       requestAnimationFrame(() => {
         if (newsListScrollRef.current) {
@@ -2500,8 +2500,7 @@ function App() {
       })
     } catch (deleteError) {
       const message = deleteError instanceof Error ? deleteError.message : 'Unable to delete saved article.'
-      setSaveMessage(message)
-      showTopAlert('Delete failed', message, 'destructive')
+      showBottomToast({ title: 'Delete failed', description: message, variant: 'destructive' })
     } finally {
       setSaving(false)
     }
@@ -2525,7 +2524,10 @@ function App() {
       sentimentScore: selectedArticle.sentimentScore === null ? '' : String(selectedArticle.sentimentScore),
     })
     setStoryEditOpen(true)
-    setSaveMessage('')
+    showBottomToast({
+      title: 'Editing story',
+      description: 'Change title, image URL, or fields — then use the Save (database) icon.',
+    })
   }
 
   function cancelStoryEditor() {
@@ -2546,6 +2548,10 @@ function App() {
       sentimentLabel: selectedArticle.sentimentLabel,
       sentimentScore: selectedArticle.sentimentScore === null ? '' : String(selectedArticle.sentimentScore),
     })
+    showBottomToast({
+      title: 'Edit cancelled',
+      description: 'Story fields restored. Nothing was saved.',
+    })
   }
 
   /**
@@ -2557,8 +2563,10 @@ function App() {
     const hasSavedRow = Boolean(selectedArticle.savedRowId ?? selectedSavedMatch?.savedRowId)
     if (hasSavedRow) {
       if (!editDirty && !storyEditOpen) {
-        setSaveMessage('No changes to save.')
-        showTopAlert('Nothing to save', 'No edits on this story yet.')
+        showBottomToast({
+          title: 'Nothing to save',
+          description: 'No edits on this story yet. Change fields first, then save.',
+        })
         return
       }
       await updateSavedArticle({ force: true })
@@ -2584,6 +2592,13 @@ function App() {
     setActiveDashboardCategory(id)
     activeDashboardCategoryRef.current = id
     setQuery('')
+    const label =
+      dashboardCategories.find((item) => item.id === id)?.label ||
+      id.replace(/-/g, ' ')
+    showBottomToast({
+      title: 'Category changed',
+      description: `Filter set to “${label}”.`,
+    })
   }
 
   function handleNewsListScroll(event: UIEvent<HTMLDivElement>) {
@@ -2600,10 +2615,16 @@ function App() {
       const next = new Set(current)
       if (next.has(selectedArticle.id)) {
         next.delete(selectedArticle.id)
-        setSaveMessage('Removed from Saved.')
+        showBottomToast({
+          title: 'Removed from Saved',
+          description: 'Story removed from your client bookmarks.',
+        })
       } else {
         next.add(selectedArticle.id)
-        setSaveMessage('Saved to your client bookmarks.')
+        showBottomToast({
+          title: 'Bookmarked',
+          description: 'Story added to your client bookmarks.',
+        })
       }
       return next
     })
@@ -2616,10 +2637,13 @@ function App() {
       const next = new Set(current)
       if (next.has(selectedArticle.id)) {
         next.delete(selectedArticle.id)
-        setSaveMessage('Removed from Liked.')
+        showBottomToast({
+          title: 'Removed from Liked',
+          description: 'Story removed from your likes.',
+        })
       } else {
         next.add(selectedArticle.id)
-        setSaveMessage('Added to Liked.')
+        showBottomToast({ title: 'Liked', description: 'Story added to your likes.' })
       }
       return next
     })
@@ -2630,8 +2654,16 @@ function App() {
 
     setReportedArticleIds((current) => {
       const next = new Set(current)
-      if (next.has(selectedArticle.id)) next.delete(selectedArticle.id)
-      else next.add(selectedArticle.id)
+      if (next.has(selectedArticle.id)) {
+        next.delete(selectedArticle.id)
+        showBottomToast({
+          title: 'Report cleared',
+          description: 'This story is no longer marked as reported.',
+        })
+      } else {
+        next.add(selectedArticle.id)
+        showBottomToast({ title: 'Reported', description: 'This story is marked as reported.' })
+      }
       return next
     })
   }
@@ -2677,9 +2709,13 @@ function App() {
       }
 
       await navigator.clipboard.writeText(selectedArticle.url)
-      setSaveMessage('Article link copied.')
+      showBottomToast({ title: 'Link copied', description: 'Article URL copied to clipboard.' })
     } catch {
-      setSaveMessage('Unable to share this article.')
+      showBottomToast({
+        title: 'Share failed',
+        description: 'Unable to share this article.',
+        variant: 'destructive',
+      })
     }
   }
 
@@ -3031,7 +3067,10 @@ function App() {
     return []
   }
 
-  async function persistTickerForms(nextTickers: EditTickerForm[], options?: { keepEditing?: boolean }) {
+  async function persistTickerForms(
+    nextTickers: EditTickerForm[],
+    options?: { keepEditing?: boolean; silent?: boolean },
+  ) {
     if (!selectedArticle) return
 
     const cleaned = nextTickers
@@ -3081,12 +3120,16 @@ function App() {
 
     const savedRowId = selectedArticle.savedRowId ?? selectedSavedMatch?.savedRowId
     if (!savedRowId) {
-      setSaveMessage('Ticker list updated locally. Save the story to Supabase to keep it.')
+      if (!options?.silent) {
+        showBottomToast({
+          title: 'Tickers updated',
+          description: 'Saved on this story locally. Use the header Save icon to keep them in Supabase.',
+        })
+      }
       return
     }
 
     setSaving(true)
-    setSaveMessage('')
     try {
       const response = await trackedFetch(`/api/articles/saved/${savedRowId}`, {
         method: 'PUT',
@@ -3117,10 +3160,16 @@ function App() {
           setSelectedId(previousSelectedId)
         })
       }
-      setSaveMessage('Tickers saved to Supabase.')
+      if (!options?.silent) {
+        showBottomToast({
+          title: 'Tickers saved',
+          description: 'Ticker changes saved to Supabase on this story.',
+        })
+      }
       await refreshSavedArticleIndex()
     } catch (err) {
-      setSaveMessage(err instanceof Error ? err.message : 'Unable to save tickers.')
+      const message = err instanceof Error ? err.message : 'Unable to save tickers.'
+      showBottomToast({ title: 'Ticker save failed', description: message, variant: 'destructive' })
     } finally {
       setSaving(false)
     }
@@ -3146,6 +3195,10 @@ function App() {
     }))
     setTickerEditingIndex(nextIndex)
     setTickerDraft(emptyTickerForm())
+    showBottomToast({
+      title: 'Add ticker',
+      description: 'Enter the symbol (and optional sentiment/reason), then Save on the row.',
+    })
   }
 
   function cancelTickerEdit() {
@@ -3165,7 +3218,11 @@ function App() {
   async function saveTickerEdit() {
     if (tickerEditingIndex == null || !tickerDraft) return
     if (!tickerDraft.ticker.trim()) {
-      setSaveMessage('Enter a ticker symbol before saving.')
+      showBottomToast({
+        title: 'Ticker required',
+        description: 'Enter a ticker symbol before saving.',
+        variant: 'destructive',
+      })
       return
     }
     const rows = getWorkingTickerForms()
@@ -3205,8 +3262,18 @@ function App() {
     }, 8000)
 
     const label = displayTicker(snapshot.ticker) || 'Ticker'
-    showTopAlert('Ticker deleted', `${label} removed from this story. Use Undo if that was a mistake.`)
-    await persistTickerForms(next)
+    // Silent persist so the toast below is the only message (with Undo).
+    await persistTickerForms(next, { silent: true })
+    showBottomToast({
+      title: 'Ticker deleted',
+      description: `${label} removed from this story.`,
+      action: {
+        label: 'Undo',
+        onClick: () => {
+          void undoDeleteTicker()
+        },
+      },
+    })
   }
 
   async function undoDeleteTicker() {
@@ -3230,8 +3297,11 @@ function App() {
     }
     const label = displayTicker(tickerDeleteUndo.ticker.ticker) || 'Ticker'
     setTickerDeleteUndo(null)
-    showTopAlert('Ticker restored', `${label} is back on this story.`)
-    await persistTickerForms(next)
+    await persistTickerForms(next, { silent: true })
+    showBottomToast({
+      title: 'Ticker restored',
+      description: `${label} is back on this story.`,
+    })
   }
 
   async function reorderTickers(fromIndex: number, toIndex: number) {
@@ -3252,7 +3322,16 @@ function App() {
       }
     }
 
-    await persistTickerForms(next, { keepEditing: tickerEditingIndex != null })
+    await persistTickerForms(next, {
+      keepEditing: tickerEditingIndex != null,
+      silent: true,
+    })
+    const label = displayTicker(moved?.ticker) || 'Ticker'
+    const inSupabase = Boolean(selectedArticle?.savedRowId || selectedSavedMatch?.savedRowId)
+    showBottomToast({
+      title: 'Tickers reordered',
+      description: `${label} moved. Order is saved ${inSupabase ? 'to Supabase' : 'locally'}.`,
+    })
   }
 
   function renderTickerCards({ compact = false }: { compact?: boolean } = {}) {
@@ -3939,7 +4018,13 @@ function App() {
                 activeMarketTicker === 'all' && 'font-semibold text-foreground',
               )}
               disabled={marketTickers.length < 2}
-              onClick={() => setActiveMarketTicker('all')}
+              onClick={() => {
+                setActiveMarketTicker('all')
+                showBottomToast({
+                  title: 'Market filter',
+                  description: 'Showing all story tickers in the market column.',
+                })
+              }}
               size="sm"
               type="button"
               variant="ghost"
@@ -3953,7 +4038,13 @@ function App() {
                   'h-7 bg-transparent px-2 text-sm text-muted-foreground hover:bg-transparent hover:text-foreground',
                   activeMarketTicker === ticker && 'font-semibold text-foreground',
                 )}
-                onClick={() => setActiveMarketTicker(ticker)}
+                onClick={() => {
+                  setActiveMarketTicker(ticker)
+                  showBottomToast({
+                    title: 'Market filter',
+                    description: `Focused market column on ${displayTicker(ticker)}.`,
+                  })
+                }}
                 size="sm"
                 title={
                   tickerMetadata(ticker)
@@ -4421,43 +4512,9 @@ function App() {
   }
 
   // Shared client-style shell for both `/` and `/dashboard`.
+  // Bottom toast is rendered globally by <BottomToastProvider> in main.tsx.
   return (
       <main className="flex min-h-svh flex-col overflow-x-hidden bg-background text-foreground xl:h-svh xl:overflow-hidden">
-        {topAlert ? (
-          <div className="pointer-events-none fixed inset-x-0 bottom-4 z-[100] flex justify-center px-4">
-            <div className="pointer-events-auto w-full max-w-md animate-in fade-in slide-in-from-bottom-2 duration-200">
-              <Alert variant={topAlert.variant === 'destructive' ? 'destructive' : 'default'} className="shadow-lg">
-                {topAlert.variant === 'destructive' ? <AlertCircle /> : <Check />}
-                <AlertTitle>{topAlert.title}</AlertTitle>
-                {topAlert.description ? (
-                  <AlertDescription>{topAlert.description}</AlertDescription>
-                ) : null}
-                <AlertAction className="flex items-center gap-1">
-                  {tickerDeleteUndo && topAlert.title.toLowerCase().includes('ticker deleted') ? (
-                    <Button
-                      size="sm"
-                      type="button"
-                      variant="secondary"
-                      onClick={() => void undoDeleteTicker()}
-                    >
-                      <Undo2 className="size-3.5" />
-                      Undo
-                    </Button>
-                  ) : null}
-                  <Button
-                    size="icon-sm"
-                    type="button"
-                    variant="ghost"
-                    aria-label="Dismiss"
-                    onClick={() => setTopAlert(null)}
-                  >
-                    <X className="size-4" />
-                  </Button>
-                </AlertAction>
-              </Alert>
-            </div>
-          </div>
-        ) : null}
         <header className="sticky top-0 z-20 shrink-0 border-b bg-background/95 backdrop-blur">
           <div className="flex w-full flex-col gap-3 px-4 py-3 sm:px-6">
             <div className="grid gap-3 xl:grid-cols-[1fr_minmax(240px,31.5rem)_1fr] xl:items-center">
@@ -4537,6 +4594,23 @@ function App() {
                         <RefreshCw />
                       </Button>
                     ) : null}
+                    <Button
+                      onClick={() => {
+                        setClientProfilePanelOpen(false)
+                        navigate('/dashboard/database')
+                        showBottomToast({
+                          title: 'Database',
+                          description: 'Opening saved Yahoo / ticker snapshots.',
+                        })
+                      }}
+                      size="icon"
+                      title="Open Database"
+                      type="button"
+                      variant="outline"
+                      aria-label="Open Database"
+                    >
+                      <Database />
+                    </Button>
                   </>
                 )}
               </div>
@@ -4977,13 +5051,7 @@ function App() {
                         {renderLinkedMarketNews()}
                       </>
                     )}
-                    {saveMessage ? (
-                      <Alert>
-                        <Bell />
-                        <AlertTitle>Action</AlertTitle>
-                        <AlertDescription>{saveMessage}</AlertDescription>
-                      </Alert>
-                    ) : null}
+
                   </article>
                 </ScrollArea>
               ) : (

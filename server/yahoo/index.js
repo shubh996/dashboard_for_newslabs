@@ -23,8 +23,18 @@ function getSupabase() {
 }
 
 function errorMessage(error, fallback) {
-  if (error instanceof Error) return error.message
-  if (error && typeof error === 'object' && typeof error.message === 'string') return error.message
+  if (!error) return fallback
+  if (typeof error === 'string') return error
+  if (error instanceof Error) {
+    // Supabase / PostgREST errors often put useful detail on extra fields.
+    const extra = [error.details, error.hint, error.code].filter(Boolean).join(' · ')
+    return extra ? `${error.message} (${extra})` : error.message
+  }
+  if (typeof error === 'object') {
+    const message = typeof error.message === 'string' ? error.message : fallback
+    const extra = [error.details, error.hint, error.code].filter(Boolean).join(' · ')
+    return extra ? `${message} (${extra})` : message
+  }
   return fallback
 }
 
@@ -32,16 +42,165 @@ function normalizeSnapshot(row) {
   if (!row) return null
   return {
     ticker: row.ticker,
-    data: row.data,
-    rawJson: row.raw_json,
-    moduleStatus: row.module_status,
-    sourceMetadata: row.source_metadata,
+    data: row.data ?? {},
+    rawJson: row.raw_json ?? {},
+    moduleStatus: row.module_status ?? {},
+    sourceMetadata: row.source_metadata ?? {},
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     sourceTable: 'yahoo_finance_snapshots',
     source: 'yahoo-finance',
   }
 }
+
+/**
+ * Yahoo full modules are ~1.5–2MB (chart alone ~500KB, duplicated in data + raw).
+ * Upserting that + GIN on jsonb hits Supabase statement_timeout (~5s, code 57014).
+ * Slim before write: drop re-fetchable series, cap huge arrays.
+ */
+function capList(value, max) {
+  if (!Array.isArray(value)) return value
+  if (value.length <= max) return value
+  return value.slice(0, max)
+}
+
+function slimChart(chart) {
+  if (!chart || typeof chart !== 'object') return chart
+  const meta = chart.meta ?? chart.chart?.result?.[0]?.meta ?? null
+  return {
+    omitted: true,
+    meta,
+    note: 'OHLCV series omitted from Supabase snapshot — load live via /api/yahoo/:ticker/chart',
+  }
+}
+
+function slimHeavyObject(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input
+  const out = { ...input }
+
+  if ('chart' in out) out.chart = slimChart(out.chart)
+
+  // Common Yahoo module shapes with long histories.
+  if (out.upgradeDowngradeHistory && typeof out.upgradeDowngradeHistory === 'object') {
+    const hist = out.upgradeDowngradeHistory
+    out.upgradeDowngradeHistory = {
+      ...hist,
+      history: capList(hist.history, 80),
+    }
+  }
+  if (Array.isArray(out.history)) out.history = capList(out.history, 80)
+
+  if (out.options && typeof out.options === 'object') {
+    const opt = out.options
+    out.options = {
+      ...opt,
+      calls: capList(opt.calls, 40),
+      puts: capList(opt.puts, 40),
+      expirationDates: capList(opt.expirationDates, 12),
+      options: Array.isArray(opt.options)
+        ? opt.options.slice(0, 2).map((chain) => ({
+            ...chain,
+            calls: capList(chain?.calls, 40),
+            puts: capList(chain?.puts, 40),
+          }))
+        : opt.options,
+    }
+  }
+
+  if (out.insights && typeof out.insights === 'object') {
+    const insights = out.insights
+    out.insights = {
+      ...insights,
+      // Keep summary fields; drop bulky report blobs when present.
+      reports: capList(insights.reports, 5),
+      sigDevs: capList(insights.sigDevs, 15),
+    }
+  }
+
+  if (out.secFilings && typeof out.secFilings === 'object') {
+    const filings = out.secFilings
+    out.secFilings = {
+      ...filings,
+      filings: capList(filings.filings, 40),
+      raw: undefined,
+    }
+  }
+  if (Array.isArray(out.filings)) out.filings = capList(out.filings, 40)
+
+  if (out.insiderTransactions && typeof out.insiderTransactions === 'object') {
+    const insider = out.insiderTransactions
+    out.insiderTransactions = {
+      ...insider,
+      transactions: capList(insider.transactions, 60),
+    }
+  }
+  if (out.insider && typeof out.insider === 'object') {
+    out.insider = {
+      ...out.insider,
+      transactions: capList(out.insider.transactions, 60),
+      holders: capList(out.insider.holders, 40),
+    }
+  }
+
+  if (out.statements && typeof out.statements === 'object') {
+    // Keep statements but they are already moderate; no-op unless arrays explode.
+    for (const key of Object.keys(out.statements)) {
+      if (Array.isArray(out.statements[key])) {
+        out.statements[key] = capList(out.statements[key], 40)
+      }
+    }
+  }
+
+  return out
+}
+
+function prepareSnapshotRow(ticker, body) {
+  const plainData = toPlainJson(body.data && typeof body.data === 'object' ? body.data : {}) || {}
+  const plainRaw =
+    toPlainJson(
+      body.rawJson && typeof body.rawJson === 'object'
+        ? body.rawJson
+        : body.raw_json && typeof body.raw_json === 'object'
+          ? body.raw_json
+          : {},
+    ) || {}
+  const moduleStatus =
+    toPlainJson(
+      body.moduleStatus && typeof body.moduleStatus === 'object'
+        ? body.moduleStatus
+        : body.module_status && typeof body.module_status === 'object'
+          ? body.module_status
+          : {},
+    ) || {}
+  const sourceMetadata =
+    toPlainJson(
+      body.sourceMetadata && typeof body.sourceMetadata === 'object'
+        ? body.sourceMetadata
+        : body.source_metadata && typeof body.source_metadata === 'object'
+          ? body.source_metadata
+          : { source: 'yahoo-finance', fetchedAt: new Date().toISOString() },
+    ) || { source: 'yahoo-finance', fetchedAt: new Date().toISOString() }
+
+  const data = slimHeavyObject(plainData)
+  const rawJson = slimHeavyObject(plainRaw)
+
+  return {
+    ticker,
+    data,
+    raw_json: rawJson,
+    module_status: moduleStatus,
+    source_metadata: {
+      ...sourceMetadata,
+      source: 'yahoo-finance',
+      slimmedForSave: true,
+      chartOmitted: true,
+    },
+    updated_at: new Date().toISOString(),
+  }
+}
+
+// After upsert, only return lightweight columns (returning 2MB jsonb doubles work / timeout risk).
+const SNAPSHOT_SELECT_LIGHT = 'ticker, module_status, source_metadata, created_at, updated_at'
 
 router.get('/modules', (_request, response) => {
   response.json({
@@ -51,7 +210,37 @@ router.get('/modules', (_request, response) => {
   })
 })
 
-// Must be registered before /:ticker routes so "search" is not treated as a ticker.
+// Must be registered before /:ticker routes so path segments are not treated as tickers.
+// Batch check which tickers exist in yahoo_finance_snapshots (avoids N×404 console noise).
+router.get('/saved-status', async (request, response) => {
+  try {
+    const tickers = String(request.query.tickers || '')
+      .split(',')
+      .map((item) => item.trim().toUpperCase())
+      .filter(Boolean)
+      .slice(0, 80)
+
+    if (!tickers.length) {
+      response.json({ saved: {} })
+      return
+    }
+
+    const supabase = getSupabase()
+    const { data, error } = await supabase
+      .from('yahoo_finance_snapshots')
+      .select('ticker')
+      .in('ticker', tickers)
+
+    if (error) throw error
+
+    const found = new Set((data || []).map((row) => String(row.ticker || '').toUpperCase()))
+    const saved = Object.fromEntries(tickers.map((ticker) => [ticker, found.has(ticker)]))
+    response.json({ saved })
+  } catch (error) {
+    response.status(500).json({ error: errorMessage(error, 'Failed to check saved Yahoo Finance tickers') })
+  }
+})
+
 // Returns saved snapshots when present, plus live Yahoo Finance quote matches
 // so the search bar always shows suggestions while typing (not only for saved tickers).
 router.get('/search', async (request, response) => {
@@ -373,7 +562,8 @@ router.get('/:ticker/saved', async (request, response) => {
     const { data, error } = await supabase.from('yahoo_finance_snapshots').select('*').eq('ticker', ticker).maybeSingle()
     if (error) throw error
     if (!data) {
-      response.status(404).json({ error: 'No saved Yahoo Finance snapshot for this ticker' })
+      // 200 + null (not 404) so browsers don't log expected "not saved yet" as failed requests.
+      response.status(200).json(null)
       return
     }
     response.json(normalizeSnapshot(data))
@@ -387,40 +577,27 @@ router.post('/:ticker/save', async (request, response) => {
   try {
     const ticker = request.params.ticker.toUpperCase()
     const body = request.body || {}
-    const data = body.data && typeof body.data === 'object' ? body.data : {}
-    const rawJson = body.rawJson && typeof body.rawJson === 'object' ? body.rawJson : body.raw_json && typeof body.raw_json === 'object' ? body.raw_json : {}
-    const moduleStatus =
-      body.moduleStatus && typeof body.moduleStatus === 'object'
-        ? body.moduleStatus
-        : body.module_status && typeof body.module_status === 'object'
-          ? body.module_status
-          : {}
-    const sourceMetadata =
-      body.sourceMetadata && typeof body.sourceMetadata === 'object'
-        ? body.sourceMetadata
-        : body.source_metadata && typeof body.source_metadata === 'object'
-          ? body.source_metadata
-          : { source: 'yahoo-finance', fetchedAt: new Date().toISOString() }
+    const row = prepareSnapshotRow(ticker, body)
 
     const supabase = getSupabase()
-    const row = {
-      ticker,
-      data,
-      raw_json: rawJson,
-      module_status: moduleStatus,
-      source_metadata: { ...sourceMetadata, source: 'yahoo-finance' },
-      updated_at: new Date().toISOString(),
-    }
-
     const { data: saved, error } = await supabase
       .from('yahoo_finance_snapshots')
       .upsert(row, { onConflict: 'ticker' })
-      .select()
+      .select(SNAPSHOT_SELECT_LIGHT)
       .single()
 
     if (error) throw error
-    response.json({ ok: true, snapshot: normalizeSnapshot(saved) })
+    // Echo slimmed payloads so the client still has full UI data without a re-read of jsonb.
+    response.json({
+      ok: true,
+      snapshot: normalizeSnapshot({
+        ...saved,
+        data: row.data,
+        raw_json: row.raw_json,
+      }),
+    })
   } catch (error) {
+    console.error('[yahoo/save]', request.params.ticker, errorMessage(error, 'save failed'), error)
     response.status(500).json({ error: errorMessage(error, 'Failed to save Yahoo Finance snapshot') })
   }
 })
@@ -430,26 +607,32 @@ router.post('/:ticker/refresh', async (request, response) => {
   try {
     const ticker = request.params.ticker.toUpperCase()
     const bundle = await fetchAllYahooModules(ticker)
-    const supabase = getSupabase()
-    const row = {
-      ticker,
+    const row = prepareSnapshotRow(ticker, {
       data: bundle.data,
-      raw_json: bundle.raw_json,
-      module_status: bundle.module_status,
-      source_metadata: {
+      rawJson: bundle.raw_json,
+      moduleStatus: bundle.module_status,
+      sourceMetadata: {
         source: 'yahoo-finance',
         fetchedAt: bundle.fetchedAt,
         units: bundle.units,
       },
-      updated_at: new Date().toISOString(),
-    }
+    })
+    const supabase = getSupabase()
     const { data: saved, error } = await supabase
       .from('yahoo_finance_snapshots')
       .upsert(row, { onConflict: 'ticker' })
-      .select()
+      .select(SNAPSHOT_SELECT_LIGHT)
       .single()
     if (error) throw error
-    response.json({ ok: true, bundle, snapshot: normalizeSnapshot(saved) })
+    response.json({
+      ok: true,
+      bundle,
+      snapshot: normalizeSnapshot({
+        ...saved,
+        data: row.data,
+        raw_json: row.raw_json,
+      }),
+    })
   } catch (error) {
     response.status(500).json({ error: errorMessage(error, 'Failed to refresh Yahoo Finance snapshot') })
   }

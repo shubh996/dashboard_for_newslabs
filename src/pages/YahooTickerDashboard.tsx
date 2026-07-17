@@ -32,6 +32,7 @@ import {
   YahooRawJsonSection,
   YahooValuationSection,
 } from '@/components/yahoo/YahooDataSections'
+import { useBottomToast } from '@/components/ui/bottom-toast'
 import { useEdgarSection } from '@/hooks/useEdgarSection'
 import { getCongressTrading, getProxyStatement } from '@/services/edgarApi'
 import {
@@ -77,6 +78,7 @@ export default function YahooTickerDashboard({
   const { symbol: routeSymbol = '' } = useParams<{ symbol: string }>()
   const ticker = (symbolProp || routeSymbol || '').toUpperCase()
   const navigate = useNavigate()
+  const { toast } = useBottomToast()
   const [searchParams, setSearchParams] = useSearchParams()
   const urlSavedOnly = searchParams.get('source') === 'saved'
   // Embedded Market: load saved snapshot first when available (database dashboard UX).
@@ -374,10 +376,16 @@ export default function YahooTickerDashboard({
       setFromSaved(true)
       setSaveState('saved')
       onSavedChange?.(ticker, true)
+      toast({
+        title: `${ticker} saved`,
+        description: 'Yahoo Finance snapshot stored in Supabase (yahoo_finance_snapshots).',
+      })
       setTimeout(() => setSaveState('idle'), 3000)
     } catch (err) {
       setSaveState('error')
-      setSaveError(err instanceof Error ? err.message : 'Failed to save')
+      const message = err instanceof Error ? err.message : 'Failed to save'
+      setSaveError(message)
+      toast({ title: `${ticker} save failed`, description: message, variant: 'destructive' })
     }
   }
 
@@ -388,6 +396,10 @@ export default function YahooTickerDashboard({
     setProgress({})
     setLoadPhase('yahoo')
     setLoadDetail(`Yahoo Finance — refreshing all modules for ${ticker}…`)
+    toast({
+      title: `Refreshing ${ticker}`,
+      description: 'Fetching all Yahoo Finance modules, then saving to Supabase…',
+    })
     try {
       // Clear saved mode so we show live progress after refresh.
       if (urlSavedOnly) setSearchParams({})
@@ -400,6 +412,10 @@ export default function YahooTickerDashboard({
       setFromSaved(true)
       setActiveTab('overview')
       onSavedChange?.(ticker, true)
+      toast({
+        title: `${ticker} refreshed`,
+        description: 'Live Yahoo data loaded and snapshot updated in Supabase.',
+      })
       const nextProgress: Record<string, YahooUnitProgress> = {}
       for (const unit of result.bundle.units || []) {
         nextProgress[unit.unitId] = unit
@@ -409,7 +425,9 @@ export default function YahooTickerDashboard({
       setLoadDetail('')
       setLoading(false)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to refresh from Yahoo Finance')
+      const message = err instanceof Error ? err.message : 'Failed to refresh from Yahoo Finance'
+      setError(message)
+      toast({ title: `${ticker} refresh failed`, description: message, variant: 'destructive' })
       setLoadPhase('idle')
       setLoadDetail('')
       setLoading(false)
