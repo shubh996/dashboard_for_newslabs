@@ -10,6 +10,9 @@ import YahooTickerDashboard from './pages/YahooTickerDashboard.tsx'
 import ManagerPortfolioPage from './pages/ManagerPortfolioPage.tsx'
 import PoliticianPortfolioPage from './pages/PoliticianPortfolioPage.tsx'
 import TickerDatabasePage from './pages/TickerDatabasePage.tsx'
+import PrivacyPage from './pages/PrivacyPage.tsx'
+import TermsPage from './pages/TermsPage.tsx'
+import SupportPage from './pages/SupportPage.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -17,6 +20,9 @@ createRoot(document.getElementById('root')!).render(
       <BottomToastProvider>
         <BrowserRouter>
           <Routes>
+            <Route path="/privacy" element={<PrivacyPage />} />
+            <Route path="/terms" element={<TermsPage />} />
+            <Route path="/support" element={<SupportPage />} />
             <Route path="/dashboard/database" element={<TickerDatabasePage />} />
             <Route path="/dashboard/yahoo/:symbol" element={<YahooTickerDashboard />} />
             <Route path="/dashboard/ticker/manager/:cik" element={<ManagerPortfolioPage />} />

@@ -10,6 +10,7 @@ import { useSavedEntities } from '@/hooks/useSavedEntities'
 import { getManagerList, refreshAllManagers, searchSaved } from '@/services/edgarApi'
 import { searchYahooSaved } from '@/services/yahooApi'
 import { cn } from '@/lib/utils'
+import { readPref, writePref } from '@/lib/prefs'
 import type { ManagerList, ManagerListItem, ManagerRefreshSummary, SearchResultItem, SearchResults } from '@/types/edgar'
 import type { YahooSearchResult } from '@/types/yahoo'
 
@@ -45,11 +46,11 @@ function looksLikeTicker(value: string) {
 // stays consistent no matter which page you land on first.
 function useTheme() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() =>
-    window.localStorage.getItem('newslabs-theme') === 'dark' ? 'dark' : 'light',
+    readPref('theme') === 'dark' ? 'dark' : 'light',
   )
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
-    window.localStorage.setItem('newslabs-theme', theme)
+    writePref('theme', theme)
   }, [theme])
   return [theme, setTheme] as const
 }

@@ -1,6 +1,6 @@
-# dashboard_for_newslabs
+# 9AM
 
-React + TypeScript dashboard for fetching market news from Alpha Vantage, Polygon, Yahoo Finance through the local `yfinance-main` Python package, and NewsAPI. API keys stay in the local backend proxy.
+React + TypeScript dashboard for the **9AM** market news product. Fetches market news from Alpha Vantage, Polygon, Yahoo Finance through the local `yfinance-main` Python package, and NewsAPI. API keys stay in the local backend proxy.
 
 ## Run
 

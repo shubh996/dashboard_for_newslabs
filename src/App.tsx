@@ -48,6 +48,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { readPref, writePref } from '@/lib/prefs'
 import { supabase, supabaseAuthConfigured } from '@/lib/supabaseClient'
 import {
   fetchYahooQuote,
@@ -726,6 +727,85 @@ function articleAiUrl(article: NewsArticle, tickers: EnrichedTicker[], topics: E
   return `https://www.perplexity.ai/search/?q=${encodedPrompt}`
 }
 
+/** Prompt for discovering / improving linked tickers from full story context. Always opens Perplexity. */
+function linkedTickersAiPrompt(article: NewsArticle, tickers: EnrichedTicker[], topics: EnrichedTopic[]) {
+  const tickerLines = tickers.length
+    ? tickers.map((ticker, index) => {
+      return [
+        `${index + 1}. ${displayTicker(ticker.ticker)}`,
+        ticker.exchange || '—',
+        ticker.sentimentLabel || '—',
+        ticker.sentimentScore || '—',
+        ticker.relevance || '—',
+        ticker.reason || '—',
+      ].join(' | ')
+    }).join('\n')
+    : '(none tagged yet)'
+
+  const topicLines = topics.length
+    ? topics.map((topic) => {
+      return [
+        topic.topic,
+        topic.relevance ? `relevance ${topic.relevance}` : '',
+        topic.sentimentLabel ? `sentiment ${topic.sentimentLabel}` : '',
+        topic.sentimentScore ? `score ${topic.sentimentScore}` : '',
+      ].filter(Boolean).join(' · ')
+    }).join('\n')
+    : '(none)'
+
+  return [
+    'You are a senior market-news desk editor at a finance newsroom.',
+    'Task: recommend the BEST linked public-market tickers for the story below so an editor can tag the article.',
+    '',
+    'Rules:',
+    '- Only US/major exchange listed stocks, ADRs, or liquid ETFs (NYSE, NASDAQ, AMEX, ARCA). No private companies, no OTC penny noise, no made-up symbols.',
+    '- Prefer names explicitly mentioned or clearly material to the story (issuer, competitor, supplier, customer, sector proxy).',
+    '- Cap at 6 tickers total. Order by relevance desc. Primary name first.',
+    '- Be precise: if a company is private, map to the closest public parent/peer/ETF only if material, and say so in reason.',
+    '- Do not invent financial facts. If unsure, lower relevance and say why.',
+    '- Match our editor form fields exactly: Symbol, Exchange, Sentiment, Score, Relevance, Reason.',
+    '',
+    'Output format (use exactly these sections, nothing else before section 1):',
+    '',
+    '## 1) Final linked tickers (paste-ready)',
+    'Markdown table with columns:',
+    '| Symbol | Exchange | Sentiment | Score | Relevance | Reason |',
+    'Where:',
+    '- Symbol = Yahoo-style ticker only (e.g. AAPL, BRK-B, NVDA) — no company name in this cell',
+    '- Exchange = NASDAQ / NYSE / AMEX / ARCA (best guess)',
+    '- Sentiment = Bullish | Bearish | Neutral for THIS story’s impact on that ticker',
+    '- Score = number from -1.00 to 1.00 (story impact; not stock rating)',
+    '- Relevance = number from 0.00 to 1.00 (how tightly linked to this story)',
+    '- Reason = one tight sentence, max 18 words, why it belongs on this story',
+    '',
+    '## 2) Keep / drop current tags',
+    'For each currently linked ticker: KEEP or DROP + one short why.',
+    'If none tagged, write: none tagged.',
+    '',
+    '## 3) One-line desk note',
+    'Single sentence: what this story is really about for markets (max 25 words).',
+    '',
+    '--- STORY ---',
+    `Headline: ${article.title}`,
+    `Published: ${formatDate(article.publishedAt)}`,
+    `Source: ${article.source || article.providerLabel}`,
+    article.author ? `Author: ${article.author}` : '',
+    article.url ? `URL: ${article.url}` : '',
+    `Summary: ${truncatePromptPart(article.summary || 'No summary provided.', 1800)}`,
+    '',
+    'Currently linked tickers (Symbol | Exchange | Sentiment | Score | Relevance | Reason):',
+    tickerLines,
+    '',
+    'Topics:',
+    topicLines,
+    '--- END ---',
+  ].filter(Boolean).join('\n')
+}
+
+function linkedTickersPerplexityUrl(article: NewsArticle, tickers: EnrichedTicker[], topics: EnrichedTopic[]) {
+  return `https://www.perplexity.ai/search/?q=${encodeURIComponent(linkedTickersAiPrompt(article, tickers, topics))}`
+}
+
 function formatLivePrice(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return '—'
   return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -1111,7 +1191,7 @@ function App() {
   const [showNormalizedJson, setShowNormalizedJson] = useState(false)
   const [apiDebugPanelOpen, setApiDebugPanelOpen] = useState(() => {
     if (typeof window === 'undefined') return false
-    return window.localStorage.getItem('newslabs-api-debug-panel') === 'true'
+    return readPref('api-debug-panel') === 'true'
   })
   const [apiCallLogs, setApiCallLogs] = useState<ApiCallLog[]>([])
   const [linkedStoryNewsStoryKey, setLinkedStoryNewsStoryKey] = useState('')
@@ -1123,34 +1203,34 @@ function App() {
   const [reportedArticleIds, setReportedArticleIds] = useState<Set<string>>(() => new Set())
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window === 'undefined') return 'light'
-    return window.localStorage.getItem('newslabs-theme') === 'dark' ? 'dark' : 'light'
+    return readPref('theme') === 'dark' ? 'dark' : 'light'
   })
   const [aiDestination, setAiDestination] = useState<AiDestination>(() => {
     if (typeof window === 'undefined') return 'perplexity'
-    const stored = window.localStorage.getItem('newslabs-ai-destination')
+    const stored = readPref('ai-destination')
     return aiDestinations.some((item) => item.id === stored) ? stored as AiDestination : 'perplexity'
   })
   const [stockOpenDestination, setStockOpenDestination] = useState<StockOpenDestination>(() => {
     if (typeof window === 'undefined') return 'tradingview'
-    const stored = window.localStorage.getItem('newslabs-stock-open-destination')
+    const stored = readPref('stock-open-destination')
     return stockOpenDestinations.some((item) => item.id === stored) ? stored as StockOpenDestination : 'tradingview'
   })
   const [previewWidth, setPreviewWidth] = useState(() => {
     if (typeof window === 'undefined') return 520
-    return clamp(Number(window.localStorage.getItem('newslabs-preview-width') || 520), previewMinWidth, previewMaxWidth)
+    return clamp(Number(readPref('preview-width') || 520), previewMinWidth, previewMaxWidth)
   })
   const [isResizingPreview, setIsResizingPreview] = useState(false)
   const [clientLatestWidth, setClientLatestWidth] = useState(() => {
     if (typeof window === 'undefined') return 360
-    return clamp(Number(window.localStorage.getItem('newslabs-client-latest-width') || 360), 300, 560)
+    return clamp(Number(readPref('client-latest-width') || 360), 300, 560)
   })
   const [clientStoryWidth, setClientStoryWidth] = useState(() => {
     if (typeof window === 'undefined') return 520
-    return clamp(Number(window.localStorage.getItem('newslabs-client-story-width') || 520), 380, 780)
+    return clamp(Number(readPref('client-story-width') || 520), 380, 780)
   })
   const [clientTickerWidth, setClientTickerWidth] = useState(() => {
     if (typeof window === 'undefined') return 320
-    return clamp(Number(window.localStorage.getItem('newslabs-client-ticker-width') || 320), 260, 460)
+    return clamp(Number(readPref('client-ticker-width') || 320), 260, 460)
   })
   const [clientResizeTarget, setClientResizeTarget] = useState<'latest' | 'story' | 'tickers' | null>(null)
   const [editForm, setEditForm] = useState<EditArticleForm>({
@@ -1547,15 +1627,15 @@ function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
-    window.localStorage.setItem('newslabs-theme', theme)
+    writePref('theme', theme)
   }, [theme])
 
   useEffect(() => {
-    window.localStorage.setItem('newslabs-ai-destination', aiDestination)
+    writePref('ai-destination', aiDestination)
   }, [aiDestination])
 
   useEffect(() => {
-    window.localStorage.setItem('newslabs-stock-open-destination', stockOpenDestination)
+    writePref('stock-open-destination', stockOpenDestination)
   }, [stockOpenDestination])
 
   useEffect(() => {
@@ -1589,7 +1669,7 @@ function App() {
   }, [authUser])
 
   useEffect(() => {
-    window.localStorage.setItem('newslabs-api-debug-panel', String(apiDebugPanelOpen))
+    writePref('api-debug-panel', String(apiDebugPanelOpen))
   }, [apiDebugPanelOpen])
 
   useEffect(() => {
@@ -1740,22 +1820,22 @@ function App() {
 
   useEffect(() => {
     previewWidthRef.current = previewWidth
-    window.localStorage.setItem('newslabs-preview-width', String(previewWidth))
+    writePref('preview-width', String(previewWidth))
   }, [previewWidth])
 
   useEffect(() => {
     clientLatestWidthRef.current = clientLatestWidth
-    window.localStorage.setItem('newslabs-client-latest-width', String(clientLatestWidth))
+    writePref('client-latest-width', String(clientLatestWidth))
   }, [clientLatestWidth])
 
   useEffect(() => {
     clientStoryWidthRef.current = clientStoryWidth
-    window.localStorage.setItem('newslabs-client-story-width', String(clientStoryWidth))
+    writePref('client-story-width', String(clientStoryWidth))
   }, [clientStoryWidth])
 
   useEffect(() => {
     clientTickerWidthRef.current = clientTickerWidth
-    window.localStorage.setItem('newslabs-client-ticker-width', String(clientTickerWidth))
+    writePref('client-ticker-width', String(clientTickerWidth))
   }, [clientTickerWidth])
 
 
@@ -2722,6 +2802,16 @@ function App() {
   function openSelectedArticleAi() {
     if (!selectedArticle) return
     window.open(articleAiUrl(selectedArticle, enrichedTickers, enrichedTopics, aiDestination), '_blank', 'noopener,noreferrer')
+  }
+
+  /** Tickers column: open Perplexity with full story context and ask for linked tickers. */
+  function openLinkedTickersAi() {
+    if (!selectedArticle) return
+    window.open(
+      linkedTickersPerplexityUrl(selectedArticle, enrichedTickers, enrichedTopics),
+      '_blank',
+      'noopener,noreferrer',
+    )
   }
 
   /** Inline story editor form — lives inside the Story column only. */
@@ -4500,11 +4590,50 @@ function App() {
                     ))}
                   </div>
                 </div>
+
+                <div className="rounded-lg border p-4">
+                  <div className="text-sm font-medium uppercase text-muted-foreground">Support & legal</div>
+                  <div className="mt-3 grid gap-2">
+                    <Button
+                      className="justify-start"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setClientProfilePanelOpen(false)
+                        navigate('/support')
+                      }}
+                    >
+                      Support
+                    </Button>
+                    <Button
+                      className="justify-start"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setClientProfilePanelOpen(false)
+                        navigate('/privacy')
+                      }}
+                    >
+                      Privacy Policy
+                    </Button>
+                    <Button
+                      className="justify-start"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setClientProfilePanelOpen(false)
+                        navigate('/terms')
+                      }}
+                    >
+                      Terms of Use
+                    </Button>
+                  </div>
+                </div>
               </section>
             </div>
           </CardContent>
           <div className="border-t px-4 py-2 text-center text-sm text-muted-foreground sm:px-6">
-            ↑/↓ or ←/→ move news
+            9AM · ↑/↓ or ←/→ move news
           </div>
         </Card>
       </div>
@@ -4519,7 +4648,7 @@ function App() {
           <div className="flex w-full flex-col gap-3 px-4 py-3 sm:px-6">
             <div className="grid gap-3 xl:grid-cols-[1fr_minmax(240px,31.5rem)_1fr] xl:items-center">
               <div className="min-w-0">
-                <h1 className="text-2xl font-semibold tracking-normal">The News Company</h1>
+                <h1 className="text-2xl font-semibold tracking-normal">9AM</h1>
               </div>
               <div className="flex min-h-10 items-center justify-start gap-2 xl:justify-center">
                 {loading && !clientMode && loadingStatus ? (
@@ -4880,52 +5009,57 @@ function App() {
                       ) : null}
                     </>
                   ) : null}
-                  <Button
-                    aria-label="Save bookmark"
-                    className={cn(selectedArticleBookmarked && 'text-primary')}
-                    disabled={!selectedArticle}
-                    onClick={toggleClientBookmark}
-                    size="icon-sm"
-                    title="Save bookmark"
-                    type="button"
-                    variant={selectedArticleBookmarked ? 'secondary' : 'outline'}
-                  >
-                    <Bookmark className={cn(selectedArticleBookmarked && 'fill-current')} />
-                  </Button>
-                  <Button
-                    aria-label="Like article"
-                    className={cn(selectedArticleLiked && 'text-primary')}
-                    disabled={!selectedArticle}
-                    onClick={toggleClientLike}
-                    size="icon-sm"
-                    title="Like"
-                    type="button"
-                    variant={selectedArticleLiked ? 'secondary' : 'outline'}
-                  >
-                    <Heart className={cn(selectedArticleLiked && 'fill-current')} />
-                  </Button>
-                  <Button
-                    aria-label="Report article"
-                    disabled={!selectedArticle}
-                    onClick={reportClientArticle}
-                    size="icon-sm"
-                    title="Report"
-                    type="button"
-                    variant={selectedArticleReported ? 'destructive' : 'outline'}
-                  >
-                    <Flag />
-                  </Button>
-                  <Button
-                    aria-label="Share article"
-                    disabled={!selectedArticle?.url}
-                    onClick={() => void shareClientArticle()}
-                    size="icon-sm"
-                    title="Share"
-                    type="button"
-                    variant="outline"
-                  >
-                    <Share2 />
-                  </Button>
+                  {/* Client mode keeps social actions; dashboard keeps only AI / Edit / Save. */}
+                  {clientMode ? (
+                    <>
+                      <Button
+                        aria-label="Save bookmark"
+                        className={cn(selectedArticleBookmarked && 'text-primary')}
+                        disabled={!selectedArticle}
+                        onClick={toggleClientBookmark}
+                        size="icon-sm"
+                        title="Save bookmark"
+                        type="button"
+                        variant={selectedArticleBookmarked ? 'secondary' : 'outline'}
+                      >
+                        <Bookmark className={cn(selectedArticleBookmarked && 'fill-current')} />
+                      </Button>
+                      <Button
+                        aria-label="Like article"
+                        className={cn(selectedArticleLiked && 'text-primary')}
+                        disabled={!selectedArticle}
+                        onClick={toggleClientLike}
+                        size="icon-sm"
+                        title="Like"
+                        type="button"
+                        variant={selectedArticleLiked ? 'secondary' : 'outline'}
+                      >
+                        <Heart className={cn(selectedArticleLiked && 'fill-current')} />
+                      </Button>
+                      <Button
+                        aria-label="Report article"
+                        disabled={!selectedArticle}
+                        onClick={reportClientArticle}
+                        size="icon-sm"
+                        title="Report"
+                        type="button"
+                        variant={selectedArticleReported ? 'destructive' : 'outline'}
+                      >
+                        <Flag />
+                      </Button>
+                      <Button
+                        aria-label="Share article"
+                        disabled={!selectedArticle?.url}
+                        onClick={() => void shareClientArticle()}
+                        size="icon-sm"
+                        title="Share"
+                        type="button"
+                        variant="outline"
+                      >
+                        <Share2 />
+                      </Button>
+                    </>
+                  ) : null}
                 </div>
               </div>
             </CardHeader>
@@ -5094,18 +5228,32 @@ function App() {
                         : 'Select a story'}
                   </CardDescription>
                 </div>
-                <Button
-                  aria-label="Add ticker"
-                  className="shrink-0"
-                  disabled={!selectedArticle || loading || saving}
-                  size="icon-sm"
-                  title="Add ticker"
-                  type="button"
-                  variant="outline"
-                  onClick={startAddTicker}
-                >
-                  <Plus className="size-4" />
-                </Button>
+                <div className="flex shrink-0 items-center gap-1">
+                  <Button
+                    aria-label="Add ticker"
+                    disabled={!selectedArticle || loading || saving}
+                    size="icon-sm"
+                    title="Add ticker"
+                    type="button"
+                    variant="outline"
+                    onClick={startAddTicker}
+                  >
+                    <Plus className="size-4" />
+                  </Button>
+                  {!clientMode ? (
+                    <Button
+                      aria-label="Ask Perplexity for linked tickers"
+                      disabled={!selectedArticle || loading}
+                      size="icon-sm"
+                      title="Ask Perplexity for linked tickers from this story"
+                      type="button"
+                      variant="outline"
+                      onClick={openLinkedTickersAi}
+                    >
+                      <Sparkles className="size-4" />
+                    </Button>
+                  ) : null}
+                </div>
               </div>
             </CardHeader>
             <CardContent className="min-h-0 flex-1 p-0">
