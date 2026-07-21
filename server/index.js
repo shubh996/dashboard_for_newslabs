@@ -6,6 +6,7 @@ import express from 'express'
 import { createClient } from '@supabase/supabase-js'
 import edgarRouter from './edgar/index.js'
 import yahooRouter from './yahoo/index.js'
+import { mountNotificationsRoutes } from './notifications.js'
 import { getYahooSession, fetchYahooQuoteSummary, yahooRaw } from './yahooClient.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -1277,6 +1278,9 @@ app.post('/api/articles/save', async (request, response) => {
 app.use('/api/edgar', edgarRouter)
 // Yahoo Finance ticker data — separate router + Supabase table from SEC EDGAR.
 app.use('/api/yahoo', yahooRouter)
+
+// Notifications dashboard: monitored tickers + Firecrawl Perplexity scrapes
+mountNotificationsRoutes(app, { getSupabase })
 
 app.listen(port, () => {
   console.log(`News dashboard API listening on http://localhost:${port}`)

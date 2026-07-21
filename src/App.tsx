@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   AlertCircle,
   ArrowUpRight,
+  Bell,
   Bookmark,
   Camera,
   CalendarClock,
@@ -131,7 +132,6 @@ type EditArticleForm = {
 
 type ClientCategoryId = 'all' | 'bookmarks' | 'liked' | 'ai' | 'business' | 'crypto' | 'markets' | 'us'
 type ClientRailView = 'latest' | 'search' | 'bookmarks' | 'liked' | 'reported'
-type DashboardCategoryId = 'all-us' | 'ai-infra' | 'digital-assets' | 'power-grid' | 'mega-cap' | 'wall-street' | 'health-innovation'
 type AiDestination = 'perplexity' | 'chatgpt' | 'grok' | 'gemini'
 type StockOpenDestination = 'tradingview' | 'yahoo-finance'
 type ApiCallStatus = 'pending' | 'success' | 'error'
@@ -175,18 +175,6 @@ const clientCategories: Array<{ id: ClientCategoryId; label: string; terms: stri
   { id: 'crypto', label: 'Crypto', terms: ['crypto', 'bitcoin', 'ethereum', 'blockchain', 'coinbase'] },
   { id: 'markets', label: 'Markets', terms: ['markets', 'stocks', 'nasdaq', 's&p', 'dow', 'etf', 'treasury'] },
   { id: 'us', label: 'US', terms: ['us', 'u.s.', 'united states', 'america', 'fed', 'washington'] },
-]
-
-const clientTopCategories = clientCategories.filter((category) => category.id !== 'bookmarks' && category.id !== 'liked')
-
-const dashboardCategories: Array<{ id: DashboardCategoryId; label: string; query: string }> = [
-  { id: 'all-us', label: 'All US', query: '^GSPC,^IXIC,^DJI,^RUT,^NYA' },
-  { id: 'ai-infra', label: 'AI Infra', query: 'NVDA,MSFT,AMD,AVGO,GOOGL,META' },
-  { id: 'digital-assets', label: 'Digital Assets', query: 'COIN,MSTR,HOOD,RIOT,MARA,IBIT' },
-  { id: 'power-grid', label: 'Power Grid', query: 'XOM,CVX,COP,SLB,NEE,GEV' },
-  { id: 'mega-cap', label: 'Mega Cap', query: 'AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA' },
-  { id: 'wall-street', label: 'Wall Street', query: 'JPM,BAC,WFC,GS,MS,BLK' },
-  { id: 'health-innovation', label: 'Health Innovation', query: 'LLY,UNH,JNJ,MRK,PFE,ISRG' },
 ]
 
 const aiDestinations: Array<{ id: AiDestination; label: string }> = [
@@ -1140,7 +1128,6 @@ function App() {
   const navigate = useNavigate()
   const { toast: showBottomToast } = useBottomToast()
   const [activeSource, setActiveSource] = useState<SourceTabId>('supabase')
-  const [activeDashboardCategory, setActiveDashboardCategory] = useState<DashboardCategoryId>('all-us')
   const [query, setQuery] = useState('')
   const [data, setData] = useState<NewsResponse | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -1263,7 +1250,7 @@ function App() {
   /** When true, skip auto scroll-into-view on selectedId change (saves/updates must not jump the list). */
   const suppressNewsListAutoScrollRef = useRef(false)
   const queryRef = useRef(query)
-  const activeDashboardCategoryRef = useRef(activeDashboardCategory)
+
   const savedOffsetRef = useRef(0)
   const hasMoreSavedRef = useRef(false)
   const loadingMoreSavedRef = useRef(false)
@@ -1926,10 +1913,6 @@ function App() {
   useEffect(() => {
     queryRef.current = query
   }, [query])
-
-  useEffect(() => {
-    activeDashboardCategoryRef.current = activeDashboardCategory
-  }, [activeDashboardCategory])
 
   useEffect(() => {
     void refreshSavedArticleIndex()
@@ -2667,19 +2650,6 @@ function App() {
     // Load Supabase feed once when entering the dashboard.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- avoid reloading over Polygon results
   }, [clientMode])
-
-  function handleDashboardCategoryChange(id: DashboardCategoryId) {
-    setActiveDashboardCategory(id)
-    activeDashboardCategoryRef.current = id
-    setQuery('')
-    const label =
-      dashboardCategories.find((item) => item.id === id)?.label ||
-      id.replace(/-/g, ' ')
-    showBottomToast({
-      title: 'Category changed',
-      description: `Filter set to “${label}”.`,
-    })
-  }
 
   function handleNewsListScroll(event: UIEvent<HTMLDivElement>) {
     if (!savedMode || loadingMoreSavedRef.current || !hasMoreSavedRef.current) return
@@ -4743,34 +4713,21 @@ function App() {
                   </>
                 )}
               </div>
-              <nav aria-label="News categories" className="flex flex-wrap items-center justify-start gap-1 sm:gap-3 xl:justify-end">
-                {(clientMode ? clientTopCategories : dashboardCategories).map((category) => (
-                  <Button
-                    key={category.id}
-                    className={cn(
-                      'bg-transparent px-2 text-base text-muted-foreground hover:bg-transparent hover:text-foreground',
-                      (clientMode
-                        ? activeClientCategory === category.id
-                        : activeDashboardCategory === category.id) && 'font-semibold text-foreground',
-                    )}
-                    onClick={() => {
-                      setClientProfilePanelOpen(false)
-                      if (clientMode) {
-                        setActiveClientCategory(category.id as ClientCategoryId)
-                        setActiveClientRailView('latest')
-                        setQuery('')
-                      } else {
-                        handleDashboardCategoryChange(category.id as DashboardCategoryId)
-                      }
-                    }}
-                    size="sm"
-                    type="button"
-                    variant="ghost"
-                  >
-                    {category.label}
-                  </Button>
-                ))}
-              </nav>
+              <div className="flex items-center justify-start gap-2 xl:justify-end">
+                <Button
+                  aria-label="Open notifications in a new tab"
+                  size="icon"
+                  title="Notifications"
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setClientProfilePanelOpen(false)
+                    window.open('/notifications', '_blank', 'noopener,noreferrer')
+                  }}
+                >
+                  <Bell className="size-4" />
+                </Button>
+              </div>
             </div>
           </div>
         </header>
@@ -4925,7 +4882,7 @@ function App() {
                       </>
                     ) : (
                       <div className="rounded-lg border p-4 text-base text-muted-foreground">
-                        No articles match this category yet.
+                        No articles match this view yet.
                       </div>
                     )}
                   </div>
