@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
-    "dev:api": "node server/index.js",
+    "dev:api": "node --watch server/index.js",
     "dev:web": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
