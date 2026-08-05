@@ -13,15 +13,20 @@ comment on column public.device_monitored_tickers.notable_price_movements is
   '"updated_at": iso, '
   '"last_scraped_at": iso, '
   '"source_url": string, '
+  '"source_provider": "perplexity" | "trading_economics", '
+  '"asset_class": "equity" | "commodity" | "forex" | "crypto" | "index", '
   '"dates": { '
   '  "YYYY-MM-DD": { '
   '    "event_date", "display_date", "time_label", "price", "price_change", '
+  '    "direction", "premarket_change", "premarket_direction", "premarket_reason", '
   '    "summary", "reasons"[], "sources"[], "source_count", '
   '    "content_fingerprint", "saved_at" '
   '  } '
   '}, '
   '"events_by_date": <same map as dates, for older readers> '
   '}. '
+  'Equity scrapes use Perplexity finance; non-equity (commodity/forex/crypto/index) '
+  'scrapes use Trading Economics via Firecrawl. '
   'Only new (or content-changed) dates are written; existing dates are never bulk-replaced.';
 
 create index if not exists device_monitored_tickers_ticker_idx

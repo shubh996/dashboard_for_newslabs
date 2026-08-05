@@ -351,6 +351,115 @@ const ALL_CHART_INTERVALS = new Set([
   '3mo',
 ])
 
+/** Try fetch an image URL; return { buf, contentType } or null. */
+async function tryFetchImage(url, timeoutMs = 7000) {
+  try {
+    const upstream = await fetch(url, {
+      headers: {
+        Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'User-Agent':
+          'Mozilla/5.0 (compatible; NewsLabsDashboard/1.0; +https://9am.site)',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!upstream.ok) return null
+    const contentType = (upstream.headers.get('content-type') || 'image/png').split(';')[0].trim()
+    if (!contentType.startsWith('image/')) return null
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    // Tiny / empty / placeholder GIFs often < ~100 bytes
+    if (buf.length < 100) return null
+    return { buf, contentType }
+  } catch {
+    return null
+  }
+}
+
+function hostFromWebsite(website) {
+  if (!website || typeof website !== 'string') return null
+  try {
+    let raw = website.trim()
+    if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`
+    const host = new URL(raw).hostname.replace(/^www\./i, '')
+    return host || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Same-origin logo proxy (list UI + canvas share-cards).
+ * Cascades several public sources until one returns a real image:
+ *   IEX → FMP → Parqet → Synth → Yahoo website favicon (Google / DuckDuckGo)
+ */
+router.get('/:ticker/logo', async (request, response) => {
+  try {
+    const ticker = String(request.params.ticker || '').toUpperCase()
+    const logoSymbol = ticker.replace(/[^A-Z0-9.-]/g, '')
+    if (!logoSymbol) {
+      response.status(400).json({ error: 'Invalid ticker' })
+      return
+    }
+
+    const yahooSymbol = toYahooSymbol(logoSymbol)
+    const candidates = []
+
+    // 1) Direct ticker logo CDNs (no auth)
+    candidates.push(`https://storage.googleapis.com/iex/api/logos/${logoSymbol}.png`)
+    candidates.push(`https://financialmodelingprep.com/image-stock/${logoSymbol}.png`)
+    candidates.push(`https://assets.parqet.com/logos/symbol/${logoSymbol}`)
+    candidates.push(`https://logo.synthfinance.com/ticker/${logoSymbol}`)
+
+    // 2) Optional website from query
+    let website =
+      typeof request.query.website === 'string' ? request.query.website.trim() : ''
+
+    // 3) Resolve website from Yahoo quoteSummary when missing
+    if (!website) {
+      try {
+        const summary = await yahooFinance.quoteSummary(
+          yahooSymbol,
+          { modules: ['assetProfile', 'summaryProfile'] },
+          { validateResult: false },
+        )
+        website =
+          summary?.assetProfile?.website ||
+          summary?.summaryProfile?.website ||
+          ''
+      } catch {
+        website = ''
+      }
+    }
+
+    // 4) Also try shortName-based nothing — domain favicons instead
+    const host = hostFromWebsite(website)
+    if (host) {
+      candidates.push(
+        `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=128`,
+      )
+      candidates.push(`https://icons.duckduckgo.com/ip3/${host}.ico`)
+      // Logo.dev public domain path (works for many brands without token for basic use)
+      candidates.push(`https://img.logo.dev/${host}?size=128&format=png`)
+    }
+
+    // 5) Last-ditch: Google favicon using ticker.com-style guesses is weak — skip
+
+    for (const url of candidates) {
+      const hit = await tryFetchImage(url)
+      if (!hit) continue
+      response.setHeader('Content-Type', hit.contentType)
+      response.setHeader('Cache-Control', 'public, max-age=86400')
+      response.setHeader('X-Logo-Source', new URL(url).hostname)
+      response.send(hit.buf)
+      return
+    }
+
+    response.status(404).json({ error: 'Logo not found' })
+  } catch (error) {
+    response.status(500).json({ error: errorMessage(error, 'Failed to fetch logo') })
+  }
+})
+
 // Lightweight live quote (unofficial yahoo-finance2) for ticker chips in the news UI.
 router.get('/:ticker/quote', async (request, response) => {
   try {
