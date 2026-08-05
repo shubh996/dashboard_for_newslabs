@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -23,8 +24,10 @@ import {
   Moon,
   Newspaper,
   PenLine,
+  Plus,
   RefreshCw,
   Save,
+  Search,
   Share2,
   Sparkles,
   Sun,
@@ -36,7 +39,8 @@ import {
 import { useTheme } from '@/hooks/useTheme'
 import { useBottomToast } from '@/components/ui/bottom-toast'
 import { readPref, writePref } from '@/lib/prefs'
-import { fetchYahooQuote } from '@/services/yahooApi'
+import { fetchYahooQuote, searchYahooSaved } from '@/services/yahooApi'
+import type { YahooSearchResult } from '@/types/yahoo'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -1024,8 +1028,12 @@ type ShareCardStyle = {
   cardColor: ShareCardColorId
   /** Title, reason, brand, stamp body text */
   textColor: ShareTextColorId
-  /** Outer content padding (px at 1080 width) */
+  /** Left/right content padding (px at 1080 width) */
   imagePadding: number
+  /** Top padding above logo / title band */
+  headerPadding: number
+  /** Bottom padding below footer (date + Track at Trigger) */
+  footerPadding: number
   stampFontSize: number
   reasonFontSize: number
   /** Company name weight */
@@ -1053,6 +1061,8 @@ const DEFAULT_SHARE_CARD_STYLE: ShareCardStyle = {
   cardColor: 'yellow',
   textColor: 'black',
   imagePadding: 48,
+  headerPadding: 88,
+  footerPadding: 48,
   stampFontSize: 30,
   reasonFontSize: 60,
   nameBold: true,
@@ -1082,6 +1092,21 @@ function loadShareCardStyle(): ShareCardStyle {
       : 'yellow'
     const titleMode = parsed.titleMode === 'ticker' ? 'ticker' : 'company'
     const imagePadding = Number(parsed.imagePadding)
+    const sidePad =
+      Number.isFinite(imagePadding) && imagePadding >= 16
+        ? Math.min(120, Math.round(imagePadding))
+        : DEFAULT_SHARE_CARD_STYLE.imagePadding
+    // Older saves only had imagePadding (sides + derived top/bottom) — migrate once
+    const rawHeader = Number(parsed.headerPadding)
+    const rawFooter = Number(parsed.footerPadding)
+    const headerPadding =
+      Number.isFinite(rawHeader) && rawHeader >= 0
+        ? Math.min(200, Math.round(rawHeader))
+        : Math.min(200, sidePad + 40)
+    const footerPadding =
+      Number.isFinite(rawFooter) && rawFooter >= 0
+        ? Math.min(200, Math.round(rawFooter))
+        : sidePad
     return {
       ...DEFAULT_SHARE_CARD_STYLE,
       ...parsed,
@@ -1097,10 +1122,9 @@ function loadShareCardStyle(): ShareCardStyle {
       pctFontSize: Number(parsed.pctFontSize) || DEFAULT_SHARE_CARD_STYLE.pctFontSize,
       priceFontSize: Number(parsed.priceFontSize) || DEFAULT_SHARE_CARD_STYLE.priceFontSize,
       priceFontWeight: Number(parsed.priceFontWeight) || DEFAULT_SHARE_CARD_STYLE.priceFontWeight,
-      imagePadding:
-        Number.isFinite(imagePadding) && imagePadding >= 16
-          ? Math.min(120, Math.round(imagePadding))
-          : DEFAULT_SHARE_CARD_STYLE.imagePadding,
+      imagePadding: sidePad,
+      headerPadding,
+      footerPadding,
       stampFontSize: Number(parsed.stampFontSize) || DEFAULT_SHARE_CARD_STYLE.stampFontSize,
       reasonFontSize: Number(parsed.reasonFontSize) || DEFAULT_SHARE_CARD_STYLE.reasonFontSize,
       nameBold: parsed.nameBold !== undefined ? Boolean(parsed.nameBold) : true,
@@ -1185,35 +1209,30 @@ function formatShareStampLabel(event: PriceMovementEvent): string {
   return dayMonth || time
 }
 
-/**
- * Share-card (Yahoo-style yellow):
- * company name · large % · mini chart · full likely-driver reason · Track at Trigger.
- * Height follows content (aspect ratio flexes). Style knobs from preview sliders.
- */
-async function renderMomentumTweetImage(
+/** Editable copy drawn on the share image (session-only; not in layout prefs). */
+type ShareCardTextContent = {
+  title: string
+  percent: string
+  price: string
+  reason: string
+  stamp: string
+  brand: string
+}
+
+/** Build default image text from event + style (company name already resolved when possible). */
+function buildShareCardTextContent(
   ticker: string,
   event: PriceMovementEvent,
   companyName?: string | null,
   style: ShareCardStyle = DEFAULT_SHARE_CARD_STYLE,
-): Promise<{ blob: Blob; objectUrl: string } | null> {
-  if (typeof document === 'undefined') return null
+): ShareCardTextContent {
   const symbol = String(ticker || '').toUpperCase()
   const close = formatChange(event.price_change || event.momentum)
   const premarket = formatChange(getPremarketChange(event))
-  const isDown = Boolean(close?.negative || (!close?.positive && premarket?.negative))
-  const isUp = Boolean(close?.positive || premarket?.positive) && !isDown
-
   const titleMode = style.titleMode === 'ticker' ? 'ticker' : 'company'
-  // Company mode: resolve real name (DB → Yahoo Finance) so title is never just blank
-  const companyLabel =
-    titleMode === 'company'
-      ? await resolveShareCompanyName(symbol, companyName)
-      : String(companyName || '').trim() || symbol
+  const companyLabel = String(companyName || '').trim() || symbol
   const titleText = titleMode === 'ticker' ? symbol : companyLabel
-  // Default: date · time on footer left next to Track at Trigger
-  const dateInFooter = style.dateInFooter !== false
 
-  // Always full likely driver — never truncate for “word budget”
   const sections = parseGeminiTweetSections(event.summary || '')
   let quote =
     sections.likely ||
@@ -1229,15 +1248,113 @@ async function renderMomentumTweetImage(
       : `${titleText} notable price momentum`
   }
 
+  return {
+    title: titleText,
+    percent: close?.text || premarket?.text || '',
+    price: formatSharePriceLabel(event.price),
+    reason: quote,
+    stamp: formatShareStampLabel(event),
+    brand: 'Track at Trigger',
+  }
+}
+
+/** Infer up/down coloring from edited % text, else fall back to event flags. */
+function shareMoveFlagsFromText(
+  moveText: string,
+  fallbackIsDown: boolean,
+  fallbackIsUp: boolean,
+): { isDown: boolean; isUp: boolean } {
+  const t = String(moveText || '').trim()
+  if (/^[-−(]/.test(t) || /\bdown\b/i.test(t)) return { isDown: true, isUp: false }
+  if (/^\+/.test(t) || /\bup\b/i.test(t)) return { isDown: false, isUp: true }
+  return { isDown: fallbackIsDown, isUp: fallbackIsUp }
+}
+
+/**
+ * Share-card (Yahoo-style yellow):
+ * company name · large % · mini chart · full likely-driver reason · Track at Trigger.
+ * Height follows content (aspect ratio flexes). Style knobs from preview sliders.
+ * `textContent` overrides drawn strings when provided (live-editable in layout panel).
+ */
+async function renderMomentumTweetImage(
+  ticker: string,
+  event: PriceMovementEvent,
+  companyName?: string | null,
+  style: ShareCardStyle = DEFAULT_SHARE_CARD_STYLE,
+  textContent?: ShareCardTextContent | null,
+): Promise<{ blob: Blob; objectUrl: string } | null> {
+  if (typeof document === 'undefined') return null
+  const symbol = String(ticker || '').toUpperCase()
+  const close = formatChange(event.price_change || event.momentum)
+  const premarket = formatChange(getPremarketChange(event))
+  let isDown = Boolean(close?.negative || (!close?.positive && premarket?.negative))
+  let isUp = Boolean(close?.positive || premarket?.positive) && !isDown
+
+  // Defaults when textContent omitted (e.g. first paint before overrides)
+  const titleMode = style.titleMode === 'ticker' ? 'ticker' : 'company'
+  const companyLabel =
+    titleMode === 'company'
+      ? await resolveShareCompanyName(symbol, companyName)
+      : String(companyName || '').trim() || symbol
+  const defaultTitle = titleMode === 'ticker' ? symbol : companyLabel
+  // Default: date · time on footer left next to Track at Trigger
+  const dateInFooter = style.dateInFooter !== false
+
+  const sections = parseGeminiTweetSections(event.summary || '')
+  let defaultQuote =
+    sections.likely ||
+    sections.headline ||
+    String(event.summary || '').replace(/^likely\s*driver\s*:\s*/i, '').trim()
+  defaultQuote = defaultQuote.replace(/\s+/g, ' ').trim()
+  if (!defaultQuote) {
+    const bits: string[] = []
+    if (close?.text) bits.push(`${close.text} at close`)
+    if (premarket?.text) bits.push(`pre-market ${premarket.text}`)
+    defaultQuote = bits.length
+      ? `${defaultTitle} moved ${bits.join(' · ')}`
+      : `${defaultTitle} notable price momentum`
+  }
+
+  const titleText = (textContent?.title ?? defaultTitle).trim() || defaultTitle
+  const moveText = (textContent?.percent ?? close?.text ?? premarket?.text ?? '').trim()
+  const priceLabel = (textContent?.price ?? formatSharePriceLabel(event.price)).trim()
+  const stampLabel = (textContent?.stamp ?? formatShareStampLabel(event)).trim()
+  const quote = (textContent?.reason ?? defaultQuote).replace(/\s+/g, ' ').trim() || defaultQuote
+  const brandLabel = (textContent?.brand ?? 'Track at Trigger').trim() || 'Track at Trigger'
+
+  const moveFlags = shareMoveFlagsFromText(moveText, isDown, isUp)
+  isDown = moveFlags.isDown
+  isUp = moveFlags.isUp
+
   const w = 1080
   const imagePadding = Math.min(
     120,
     Math.max(16, Math.round(Number(style.imagePadding) || DEFAULT_SHARE_CARD_STYLE.imagePadding)),
   )
+  const topPad = Math.min(
+    200,
+    Math.max(
+      0,
+      Math.round(
+        Number.isFinite(Number(style.headerPadding))
+          ? Number(style.headerPadding)
+          : DEFAULT_SHARE_CARD_STYLE.headerPadding,
+      ),
+    ),
+  )
+  const bottomPad = Math.min(
+    200,
+    Math.max(
+      0,
+      Math.round(
+        Number.isFinite(Number(style.footerPadding))
+          ? Number(style.footerPadding)
+          : DEFAULT_SHARE_CARD_STYLE.footerPadding,
+      ),
+    ),
+  )
   const padX = imagePadding
   const textMaxW = w - padX * 2
-  // Keep a bit more air on top than sides (was 88 when pad was 48)
-  const topPad = imagePadding + 40
   const logoSize = Math.round(style.logoSize)
   const logoGap = 18
   const nameSize = Math.round(style.nameFontSize)
@@ -1260,8 +1377,6 @@ async function renderMomentumTweetImage(
   const gapBeforeChart = Math.round(style.gapBeforeChart)
   const gapAfterChart = Math.round(style.gapAfterChart)
   const gapBeforeBrand = 130
-  const bottomPad = imagePadding
-  const brandLabel = 'Track at Trigger'
   const brandFont = '500 28px ui-sans-serif, system-ui, -apple-system, sans-serif'
   // Adjustable weight; slightly tall letterforms via vertical scale when drawing
   const priceFont = `${priceFontWeight} ${priceFontSize}px "Avenir Next", "Helvetica Neue", "Segoe UI", ui-sans-serif, system-ui, sans-serif`
@@ -1279,9 +1394,6 @@ async function renderMomentumTweetImage(
   const measure = document.createElement('canvas').getContext('2d')
   if (!measure) return null
 
-  const moveText = close?.text || premarket?.text || ''
-  const priceLabel = formatSharePriceLabel(event.price)
-  const stampLabel = formatShareStampLabel(event)
   // Date stamp under price (left meta row) only when not on footer
   const stampUnderPrice = Boolean(stampLabel) && !dateInFooter
   const footerDate = dateInFooter ? stampLabel : ''
@@ -1648,7 +1760,7 @@ function formatSharePriceLabel(price?: string | null): string {
   return raw
 }
 
-type SocialPlatformId = 'x' | 'whatsapp' | 'instagram'
+type SocialPlatformId = 'x' | 'stocktwits' | 'whatsapp' | 'instagram'
 
 function SocialBrandIcon({
   id,
@@ -1663,6 +1775,13 @@ function SocialBrandIcon({
       return (
         <svg viewBox="0 0 24 24" className={cn} fill="currentColor" aria-hidden>
           <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.744l7.727-8.835L1.254 2.25H8.08l4.253 5.622L18.244 2.25zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77z" />
+        </svg>
+      )
+    case 'stocktwits':
+      // Simple-icons style StockTwits mark
+      return (
+        <svg viewBox="0 0 24 24" className={cn} fill="currentColor" aria-hidden>
+          <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 14.114c-.265.586-.86 1.052-1.626 1.052-.22 0-.444-.038-.662-.12-.461-.171-.826-.469-1.051-.843a1.82 1.82 0 0 1-.248-.95v-.08H12.48l-.288 3.11h1.592V24h3.414v-8.886h3.992l.288-3.11h-3.84l.042-.42c.096-.97.41-1.51 1.415-1.51.256 0 .552.038.793.104l.477-3.08a6.11 6.11 0 0 0-1.433-.187c-2.372 0-3.756 1.406-3.756 3.906v.48H13.1l-.288 3.11h1.592v1.597c0 .72.288 1.12.91 1.12.36 0 .648-.16.838-.58l.742 1.06zM5.54 19.34H1.656L4.32 4.91H.786L1.13 1.78h8.036L5.54 19.34z" />
         </svg>
       )
     case 'whatsapp':
@@ -1689,6 +1808,11 @@ const SOCIAL_PLATFORMS: Array<{
 }> = [
   { id: 'x', label: 'X', hint: 'Open X with tweet 1 prefilled; image copied' },
   {
+    id: 'stocktwits',
+    label: 'StockTwits',
+    hint: 'Open StockTwits symbol page; image copied — paste + use Copy Tweet 1 for caption',
+  },
+  {
     id: 'whatsapp',
     label: 'WhatsApp',
     hint: 'Open WhatsApp Desktop with tweet 1; image copied (paste ⌘V)',
@@ -1705,10 +1829,17 @@ function ShareCardLayoutControls({
   style,
   onChange,
   idPrefix,
+  textContent,
+  onTextChange,
+  onTextReset,
 }: {
   style: ShareCardStyle
   onChange: (next: ShareCardStyle | ((prev: ShareCardStyle) => ShareCardStyle)) => void
   idPrefix: string
+  /** Live-editable strings drawn on the share image */
+  textContent?: ShareCardTextContent | null
+  onTextChange?: (next: ShareCardTextContent) => void
+  onTextReset?: () => void
 }) {
   const set = (patch: Partial<ShareCardStyle>) =>
     onChange((s) => {
@@ -1716,6 +1847,10 @@ function ShareCardLayoutControls({
       saveShareCardStyle(next)
       return next
     })
+  const setText = (patch: Partial<ShareCardTextContent>) => {
+    if (!textContent || !onTextChange) return
+    onTextChange({ ...textContent, ...patch })
+  }
   return (
     <div className="space-y-3 rounded-xl border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center justify-between gap-2">
@@ -1736,6 +1871,107 @@ function ShareCardLayoutControls({
           Reset defaults
         </Button>
       </div>
+
+      {textContent && onTextChange ? (
+        <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Image text
+            </p>
+            {onTextReset ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 text-xs"
+                onClick={onTextReset}
+              >
+                Reset text
+              </Button>
+            ) : null}
+          </div>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            Edit what appears on the image. Preview updates as you type.
+          </p>
+          <div className="space-y-1">
+            <Label htmlFor={`${idPrefix}-txt-title`} className="text-xs font-medium">
+              Title
+            </Label>
+            <Input
+              id={`${idPrefix}-txt-title`}
+              value={textContent.title}
+              onChange={(e) => setText({ title: e.target.value })}
+              className="h-8 text-sm"
+              placeholder="Company or ticker"
+            />
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor={`${idPrefix}-txt-pct`} className="text-xs font-medium">
+                Percentage
+              </Label>
+              <Input
+                id={`${idPrefix}-txt-pct`}
+                value={textContent.percent}
+                onChange={(e) => setText({ percent: e.target.value })}
+                className="h-8 text-sm tabular-nums"
+                placeholder="+4.2%"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor={`${idPrefix}-txt-price`} className="text-xs font-medium">
+                Price
+              </Label>
+              <Input
+                id={`${idPrefix}-txt-price`}
+                value={textContent.price}
+                onChange={(e) => setText({ price: e.target.value })}
+                className="h-8 text-sm tabular-nums"
+                placeholder="$189.50"
+              />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor={`${idPrefix}-txt-reason`} className="text-xs font-medium">
+              Reason / body
+            </Label>
+            <Textarea
+              id={`${idPrefix}-txt-reason`}
+              value={textContent.reason}
+              onChange={(e) => setText({ reason: e.target.value })}
+              rows={4}
+              className="min-h-[5.5rem] resize-y text-sm leading-relaxed"
+              placeholder="Likely driver text on the card…"
+            />
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor={`${idPrefix}-txt-stamp`} className="text-xs font-medium">
+                Timestamp
+              </Label>
+              <Input
+                id={`${idPrefix}-txt-stamp`}
+                value={textContent.stamp}
+                onChange={(e) => setText({ stamp: e.target.value })}
+                className="h-8 text-sm"
+                placeholder="5 August · 9:46 AM ET"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor={`${idPrefix}-txt-brand`} className="text-xs font-medium">
+                Footer brand
+              </Label>
+              <Input
+                id={`${idPrefix}-txt-brand`}
+                value={textContent.brand}
+                onChange={(e) => setText({ brand: e.target.value })}
+                className="h-8 text-sm"
+                placeholder="Track at Trigger"
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <div className="space-y-1.5">
         <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1808,7 +2044,7 @@ function ShareCardLayoutControls({
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-2 text-xs">
           <Label htmlFor={`${idPrefix}-image-pad`} className="text-xs font-medium">
-            Image padding
+            Side padding
           </Label>
           <span className="tabular-nums text-muted-foreground">
             {style.imagePadding ?? 48}px
@@ -1824,9 +2060,52 @@ function ShareCardLayoutControls({
           onChange={(e) => set({ imagePadding: Number(e.target.value) })}
           className="w-full accent-foreground"
         />
-        <p className="text-[10px] text-muted-foreground">
-          Outer margin around logo, text & chart.
-        </p>
+        <p className="text-[10px] text-muted-foreground">Left & right margin.</p>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-header-pad`} className="text-xs font-medium">
+              Header padding
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.headerPadding ?? 88}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-header-pad`}
+            type="range"
+            min={0}
+            max={200}
+            step={2}
+            value={style.headerPadding ?? 88}
+            onChange={(e) => set({ headerPadding: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">Space above logo / title.</p>
+        </div>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-footer-pad`} className="text-xs font-medium">
+              Footer padding
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.footerPadding ?? 48}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-footer-pad`}
+            type="range"
+            min={0}
+            max={200}
+            step={2}
+            value={style.footerPadding ?? 48}
+            onChange={(e) => set({ footerPadding: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">Space below footer row.</p>
+        </div>
       </div>
 
       <div className="space-y-1">
@@ -2134,6 +2413,13 @@ export default function NotificationsPage() {
   const [listError, setListError] = useState('')
   const [activeTicker, setActiveTicker] = useState<string>('')
   const [tickerSort, setTickerSort] = useState<TickerSortMode>('subscribers')
+  /** Sidebar Yahoo search — filter list + add missing equities */
+  const [tickerSearchQuery, setTickerSearchQuery] = useState('')
+  const [tickerSearchOpen, setTickerSearchOpen] = useState(false)
+  const [tickerSearchResults, setTickerSearchResults] = useState<YahooSearchResult[]>([])
+  const [tickerSearchLoading, setTickerSearchLoading] = useState(false)
+  const [tickerAddBusy, setTickerAddBusy] = useState<string | null>(null)
+  const tickerSearchRef = useRef<HTMLDivElement | null>(null)
   const [tabState, setTabState] = useState<Record<string, TabScrapeState>>({})
   const [creditHint, setCreditHint] = useState<string>('')
   const [firecrawlCredits, setFirecrawlCredits] = useState<{
@@ -2161,11 +2447,12 @@ export default function NotificationsPage() {
   const [tweetImageBlob, setTweetImageBlob] = useState<Blob | null>(null)
   const [tweetComposerBusy, setTweetComposerBusy] = useState(false)
   const [tweetStartBusy, setTweetStartBusy] = useState(false)
-  /** Context needed to re-render share image when sliders move. */
+  /** Context needed to re-render share image when sliders / text edits change. */
   const [tweetRenderCtx, setTweetRenderCtx] = useState<{
     ticker: string
     event: PriceMovementEvent
     companyName?: string | null
+    cardText: ShareCardTextContent
   } | null>(null)
   const [shareCardStyle, setShareCardStyle] = useState<ShareCardStyle>(() =>
     loadShareCardStyle(),
@@ -2316,6 +2603,7 @@ export default function NotificationsPage() {
     thread: MomentumTweetThread
     imageBlob: Blob | null
     imageUrl: string | null
+    cardText: ShareCardTextContent
   } | null>(null)
   /** Last Gemini usage (tokens/credits/cost) keyed by event; also session last for log header. */
   const [geminiUsageByKey, setGeminiUsageByKey] = useState<
@@ -3285,9 +3573,11 @@ export default function NotificationsPage() {
     const style = loadShareCardStyle()
     setShareCardStyle(style)
     try {
-      const thread = buildMomentumTweetThread(ticker, event, companyName)
+      const resolvedCompany = await resolveShareCompanyName(ticker, companyName)
+      const thread = buildMomentumTweetThread(ticker, event, resolvedCompany)
       setTweetThread(thread)
-      setTweetRenderCtx({ ticker, event, companyName })
+      const cardText = buildShareCardTextContent(ticker, event, resolvedCompany, style)
+      setTweetRenderCtx({ ticker, event, companyName: resolvedCompany, cardText })
       // Revoke previous object URL
       if (tweetImageUrl) {
         try {
@@ -3299,8 +3589,9 @@ export default function NotificationsPage() {
       const image = await renderMomentumTweetImage(
         ticker,
         event,
-        companyName,
+        resolvedCompany,
         style,
+        cardText,
       )
       setTweetImageBlob(image?.blob || null)
       setTweetImageUrl(image?.objectUrl || null)
@@ -3310,7 +3601,7 @@ export default function NotificationsPage() {
     }
   }
 
-  /** Debounced re-render when preview sliders / bold toggles change. */
+  /** Debounced re-render when preview sliders / text edits change. */
   useEffect(() => {
     if (!tweetComposerOpen || !tweetRenderCtx) return
     let cancelled = false
@@ -3323,6 +3614,7 @@ export default function NotificationsPage() {
             tweetRenderCtx.event,
             tweetRenderCtx.companyName,
             shareCardStyle,
+            tweetRenderCtx.cardText,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -3354,11 +3646,11 @@ export default function NotificationsPage() {
       cancelled = true
       window.clearTimeout(timer)
     }
-    // Intentionally depend on style + open + ctx
+    // Intentionally depend on style + open + ctx (incl. cardText)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shareCardStyle, tweetComposerOpen, tweetRenderCtx])
 
-  /** Same layout sliders live-update the Share-on-social-media image. */
+  /** Same layout sliders / text edits live-update the Share-on-social-media image. */
   useEffect(() => {
     if (!socialShareOpen || !socialShareCtx) return
     let cancelled = false
@@ -3371,6 +3663,7 @@ export default function NotificationsPage() {
             socialShareCtx.event,
             socialShareCtx.companyName,
             shareCardStyle,
+            socialShareCtx.cardText,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -3407,7 +3700,13 @@ export default function NotificationsPage() {
       window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shareCardStyle, socialShareOpen, socialShareCtx?.ticker, socialShareCtx?.event?.event_date])
+  }, [
+    shareCardStyle,
+    socialShareOpen,
+    socialShareCtx?.ticker,
+    socialShareCtx?.event?.event_date,
+    socialShareCtx?.cardText,
+  ])
 
   async function copyTweetText(text: string, label: string) {
     try {
@@ -3441,6 +3740,7 @@ export default function NotificationsPage() {
             tweetRenderCtx.event,
             tweetRenderCtx.companyName,
             shareCardStyle,
+            tweetRenderCtx.cardText,
           )
           blobToCopy = fresh?.blob || null
           if (fresh?.objectUrl) {
@@ -4529,11 +4829,18 @@ export default function NotificationsPage() {
         eventForShare,
         resolvedCompany,
       )
+      const cardText = buildShareCardTextContent(
+        ticker,
+        eventForShare,
+        resolvedCompany,
+        style,
+      )
       const image = await renderMomentumTweetImage(
         ticker,
         eventForShare,
         resolvedCompany,
         style,
+        cardText,
       )
       setSocialShareCtx((prev) => {
         if (prev?.imageUrl) {
@@ -4550,6 +4857,7 @@ export default function NotificationsPage() {
           thread,
           imageBlob: image?.blob || null,
           imageUrl: image?.objectUrl || null,
+          cardText,
         }
       })
     } catch (error) {
@@ -4640,6 +4948,27 @@ export default function NotificationsPage() {
             ? 'Tweet 1 is prefilled. Paste the image with ⌘/Ctrl+V.'
             : 'Tweet 1 is prefilled. Copy the image from the preview if needed.',
           durationMs: 6500,
+        })
+        return
+      }
+
+      if (platform === 'stocktwits') {
+        // Old /widgets/share?body=… endpoint is dead (404). Open symbol stream instead.
+        // Do not writeText after image copy — that wipes the image from the clipboard.
+        const symbol = String(ticker || '')
+          .trim()
+          .toUpperCase()
+          .replace(/[^A-Z0-9.^_=\-]/g, '')
+        const symbolUrl = symbol
+          ? `https://stocktwits.com/symbol/${encodeURIComponent(symbol)}`
+          : 'https://stocktwits.com/'
+        window.open(symbolUrl, '_blank', 'noopener,noreferrer')
+        toast({
+          title: imageCopied ? 'StockTwits opened · image copied' : 'StockTwits opened',
+          description: imageCopied
+            ? `On $${symbol || 'TICKER'}: paste image with ⌘/Ctrl+V, then paste caption (Copy Tweet 1 from this panel).`
+            : 'Open the composer on the symbol page. Copy Tweet 1 + image from this panel.',
+          durationMs: 8000,
         })
         return
       }
@@ -5441,7 +5770,15 @@ export default function NotificationsPage() {
 
   /** Stocks-only list (categories removed — no commodity/crypto/forex/index). */
   const filteredTickers = useMemo(() => {
-    const list = [...tickers]
+    const q = tickerSearchQuery.trim().toLowerCase()
+    let list = [...tickers]
+    if (q) {
+      list = list.filter((item) => {
+        const t = item.ticker.toLowerCase()
+        const n = (item.company_name || '').toLowerCase()
+        return t.includes(q) || n.includes(q)
+      })
+    }
     list.sort((a, b) => {
       if (tickerSort === 'subscribers') {
         const diff = (b.subscriber_count ?? 0) - (a.subscriber_count ?? 0)
@@ -5464,7 +5801,108 @@ export default function NotificationsPage() {
       return a.ticker.localeCompare(b.ticker)
     })
     return list
-  }, [tickers, tickerSort])
+  }, [tickers, tickerSort, tickerSearchQuery])
+
+  const monitoredTickerSet = useMemo(
+    () => new Set(tickers.map((item) => item.ticker.toUpperCase())),
+    [tickers],
+  )
+
+  // Debounced Yahoo Finance search for the sidebar add/search box
+  useEffect(() => {
+    const q = tickerSearchQuery.trim()
+    if (q.length < 1) {
+      setTickerSearchResults([])
+      setTickerSearchLoading(false)
+      return
+    }
+    let cancelled = false
+    setTickerSearchLoading(true)
+    const timer = window.setTimeout(() => {
+      searchYahooSaved(q)
+        .then((body) => {
+          if (cancelled) return
+          const rows = (body.tickers || []).filter((row) => {
+            const type = String(row.quoteType || '').toUpperCase()
+            // Prefer equities / ETFs; drop options & crypto-ish symbols
+            if (type.includes('OPTION')) return false
+            if (looksLikeNonEquityTicker(row.ticker)) return false
+            return Boolean(row.ticker)
+          })
+          setTickerSearchResults(rows)
+        })
+        .catch(() => {
+          if (!cancelled) setTickerSearchResults([])
+        })
+        .finally(() => {
+          if (!cancelled) setTickerSearchLoading(false)
+        })
+    }, 220)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [tickerSearchQuery])
+
+  useEffect(() => {
+    function onPointerDown(event: MouseEvent) {
+      if (!tickerSearchRef.current) return
+      if (!tickerSearchRef.current.contains(event.target as Node)) {
+        setTickerSearchOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    return () => document.removeEventListener('mousedown', onPointerDown)
+  }, [])
+
+  const addMonitoredTicker = useCallback(
+    async (symbol: string, companyName?: string | null) => {
+      const ticker = String(symbol || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9.^_=\-]/g, '')
+      if (!ticker) return
+      if (monitoredTickerSet.has(ticker)) {
+        setActiveTicker(ticker)
+        setTickerSearchQuery('')
+        setTickerSearchOpen(false)
+        toast({ title: `${ticker} already in list`, description: 'Selected in the sidebar.' })
+        return
+      }
+      setTickerAddBusy(ticker)
+      try {
+        const response = await fetch('/api/notifications/monitored-tickers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ticker,
+            company_name: companyName || ticker,
+          }),
+        })
+        const body = await response.json().catch(() => ({}))
+        if (!response.ok) {
+          throw new Error(body.error || `Failed to add ${ticker}`)
+        }
+        await loadTickers()
+        setActiveTicker(ticker)
+        setTickerSearchQuery('')
+        setTickerSearchOpen(false)
+        toast({
+          title: body.created === false ? `${ticker} already monitored` : `Added ${ticker}`,
+          description: companyName && companyName !== ticker ? companyName : 'Ready to scrape & save.',
+        })
+      } catch (error) {
+        toast({
+          title: `Could not add ${ticker}`,
+          description: error instanceof Error ? error.message : 'Add failed',
+          variant: 'destructive',
+        })
+      } finally {
+        setTickerAddBusy(null)
+      }
+    },
+    [loadTickers, monitoredTickerSet, toast],
+  )
 
   // Keep the active ticker inside the stocks list.
   useEffect(() => {
@@ -6890,7 +7328,12 @@ export default function NotificationsPage() {
                   ) : null}
                   {!listLoading && !tickers.length ? (
                     <p className="px-2 py-6 text-xs text-muted-foreground">
-                      No equity rows in monitored tickers.
+                      No equity rows in monitored tickers. Search below to add from Yahoo.
+                    </p>
+                  ) : null}
+                  {!listLoading && tickers.length > 0 && !filteredTickers.length ? (
+                    <p className="px-2 py-4 text-xs text-muted-foreground">
+                      No match in your list. Use Yahoo results below to add.
                     </p>
                   ) : null}
                   {filteredTickers.map((item) => {
@@ -6956,6 +7399,136 @@ export default function NotificationsPage() {
                       </button>
                     )
                   })}
+                </div>
+
+                {/* Yahoo search + add — pinned under the ticker list */}
+                <div
+                  ref={tickerSearchRef}
+                  className="relative shrink-0 border-t border-border/60 bg-background/80 p-2"
+                >
+                  {tickerSearchOpen && tickerSearchQuery.trim() ? (
+                    <div className="absolute inset-x-2 bottom-full z-30 mb-1 max-h-56 overflow-y-auto rounded-xl border border-border/70 bg-popover p-1 shadow-lg">
+                      {tickerSearchLoading ? (
+                        <div className="flex items-center gap-2 px-2.5 py-2 text-xs text-muted-foreground">
+                          <Loader2 className="size-3.5 animate-spin" />
+                          Searching Yahoo…
+                        </div>
+                      ) : null}
+                      {!tickerSearchLoading && !tickerSearchResults.length ? (
+                        <p className="px-2.5 py-2 text-xs text-muted-foreground">
+                          No Yahoo matches. Try another symbol or name.
+                        </p>
+                      ) : null}
+                      {tickerSearchResults.map((row) => {
+                        const symbol = String(row.ticker || '').toUpperCase()
+                        const inList = monitoredTickerSet.has(symbol)
+                        const adding = tickerAddBusy === symbol
+                        return (
+                          <div
+                            key={`${symbol}-${row.exchange || ''}-${row.companyName || ''}`}
+                            className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 hover:bg-muted/70"
+                          >
+                            <button
+                              type="button"
+                              className="min-w-0 flex-1 rounded-md px-1 py-1 text-left"
+                              onClick={() => {
+                                if (inList) {
+                                  setActiveTicker(symbol)
+                                  setTickerSearchQuery('')
+                                  setTickerSearchOpen(false)
+                                } else {
+                                  void addMonitoredTicker(symbol, row.companyName)
+                                }
+                              }}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-semibold tracking-tight">
+                                  {symbol}
+                                </span>
+                                {inList ? (
+                                  <span className="rounded bg-emerald-500/15 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                                    In list
+                                  </span>
+                                ) : null}
+                              </div>
+                              <p className="truncate text-[10px] text-muted-foreground">
+                                {[row.companyName, row.exchange, row.quoteType]
+                                  .filter(Boolean)
+                                  .join(' · ') || 'Yahoo Finance'}
+                              </p>
+                            </button>
+                            {inList ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 shrink-0 px-2 text-[10px]"
+                                onClick={() => {
+                                  setActiveTicker(symbol)
+                                  setTickerSearchQuery('')
+                                  setTickerSearchOpen(false)
+                                }}
+                              >
+                                Open
+                              </Button>
+                            ) : (
+                              <Button
+                                type="button"
+                                size="icon-sm"
+                                variant="outline"
+                                className="size-7 shrink-0"
+                                disabled={adding || Boolean(tickerAddBusy)}
+                                title={`Add ${symbol} to monitored stocks`}
+                                aria-label={`Add ${symbol}`}
+                                onClick={() => void addMonitoredTicker(symbol, row.companyName)}
+                              >
+                                {adding ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Plus className="size-3.5" />
+                                )}
+                              </Button>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : null}
+
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={tickerSearchQuery}
+                      onChange={(e) => {
+                        setTickerSearchQuery(e.target.value)
+                        setTickerSearchOpen(true)
+                      }}
+                      onFocus={() => setTickerSearchOpen(true)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          setTickerSearchOpen(false)
+                          ;(e.target as HTMLInputElement).blur()
+                        }
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          const q = tickerSearchQuery.trim()
+                          if (!q) return
+                          const exact = tickerSearchResults.find(
+                            (r) => r.ticker.toUpperCase() === q.toUpperCase(),
+                          )
+                          const first = exact || tickerSearchResults[0]
+                          if (first) {
+                            void addMonitoredTicker(first.ticker, first.companyName)
+                          } else if (/^[A-Za-z0-9.^=_-]{1,12}$/.test(q)) {
+                            void addMonitoredTicker(q.toUpperCase(), q.toUpperCase())
+                          }
+                        }
+                      }}
+                      placeholder="Search Yahoo…"
+                      className="h-8 pl-7 pr-2 text-xs"
+                      aria-label="Search Yahoo Finance and add ticker"
+                    />
+                  </div>
                 </div>
               </aside>
 
@@ -8412,12 +8985,28 @@ export default function NotificationsPage() {
                 )}
               </div>
 
-              {/* COL 2 — image layout controls */}
+              {/* COL 2 — image layout controls + editable image text */}
               <div className="min-h-0 overflow-y-auto rounded-xl border border-border/50 bg-muted/10 p-1">
                 <ShareCardLayoutControls
                   style={shareCardStyle}
                   onChange={updateShareCardStyle}
                   idPrefix="social-share"
+                  textContent={socialShareCtx.cardText}
+                  onTextChange={(next) =>
+                    setSocialShareCtx((prev) => (prev ? { ...prev, cardText: next } : prev))
+                  }
+                  onTextReset={() => {
+                    if (!socialShareCtx) return
+                    const defaults = buildShareCardTextContent(
+                      socialShareCtx.ticker,
+                      socialShareCtx.event,
+                      socialShareCtx.companyName,
+                      shareCardStyle,
+                    )
+                    setSocialShareCtx((prev) =>
+                      prev ? { ...prev, cardText: defaults } : prev,
+                    )
+                  }}
                 />
               </div>
 
@@ -8710,6 +9299,24 @@ export default function NotificationsPage() {
                     style={shareCardStyle}
                     onChange={updateShareCardStyle}
                     idPrefix="tweet-share"
+                    textContent={tweetRenderCtx?.cardText}
+                    onTextChange={(next) =>
+                      setTweetRenderCtx((prev) =>
+                        prev ? { ...prev, cardText: next } : prev,
+                      )
+                    }
+                    onTextReset={() => {
+                      if (!tweetRenderCtx) return
+                      const defaults = buildShareCardTextContent(
+                        tweetRenderCtx.ticker,
+                        tweetRenderCtx.event,
+                        tweetRenderCtx.companyName,
+                        shareCardStyle,
+                      )
+                      setTweetRenderCtx((prev) =>
+                        prev ? { ...prev, cardText: defaults } : prev,
+                      )
+                    }}
                   />
                 </div>
               ) : null}

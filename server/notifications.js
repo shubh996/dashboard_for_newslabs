@@ -2793,6 +2793,113 @@ export function createNotificationsRouter({ getSupabase }) {
       }
     },
 
+    /**
+     * Ensure a ticker exists in device_monitored_tickers so scrape/save work.
+     * Used by the dashboard sidebar: Yahoo search → + add.
+     * Body: { ticker, company_name? }
+     */
+    async addTicker(request, response) {
+      try {
+        const ticker = normalizeTicker(request.body?.ticker || request.params?.ticker)
+        if (!ticker) {
+          response.status(400).json({ error: 'Ticker is required' })
+          return
+        }
+
+        const companyName =
+          String(request.body?.company_name || request.body?.companyName || '')
+            .trim() || ticker
+
+        const classification = classifyAsset(ticker, companyName)
+        if (classification.asset_class && classification.asset_class !== 'equity') {
+          response.status(400).json({
+            error: `Only equity tickers can be added to the stocks list (got ${classification.asset_class}).`,
+          })
+          return
+        }
+
+        const supabase = getSupabase()
+        const loaded = await loadTickerDates(supabase, ticker)
+        if (loaded.found) {
+          const meta = await loadTickerMeta(supabase, ticker)
+          response.json({
+            ok: true,
+            created: false,
+            already_exists: true,
+            ticker,
+            company_name: meta.company_name || companyName,
+          })
+          return
+        }
+
+        const nowIso = new Date().toISOString()
+        const notable = buildNotablePayload({
+          ticker,
+          dates: {},
+          sourceUrl: perplexityFinanceUrl(ticker),
+          scrapedAt: null,
+          nowIso,
+          sourceProvider: 'perplexity',
+          assetClass: 'equity',
+        })
+
+        const baseRow = {
+          ticker,
+          company_name: companyName,
+          subscribers: [],
+          notable_price_movements: notable,
+          updated_at: nowIso,
+        }
+
+        // Try a few insert shapes — table schema varies slightly across deploys.
+        const candidates = [
+          baseRow,
+          { ...baseRow, created_at: nowIso },
+          { ...baseRow, device_id: 'dashboard' },
+          { ...baseRow, device_id: 'dashboard', created_at: nowIso },
+        ]
+
+        let data = null
+        let lastError = null
+        for (const row of candidates) {
+          const result = await supabase
+            .from('device_monitored_tickers')
+            .insert(row)
+            .select('ticker, company_name, created_at, updated_at')
+            .limit(1)
+          if (!result.error) {
+            data = result.data
+            lastError = null
+            break
+          }
+          lastError = result.error
+          // Already inserted by a concurrent request
+          if (/duplicate|unique/i.test(result.error.message || '')) {
+            lastError = null
+            data = [{ ticker, company_name: companyName, created_at: nowIso, updated_at: nowIso }]
+            break
+          }
+        }
+
+        if (lastError) throw lastError
+
+        const row = Array.isArray(data) ? data[0] : data
+        response.status(201).json({
+          ok: true,
+          created: true,
+          already_exists: false,
+          ticker: row?.ticker || ticker,
+          company_name: row?.company_name || companyName,
+          created_at: row?.created_at || nowIso,
+          updated_at: row?.updated_at || nowIso,
+        })
+      } catch (error) {
+        response.status(500).json({
+          error: error instanceof Error ? error.message : 'Failed to add monitored ticker',
+        })
+      }
+    },
+
     async scrape(request, response) {
       try {
         const ticker = normalizeTicker(request.params.ticker || request.body?.ticker)
@@ -5234,6 +5341,7 @@ export function mountNotificationsRoutes(app, { getSupabase }) {
   const handlers = createNotificationsRouter({ getSupabase })
 
   app.get('/api/notifications/monitored-tickers', (req, res) => handlers.listTickers(req, res))
+  app.post('/api/notifications/monitored-tickers', (req, res) => handlers.addTicker(req, res))
   app.get('/api/notifications/firecrawl/credits', (req, res) => handlers.credits(req, res))
   app.get('/api/notifications/devices', (req, res) => handlers.listDevices(req, res))
   app.get('/api/notifications/news', (req, res) => handlers.listNews(req, res))
