@@ -6,12 +6,90 @@ import { createClient } from '@supabase/supabase-js'
 import YahooFinance from 'yahoo-finance2'
 import { FETCH_UNITS, fetchAllYahooModules, fetchUnit, listModuleCatalogue, toPlainJson } from './modules.js'
 import { toYahooSymbol } from '../yahooClient.js'
+import { getYahooLiveQuotes } from './liveQuotes.js'
 
 const yahooFinance = new YahooFinance({
   suppressNotices: ['yahooSurvey', 'ripHistorical'],
 })
 
 const router = express.Router()
+
+function marketTimeToIso(value) {
+  if (value == null) return null
+  const date = value instanceof Date
+    ? value
+    : typeof value === 'number'
+      ? new Date(value < 1_000_000_000_000 ? value * 1000 : value)
+      : new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+/**
+ * Yahoo quote.marketState (no overnightMarket* fields exist).
+ *
+ *   PREPRE  → Overnight: postMarket* hold overnight session
+ *             (e.g. Blue Ocean ATS ~8pm–4am ET Sun–Thu)
+ *   PRE     → Pre-market: preMarket*
+ *   REGULAR → Open: regularMarket*
+ *   POST    → After-hours: postMarket*
+ *   POSTPOST→ After-hours ended: postMarket* last AH print
+ *   CLOSED  → Closed / At close: regularMarket* primary
+ *             (postMarket* may still hold residual extended print)
+ *
+ * Pass marketState through as-is — do not invent sessions from the ET clock.
+ */
+const YAHOO_MARKET_STATES = new Set([
+  'PRE',
+  'PREPRE',
+  'REGULAR',
+  'POST',
+  'POSTPOST',
+  'CLOSED',
+])
+
+/** Yahoo pricing WS marketHours enum → PRE / REGULAR / POST (no PREPRE). */
+function streamMarketState(marketHours) {
+  if (marketHours === 0) return 'PRE'
+  if (marketHours === 1) return 'REGULAR'
+  if (marketHours === 2 || marketHours === 3) return 'POST'
+  return null
+}
+
+/**
+ * Prefer Yahoo REST marketState exactly. Streamer only fills gaps when REST
+ * has no state (streamer has no PREPRE / POSTPOST).
+ */
+function resolveQuoteMarketState(streamed, restMarketState) {
+  const rest = String(restMarketState || '')
+    .trim()
+    .toUpperCase()
+  if (YAHOO_MARKET_STATES.has(rest)) return rest
+  if (rest === 'OPEN') return 'REGULAR'
+  if (rest === 'CLOSE') return 'CLOSED'
+  return streamMarketState(streamed?.marketHours) || 'CLOSED'
+}
+
+/**
+ * Which Yahoo price group to update / display for marketState.
+ * PREPRE and POST/POSTPOST both use postMarket* (overnight vs after-hours
+ * is distinguished only by marketState, not by field name).
+ */
+function priceBucketForMarketState(marketState) {
+  const s = String(marketState || '').toUpperCase()
+  if (s === 'PRE') return 'pre'
+  if (s === 'PREPRE' || s === 'POST' || s === 'POSTPOST') return 'post'
+  if (s === 'REGULAR') return 'regular'
+  return 'regular' // CLOSED → At close
+}
+
+/** Prefer finite number from REST, else stream-derived. */
+function numOrNull(...vals) {
+  for (const v of vals) {
+    const n = typeof v === 'number' ? v : Number(v)
+    if (Number.isFinite(n)) return n
+  }
+  return null
+}
 
 function getSupabase() {
   const url = process.env.SUPABASE_URL
@@ -241,6 +319,649 @@ router.get('/saved-status', async (request, response) => {
   }
 })
 
+/**
+ * Yahoo predefined screener (Day Gainers / Day Losers).
+ * Uses Yahoo HTTP directly — yahoo-finance2 schema validation rejects
+ * day_gainers payloads even with validateResult:false.
+ */
+function yahooScreenerNumeric(value) {
+  if (value == null) return null
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'object' && value.raw != null) {
+    const n = Number(value.raw)
+    return Number.isFinite(n) ? n : null
+  }
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+const YAHOO_SCREENER_HEADERS = {
+  Accept: 'application/json,text/plain,*/*',
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function fetchYahooPredefinedScreener(scrIds, count = 100) {
+  const params = new URLSearchParams({
+    scrIds: String(scrIds),
+    count: String(count),
+    start: '0',
+    lang: 'en-US',
+    region: 'US',
+    formatted: 'false',
+  })
+  // query2 first; query1 often 429s under load.
+  const hosts = [
+    'https://query2.finance.yahoo.com',
+    'https://query1.finance.yahoo.com',
+  ]
+  let lastError = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (const host of hosts) {
+      try {
+        const response = await fetch(
+          `${host}/v1/finance/screener/predefined/saved?${params}`,
+          { headers: YAHOO_SCREENER_HEADERS },
+        )
+        if (response.status === 429) {
+          lastError = new Error(`Yahoo screener ${scrIds} rate-limited (429)`)
+          await sleepMs(400 + attempt * 600)
+          continue
+        }
+        if (!response.ok) {
+          lastError = new Error(`Yahoo screener ${scrIds} failed (${response.status})`)
+          continue
+        }
+        const body = await response.json()
+        if (body?.finance?.error) {
+          lastError = new Error(
+            body.finance.error.description ||
+              body.finance.error.code ||
+              `Yahoo screener ${scrIds} error`,
+          )
+          continue
+        }
+        const quotes = body?.finance?.result?.[0]?.quotes
+        if (Array.isArray(quotes) && quotes.length) return quotes
+        lastError = new Error(`Yahoo screener ${scrIds} returned 0 quotes`)
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+      }
+    }
+    await sleepMs(350 * (attempt + 1))
+  }
+  throw lastError || new Error(`Yahoo screener ${scrIds} failed`)
+}
+
+/**
+ * Fallback when predefined day_gainers is rate-limited:
+ * custom equity screener sorted by percentchange (gainers or losers).
+ */
+async function fetchYahooPercentChangeScreener({
+  direction = 'up',
+  minPercent = 10,
+  count = 100,
+} = {}) {
+  const size = Math.min(250, Math.max(5, count))
+  const sortType = direction === 'down' ? 'ASC' : 'DESC'
+  const op = direction === 'down' ? 'lt' : 'gt'
+  const threshold = direction === 'down' ? -Math.abs(minPercent) : Math.abs(minPercent)
+  const payload = {
+    size,
+    offset: 0,
+    sortField: 'percentchange',
+    sortType,
+    quoteType: 'EQUITY',
+    query: {
+      operator: 'AND',
+      operands: [
+        { operator: op, operands: ['percentchange', threshold] },
+        { operator: 'eq', operands: ['region', 'us'] },
+      ],
+    },
+  }
+  const hosts = [
+    'https://query2.finance.yahoo.com',
+    'https://query1.finance.yahoo.com',
+  ]
+  let lastError = null
+  for (const host of hosts) {
+    try {
+      const response = await fetch(`${host}/v1/finance/screener?lang=en-US&region=US`, {
+        method: 'POST',
+        headers: {
+          ...YAHOO_SCREENER_HEADERS,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) {
+        lastError = new Error(`Yahoo custom screener failed (${response.status})`)
+        continue
+      }
+      const body = await response.json()
+      const quotes = body?.finance?.result?.[0]?.quotes
+      if (Array.isArray(quotes) && quotes.length) return quotes
+      lastError = new Error('Yahoo custom screener returned 0 quotes')
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
+  }
+  throw lastError || new Error('Yahoo custom screener failed')
+}
+
+/**
+ * Extreme daily movers = Yahoo Day Gainers + Day Losers, abs % ≥ minPercent.
+ * Positive tab ← gainers · Negative tab ← losers (client splits by sign).
+ *
+ * Query:
+ *   minPercent   — abs regularMarketChangePercent floor (default 10)
+ *   minMarketCap — optional USD floor (default 0 = show full Yahoo top lists)
+ *   count        — per screener (default 100, max 250)
+ */
+router.get('/extreme-movers', async (request, response) => {
+  try {
+    const minPercent = Math.max(
+      0,
+      Number.parseFloat(String(request.query.minPercent ?? '10')) || 10,
+    )
+    // Default 0: user wants real Yahoo top gainers/losers ≥10%, not only mega-caps.
+    const minMarketCapRaw = request.query.minMarketCap
+    const minMarketCap =
+      minMarketCapRaw == null || minMarketCapRaw === ''
+        ? 0
+        : Math.max(0, Number.parseFloat(String(minMarketCapRaw)) || 0)
+    const count = Math.min(
+      250,
+      Math.max(5, Number.parseInt(String(request.query.count ?? '100'), 10) || 100),
+    )
+
+    const fetchScreener = async (scrIds, direction) => {
+      // 1) yahoo-finance2 first (handles cookies/crumb). day_gainers often
+      //    throws FailedYahooValidationError but still attaches full result.quotes.
+      try {
+        const result = await yahooFinance.screener(
+          { scrIds, count },
+          { validateResult: false },
+        )
+        if (Array.isArray(result?.quotes) && result.quotes.length) return result.quotes
+      } catch (error) {
+        const recovered = error?.result?.quotes
+        if (Array.isArray(recovered) && recovered.length) {
+          console.warn(
+            `[yahoo] package ${scrIds}: schema warn, recovered ${recovered.length} quotes`,
+          )
+          return recovered
+        }
+        console.warn(
+          `[yahoo] package ${scrIds} failed:`,
+          errorMessage(error, 'screener failed'),
+        )
+      }
+
+      // 2) Raw predefined Day Gainers / Day Losers HTTP
+      try {
+        return await fetchYahooPredefinedScreener(scrIds, count)
+      } catch (error) {
+        console.warn(
+          `[yahoo] predefined ${scrIds} failed:`,
+          errorMessage(error, 'screener failed'),
+        )
+      }
+
+      // 3) Custom percent-change screener (needs crumb; may 401)
+      try {
+        return await fetchYahooPercentChangeScreener({
+          direction,
+          minPercent,
+          count,
+        })
+      } catch (error) {
+        console.warn(
+          `[yahoo] custom ${direction} screener failed:`,
+          errorMessage(error, 'screener failed'),
+        )
+        return []
+      }
+    }
+
+    // Sequential — parallel Yahoo calls often 429 one of the two lists.
+    const gainers = await fetchScreener('day_gainers', 'up')
+    await sleepMs(200)
+    const losers = await fetchScreener('day_losers', 'down')
+
+    const bySymbol = new Map()
+    const ingest = (quotes, expectedDirection) => {
+      for (const quote of quotes) {
+        const symbol = String(quote?.symbol || '')
+          .trim()
+          .toUpperCase()
+        if (!symbol) continue
+        const quoteType = String(quote?.quoteType || '').toUpperCase()
+        // Equities + ETFs from Yahoo top lists; skip options/crypto.
+        if (
+          quoteType &&
+          quoteType !== 'EQUITY' &&
+          quoteType !== 'ETF' &&
+          quoteType !== 'MUTUALFUND'
+        ) {
+          continue
+        }
+        const exchange = String(
+          quote?.fullExchangeName || quote?.exchange || quote?.market || '',
+        ).toLowerCase()
+        if (exchange.includes('otc') || exchange.includes('pink')) continue
+
+        const percent = yahooScreenerNumeric(quote?.regularMarketChangePercent)
+        const marketCap = yahooScreenerNumeric(quote?.marketCap)
+        const price = yahooScreenerNumeric(quote?.regularMarketPrice)
+        const change = yahooScreenerNumeric(quote?.regularMarketChange)
+        if (!Number.isFinite(percent) || Math.abs(percent) < minPercent) continue
+        if (minMarketCap > 0 && Number.isFinite(marketCap) && marketCap > 0 && marketCap < minMarketCap) {
+          continue
+        }
+        // Direction guard so gainers list never pollutes Negative tab.
+        if (expectedDirection === 'up' && percent <= 0) continue
+        if (expectedDirection === 'down' && percent >= 0) continue
+
+        const prev = bySymbol.get(symbol)
+        if (prev && Math.abs(prev.regularMarketChangePercent) >= Math.abs(percent)) continue
+
+        bySymbol.set(symbol, {
+          ticker: symbol,
+          symbol,
+          company_name:
+            String(quote?.shortName || quote?.longName || symbol).trim() || symbol,
+          long_name: quote?.longName ? String(quote.longName) : null,
+          regularMarketPrice: price,
+          regularMarketChange: change,
+          regularMarketChangePercent: percent,
+          marketCap: Number.isFinite(marketCap) && marketCap > 0 ? marketCap : null,
+          currency: quote?.currency || 'USD',
+          exchange: quote?.fullExchangeName || quote?.exchange || null,
+          marketState: quote?.marketState || null,
+          quoteType: quoteType || 'EQUITY',
+          direction: percent < 0 ? 'down' : percent > 0 ? 'up' : 'flat',
+          screener: expectedDirection === 'up' ? 'day_gainers' : 'day_losers',
+        })
+      }
+    }
+
+    ingest(gainers, 'up')
+    ingest(losers, 'down')
+
+    const movers = [...bySymbol.values()].sort(
+      (a, b) =>
+        Math.abs(b.regularMarketChangePercent) - Math.abs(a.regularMarketChangePercent) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    const positive = movers.filter((m) => m.regularMarketChangePercent > 0)
+    const negative = movers.filter((m) => m.regularMarketChangePercent < 0)
+
+    response.setHeader('Cache-Control', 'public, max-age=45')
+    response.json({
+      ok: true,
+      source: 'yahoo-finance',
+      screener: ['day_gainers', 'day_losers'],
+      minPercent,
+      minMarketCap,
+      gainerCount: gainers.length,
+      loserCount: losers.length,
+      positiveCount: positive.length,
+      negativeCount: negative.length,
+      fetchedAt: new Date().toISOString(),
+      count: movers.length,
+      movers,
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: errorMessage(error, 'Failed to fetch Yahoo extreme movers'),
+    })
+  }
+})
+
+// Lightweight Yahoo-only batch used by live dashboard ticker chips.
+router.get('/quotes', async (request, response) => {
+  try {
+    const tickers = [...new Set(
+      String(request.query.tickers || '')
+        .split(',')
+        .map((item) => item.trim().toUpperCase())
+        .filter(Boolean),
+    )].slice(0, 80)
+
+    if (!tickers.length) {
+      response.json({
+        source: 'yahoo-finance',
+        fetchedAt: new Date().toISOString(),
+        quotes: {},
+      })
+      return
+    }
+
+    const tickerSymbols = tickers.map((ticker) => ({ ticker, symbol: toYahooSymbol(ticker) }))
+    const yahooSymbols = tickerSymbols.map((item) => item.symbol)
+    const [raw, streamedQuotes] = await Promise.all([
+      yahooFinance.quote(yahooSymbols, {}, { validateResult: false }),
+      getYahooLiveQuotes(yahooSymbols),
+    ])
+    const rows = Array.isArray(raw) ? raw : raw ? [raw] : []
+    const bySymbol = new Map(
+      rows.map((quote) => [String(quote?.symbol || '').toUpperCase(), quote]),
+    )
+    const quotes = {}
+
+    for (const { ticker, symbol } of tickerSymbols) {
+      const streamed = streamedQuotes[symbol.toUpperCase()] || null
+      const q = bySymbol.get(symbol.toUpperCase()) || {}
+      if (!streamed && !q.symbol) continue
+      const marketState = resolveQuoteMarketState(streamed, q.marketState)
+
+      // Always expose all three session change fields from REST (when present)
+      const regularMarketChangeVal = numOrNull(q.regularMarketChange)
+      const regularMarketChangePercentVal = numOrNull(q.regularMarketChangePercent)
+      const preMarketChangeVal = numOrNull(q.preMarketChange)
+      const preMarketChangePercentVal = numOrNull(q.preMarketChangePercent)
+      const postMarketChangeVal = numOrNull(q.postMarketChange)
+      const postMarketChangePercentVal = numOrNull(q.postMarketChangePercent)
+
+      const quote = {
+        symbol: q.symbol || symbol,
+        shortName: streamed?.shortName || q.shortName || q.longName || null,
+        longName: q.longName || streamed?.longName || null,
+        regularMarketPrice: numOrNull(q.regularMarketPrice),
+        regularMarketChange: regularMarketChangeVal,
+        regularMarketChangePercent: regularMarketChangePercentVal,
+        regularMarketPreviousClose: numOrNull(q.regularMarketPreviousClose),
+        regularMarketTime: marketTimeToIso(q.regularMarketTime),
+        preMarketPrice: numOrNull(q.preMarketPrice),
+        preMarketChange: preMarketChangeVal,
+        preMarketChangePercent: preMarketChangePercentVal,
+        preMarketTime: marketTimeToIso(q.preMarketTime),
+        postMarketPrice: numOrNull(q.postMarketPrice),
+        postMarketChange: postMarketChangeVal,
+        postMarketChangePercent: postMarketChangePercentVal,
+        postMarketTime: marketTimeToIso(q.postMarketTime),
+        hasPrePostMarketData: q.hasPrePostMarketData ?? null,
+        currency: q.currency || null,
+        marketState,
+        exchange: streamed?.exchange || q.fullExchangeName || q.exchange || null,
+        liveSource: streamed ? 'yahoo-streamer' : 'yahoo-quote',
+        streamReceivedAt: streamed?.receivedAt || null,
+      }
+
+      // Overlay live stream tick into Yahoo’s matching price fields for marketState.
+      // Never invent regularMarketPreviousClose from stream (change can be session-local
+      // or stale) — keep REST previous close and recompute change % from that basis.
+      if (streamed && Number.isFinite(streamed.price)) {
+        const bucket = priceBucketForMarketState(marketState)
+        if (bucket === 'regular' && marketState === 'REGULAR') {
+          quote.regularMarketPrice = streamed.price
+          quote.regularMarketTime = marketTimeToIso(streamed.time)
+          const prev = quote.regularMarketPreviousClose
+          if (prev != null && Number.isFinite(prev) && prev !== 0) {
+            quote.regularMarketChange = streamed.price - prev
+            quote.regularMarketChangePercent =
+              ((streamed.price - prev) / prev) * 100
+          } else {
+            quote.regularMarketChange = numOrNull(
+              streamed.change,
+              quote.regularMarketChange,
+            )
+            quote.regularMarketChangePercent = numOrNull(
+              streamed.changePercent,
+              quote.regularMarketChangePercent,
+            )
+          }
+        } else if (bucket === 'pre') {
+          quote.preMarketPrice = streamed.price
+          quote.preMarketTime = marketTimeToIso(streamed.time)
+          // Pre % is vs last RTH close (frozen regularMarketPrice in PRE)
+          const basis = quote.regularMarketPrice
+          if (basis != null && Number.isFinite(basis) && basis !== 0) {
+            quote.preMarketChange = streamed.price - basis
+            quote.preMarketChangePercent =
+              ((streamed.price - basis) / basis) * 100
+          } else {
+            quote.preMarketChange = numOrNull(
+              streamed.change,
+              quote.preMarketChange,
+            )
+            quote.preMarketChangePercent = numOrNull(
+              streamed.changePercent,
+              quote.preMarketChangePercent,
+            )
+          }
+        } else if (bucket === 'post') {
+          // PREPRE Overnight + POST/POSTPOST After Hours → postMarket*
+          quote.postMarketPrice = streamed.price
+          quote.postMarketTime = marketTimeToIso(streamed.time)
+          const basis = quote.regularMarketPrice
+          if (basis != null && Number.isFinite(basis) && basis !== 0) {
+            quote.postMarketChange = streamed.price - basis
+            quote.postMarketChangePercent =
+              ((streamed.price - basis) / basis) * 100
+          } else {
+            quote.postMarketChange = numOrNull(
+              streamed.change,
+              quote.postMarketChange,
+            )
+            quote.postMarketChangePercent = numOrNull(
+              streamed.changePercent,
+              quote.postMarketChangePercent,
+            )
+          }
+        }
+      }
+
+      quotes[ticker] = quote
+    }
+
+    response.setHeader('Cache-Control', 'no-store')
+    response.json({
+      source: 'yahoo-finance',
+      fetchedAt: new Date().toISOString(),
+      quotes,
+    })
+  } catch (error) {
+    response.status(500).json({ error: errorMessage(error, 'Failed to fetch Yahoo Finance quotes') })
+  }
+})
+
+/**
+ * Latest Yahoo Finance news for a watchlist of tickers.
+ *
+ * GET /api/yahoo/watchlist-news?tickers=AAPL,MSFT,NVDA&max_age_days=14&per_ticker=8&limit=48
+ *
+ * Uses yahoo-finance2 search (same feed as finance.yahoo.com), not stale Supabase rows.
+ */
+router.get('/watchlist-news', async (request, response) => {
+  try {
+    response.set('Cache-Control', 'no-store, max-age=0')
+    const rawTickers = String(request.query.tickers || request.query.q || '')
+      .split(/[,\s]+/)
+      .map((t) => t.trim().toUpperCase())
+      .filter((t) => t && t.length <= 16)
+    // Dedupe, cap batch size
+    const seenSym = new Set()
+    const tickers = []
+    for (const t of rawTickers) {
+      if (seenSym.has(t)) continue
+      seenSym.add(t)
+      tickers.push(t)
+      if (tickers.length >= 24) break
+    }
+
+    if (!tickers.length) {
+      response.status(400).json({
+        ok: false,
+        error: 'Provide tickers=AAPL,MSFT (comma-separated watchlist symbols)',
+        articles: [],
+      })
+      return
+    }
+
+    const maxAgeDays = Math.min(
+      Math.max(Number(request.query.max_age_days ?? 14) || 14, 1),
+      90,
+    )
+    const perTicker = Math.min(
+      Math.max(Number(request.query.per_ticker ?? 8) || 8, 2),
+      20,
+    )
+    const limit = Math.min(
+      Math.max(Number(request.query.limit ?? 48) || 48, 1),
+      100,
+    )
+    const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000
+
+    function thumbUrl(item) {
+      const resList = item?.thumbnail?.resolutions
+      if (!Array.isArray(resList) || !resList.length) return null
+      const sorted = [...resList].sort(
+        (a, b) => (Number(b.width) || 0) - (Number(a.width) || 0),
+      )
+      // Prefer a mid-size image for list cards
+      const mid =
+        sorted.find((r) => (Number(r.width) || 0) >= 140 && (Number(r.width) || 0) <= 400) ||
+        sorted[sorted.length - 1] ||
+        sorted[0]
+      return mid?.url || null
+    }
+
+    function publishMs(item) {
+      const raw = item?.providerPublishTime
+      if (raw == null) return 0
+      if (raw instanceof Date) return raw.getTime()
+      if (typeof raw === 'number') {
+        return raw < 1_000_000_000_000 ? raw * 1000 : raw
+      }
+      const t = Date.parse(String(raw))
+      return Number.isFinite(t) ? t : 0
+    }
+
+    /** Simple concurrency pool */
+    async function mapPool(items, concurrency, fn) {
+      const out = new Array(items.length)
+      let i = 0
+      async function worker() {
+        while (i < items.length) {
+          const idx = i
+          i += 1
+          out[idx] = await fn(items[idx], idx)
+        }
+      }
+      const n = Math.min(concurrency, items.length)
+      await Promise.all(Array.from({ length: n }, () => worker()))
+      return out
+    }
+
+    const perResults = await mapPool(tickers, 4, async (symbol) => {
+      try {
+        const yahooSym = toYahooSymbol(symbol) || symbol
+        const result = await yahooFinance.search(
+          yahooSym,
+          { newsCount: perTicker, quotesCount: 0 },
+          { validateResult: false },
+        )
+        const news = Array.isArray(result?.news) ? result.news : []
+        return {
+          ticker: symbol,
+          ok: true,
+          news,
+          error: null,
+        }
+      } catch (err) {
+        return {
+          ticker: symbol,
+          ok: false,
+          news: [],
+          error: err instanceof Error ? err.message : String(err),
+        }
+      }
+    })
+
+    const articles = []
+    const seen = new Set()
+    for (const batch of perResults) {
+      for (const item of batch.news || []) {
+        const ms = publishMs(item)
+        if (ms > 0 && ms < cutoffMs) continue
+        const title = String(item?.title || '').trim()
+        const link = String(item?.link || item?.url || '').trim()
+        const key = link || item?.uuid || title
+        if (!key || seen.has(key)) continue
+        seen.add(key)
+
+        const related = Array.isArray(item?.relatedTickers)
+          ? item.relatedTickers.map((t) => String(t).toUpperCase())
+          : []
+        // Ensure the queried ticker is listed when missing
+        if (batch.ticker && !related.includes(batch.ticker)) {
+          related.unshift(batch.ticker)
+        }
+
+        const publishedAt =
+          ms > 0 ? new Date(ms).toISOString() : null
+
+        articles.push({
+          id: String(item?.uuid || `yahoo-${key}`).slice(0, 120),
+          provider: 'yahoo-finance',
+          title: title || 'Untitled',
+          summary: '',
+          url: link || '',
+          image_url: thumbUrl(item),
+          source_name: item?.publisher || 'Yahoo Finance',
+          author: null,
+          published_at: publishedAt,
+          tickers: related,
+          topics: item?.type ? [String(item.type)] : [],
+          // For news-alert push header
+          impact_body: related.slice(0, 4).join(' · ') || batch.ticker,
+          ticker_sides: related.slice(0, 6).map((t) => ({
+            ticker: t,
+            side: 'neutral',
+          })),
+        })
+      }
+    }
+
+    articles.sort((a, b) => {
+      const ta = Date.parse(a.published_at || '') || 0
+      const tb = Date.parse(b.published_at || '') || 0
+      return tb - ta
+    })
+
+    const sliced = articles.slice(0, limit)
+    const errors = perResults
+      .filter((r) => !r.ok)
+      .map((r) => ({ ticker: r.ticker, error: r.error }))
+
+    response.json({
+      ok: true,
+      source: 'yahoo-finance',
+      tickers,
+      max_age_days: maxAgeDays,
+      count: sliced.length,
+      total: sliced.length,
+      has_more: false,
+      errors: errors.length ? errors : undefined,
+      articles: sliced,
+    })
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: errorMessage(error, 'Failed to fetch Yahoo watchlist news'),
+      articles: [],
+    })
+  }
+})
+
 // Returns saved snapshots when present, plus live Yahoo Finance quote matches
 // so the search bar always shows suggestions while typing (not only for saved tickers).
 router.get('/search', async (request, response) => {
@@ -280,27 +1001,41 @@ router.get('/search', async (request, response) => {
       try {
         const result = await yahooFinance.search(
           q,
-          { quotesCount: 12, newsCount: 0 },
+          { quotesCount: 16, newsCount: 0 },
           { validateResult: false },
         )
         const quotes = Array.isArray(result?.quotes) ? result.quotes : []
         live = quotes
           .filter((quote) => quote?.symbol && !savedSet.has(String(quote.symbol).toUpperCase()))
-          // Prefer equities/ETFs/funds over options chains in the typeahead.
+          // Prefer equities/ETFs/funds/crypto/FX/futures over options chains.
           .filter((quote) => {
             const type = String(quote.quoteType || quote.typeDisp || '').toUpperCase()
             return !type.includes('OPTION')
           })
-          .slice(0, 12)
-          .map((quote) => ({
-            ticker: String(quote.symbol).toUpperCase(),
-            label: String(quote.symbol).toUpperCase(),
-            companyName: quote.longname || quote.shortname || null,
-            savedAt: null,
-            exchange: quote.exchDisp || quote.exchange || null,
-            quoteType: quote.typeDisp || quote.quoteType || null,
-            source: 'yahoo-finance',
-          }))
+          .slice(0, 16)
+          .map((quote) => {
+            const symbol = String(quote.symbol).toUpperCase()
+            const shortName = quote.shortname || quote.shortName || null
+            const longName = quote.longname || quote.longName || null
+            const quoteType = quote.typeDisp || quote.quoteType || null
+            const exchange = quote.exchDisp || quote.exchange || quote.fullExchangeName || null
+            return {
+              ticker: symbol,
+              label: symbol,
+              companyName: longName || shortName || null,
+              shortName,
+              longName,
+              savedAt: null,
+              exchange,
+              quoteType,
+              sector: quote.sector || null,
+              industry: quote.industry || null,
+              // Yahoo search score when present (higher = better match)
+              score: Number.isFinite(Number(quote.score)) ? Number(quote.score) : null,
+              isYahooFinance: quote.isYahooFinance !== false,
+              source: 'yahoo-finance',
+            }
+          })
       } catch {
         // Live Yahoo search failed — still return any saved matches.
       }
@@ -325,13 +1060,15 @@ const CHART_RANGES = {
   // Look back a few calendar days so weekends/holidays still return the last
   // regular session; the UI filters 1D down to the latest trading day.
   '1d': { days: 5, interval: '1m', allowed: ['1m', '2m', '5m'] },
-  '5d': { days: 7, interval: '15m', allowed: ['5m', '15m', '30m', '60m', '1h'] },
+  // Yahoo allows ~7 calendar days of 1m/2m; share cards need dense multi-day lines.
+  '5d': { days: 7, interval: '15m', allowed: ['1m', '2m', '5m', '15m', '30m', '60m', '1h'] },
   '1mo': { days: 31, interval: '1h', allowed: ['15m', '30m', '60m', '1h', '1d'] },
   '3mo': { days: 93, interval: '1d', allowed: ['1h', '1d'] },
   '6mo': { days: 186, interval: '1d', allowed: ['1d', '1wk'] },
   ytd: { ytd: true, interval: '1d', allowed: ['1d', '1wk'] },
   '1y': { days: 365, interval: '1d', allowed: ['1d', '1wk'] },
   '5y': { days: 365 * 5, interval: '1wk', allowed: ['1d', '1wk', '1mo'] },
+  '10y': { days: 365 * 10, interval: '1wk', allowed: ['1d', '1wk', '1mo'] },
   max: { years: 30, interval: '1mo', allowed: ['1wk', '1mo'] },
 }
 
@@ -392,6 +1129,134 @@ function hostFromWebsite(website) {
  * Cascades several public sources until one returns a real image:
  *   IEX → FMP → Parqet → Synth → Yahoo website favicon (Google / DuckDuckGo)
  */
+/**
+ * Lightweight company fundamentals for the notifications detail header:
+ * market cap, sector, industry, about blurb, HQ, employees, website.
+ */
+router.get('/:ticker/profile', async (request, response) => {
+  try {
+    const ticker = String(request.params.ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!ticker) {
+      response.status(400).json({ error: 'Ticker is required' })
+      return
+    }
+    const symbol = toYahooSymbol(ticker)
+    let summary = null
+    try {
+      summary = await yahooFinance.quoteSummary(
+        symbol,
+        {
+          modules: [
+            'assetProfile',
+            'summaryProfile',
+            'summaryDetail',
+            'price',
+            'quoteType',
+          ],
+        },
+        { validateResult: false },
+      )
+    } catch (error) {
+      // Recovery: FailedYahooValidationError often still has .result
+      summary = error?.result || null
+      if (!summary) throw error
+    }
+
+    const asset = summary?.assetProfile || {}
+    const profile = summary?.summaryProfile || {}
+    const detail = summary?.summaryDetail || {}
+    const price = summary?.price || {}
+    const quoteType = summary?.quoteType || {}
+
+    const pick = (...vals) => {
+      for (const v of vals) {
+        if (v == null || v === '') continue
+        return v
+      }
+      return null
+    }
+
+    const marketCapRaw = pick(detail.marketCap, price.marketCap, price.enterpriseValue)
+    const marketCap =
+      marketCapRaw != null && Number.isFinite(Number(marketCapRaw))
+        ? Number(marketCapRaw)
+        : null
+
+    const employeesRaw = pick(asset.fullTimeEmployees, profile.fullTimeEmployees)
+    const employees =
+      employeesRaw != null && Number.isFinite(Number(employeesRaw))
+        ? Number(employeesRaw)
+        : null
+
+    // Some Yahoo profiles expose founding-ish dates as epoch seconds/ms.
+    const foundedCandidates = [
+      asset.startDate,
+      profile.startDate,
+      asset.founded,
+      profile.founded,
+      quoteType?.startDate,
+    ]
+    let founded = null
+    for (const raw of foundedCandidates) {
+      if (raw == null || raw === '') continue
+      if (typeof raw === 'string' && /^\d{4}/.test(raw)) {
+        founded = raw.slice(0, 10)
+        break
+      }
+      const n = Number(raw)
+      if (!Number.isFinite(n) || n <= 0) continue
+      const ms = n < 1e12 ? n * 1000 : n
+      const d = new Date(ms)
+      if (!Number.isNaN(d.getTime()) && d.getUTCFullYear() > 1800 && d.getUTCFullYear() < 2100) {
+        founded = String(d.getUTCFullYear())
+        break
+      }
+    }
+
+    const officers = Array.isArray(asset.companyOfficers) ? asset.companyOfficers : []
+    const ceo =
+      officers.find((o) => /chief executive|ceo/i.test(String(o?.title || ''))) ||
+      officers[0] ||
+      null
+
+    const about = String(
+      pick(asset.longBusinessSummary, profile.longBusinessSummary) || '',
+    ).trim()
+
+    response.setHeader('Cache-Control', 'public, max-age=300')
+    response.json({
+      ok: true,
+      ticker,
+      symbol,
+      source: 'yahoo-finance',
+      profile: {
+        shortName: pick(price.shortName, quoteType.shortName) || null,
+        longName: pick(price.longName, quoteType.longName) || null,
+        marketCap,
+        currency: pick(price.currency, detail.currency) || 'USD',
+        sector: pick(asset.sector, profile.sector, asset.sectorDisp) || null,
+        industry: pick(asset.industry, profile.industry, asset.industryDisp) || null,
+        website: pick(asset.website, profile.website) || null,
+        fullTimeEmployees: employees,
+        city: pick(asset.city, profile.city) || null,
+        state: pick(asset.state, profile.state) || null,
+        country: pick(asset.country, profile.country) || null,
+        founded,
+        ceo: ceo?.name ? String(ceo.name) : null,
+        ceoTitle: ceo?.title ? String(ceo.title) : null,
+        about: about || null,
+        exchange: pick(price.exchange, quoteType.exchange) || null,
+      },
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: errorMessage(error, 'Failed to fetch Yahoo company profile'),
+    })
+  }
+})
+
 router.get('/:ticker/logo', async (request, response) => {
   try {
     const ticker = String(request.params.ticker || '').toUpperCase()
@@ -506,12 +1371,24 @@ router.get('/:ticker/quote', async (request, response) => {
       quote: {
         symbol: q.symbol || symbol,
         shortName: q.shortName || q.longName || null,
-        regularMarketPrice: q.regularMarketPrice ?? null,
-        regularMarketChange: q.regularMarketChange ?? null,
-        regularMarketChangePercent: q.regularMarketChangePercent ?? null,
-        regularMarketPreviousClose: q.regularMarketPreviousClose ?? null,
+        longName: q.longName || null,
+        regularMarketPrice: numOrNull(q.regularMarketPrice),
+        regularMarketChange: numOrNull(q.regularMarketChange),
+        regularMarketChangePercent: numOrNull(q.regularMarketChangePercent),
+        regularMarketPreviousClose: numOrNull(q.regularMarketPreviousClose),
+        regularMarketTime: marketTimeToIso(q.regularMarketTime),
+        preMarketPrice: numOrNull(q.preMarketPrice),
+        preMarketChange: numOrNull(q.preMarketChange),
+        preMarketChangePercent: numOrNull(q.preMarketChangePercent),
+        preMarketTime: marketTimeToIso(q.preMarketTime),
+        postMarketPrice: numOrNull(q.postMarketPrice),
+        postMarketChange: numOrNull(q.postMarketChange),
+        postMarketChangePercent: numOrNull(q.postMarketChangePercent),
+        postMarketTime: marketTimeToIso(q.postMarketTime),
+        hasPrePostMarketData: q.hasPrePostMarketData ?? null,
         currency: q.currency || null,
-        marketState: q.marketState || null,
+        // Yahoo marketState as-is (PRE / PREPRE / REGULAR / POST / POSTPOST / CLOSED)
+        marketState: resolveQuoteMarketState(null, q.marketState),
         exchange: q.fullExchangeName || q.exchange || null,
         website,
         logoUrl,
@@ -572,6 +1449,7 @@ router.get('/:ticker/chart', async (request, response) => {
         period1,
         period2,
         interval,
+        includePrePost: isIntraday,
         events: 'div|split|earn',
       },
       { validateResult: false },
@@ -582,6 +1460,7 @@ router.get('/:ticker/chart', async (request, response) => {
       symbol,
       range: resolvedRange,
       interval,
+      includePrePost: isIntraday,
       allowedIntervals: config.allowed || [config.interval],
       chart: toPlainJson(chart),
       source: 'yahoo-finance',

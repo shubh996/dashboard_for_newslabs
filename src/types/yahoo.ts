@@ -160,9 +160,15 @@ export interface YahooSearchResult {
   ticker: string
   label: string
   companyName: string | null
+  shortName?: string | null
+  longName?: string | null
   savedAt: string | null
   exchange?: string | null
   quoteType?: string | null
+  sector?: string | null
+  industry?: string | null
+  score?: number | null
+  isYahooFinance?: boolean
   source: 'yahoo-finance'
 }
 

@@ -28,3 +28,4 @@ dist-ssr
 
 # Local SEC / cache data (large)
 server/data/
+data/

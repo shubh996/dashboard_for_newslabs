@@ -7,6 +7,7 @@ import { createClient } from '@supabase/supabase-js'
 import edgarRouter from './edgar/index.js'
 import yahooRouter from './yahoo/index.js'
 import { mountNotificationsRoutes } from './notifications.js'
+import { createMomentumRouter, startMomentumLoop } from './momentum/index.js'
 import { getYahooSession, fetchYahooQuoteSummary, yahooRaw } from './yahooClient.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -1282,6 +1283,10 @@ app.use('/api/yahoo', yahooRouter)
 // Notifications dashboard: monitored tickers + Firecrawl Perplexity scrapes
 mountNotificationsRoutes(app, { getSupabase })
 
+// Multi-ticker momentum engine (intraday rolling moves) — debug API + poll loop
+app.use('/api/momentum', createMomentumRouter())
+
 app.listen(port, () => {
   console.log(`News dashboard API listening on http://localhost:${port}`)
+  startMomentumLoop()
 })

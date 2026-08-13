@@ -6,11 +6,23 @@ import type {
   YahooUnitProgress,
 } from '@/types/yahoo'
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url)
+async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init)
   const body = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throw new Error(body?.error || `Request failed: ${url}`)
+    const msg =
+      (body && typeof body === 'object' && typeof (body as { error?: string }).error === 'string'
+        ? (body as { error: string }).error
+        : null) || `Request failed: ${response.status} ${response.statusText || ''}`.trim()
+    const err = new Error(`${msg} · ${url}`)
+    // Attach extra fields for callers that inspect the error object
+    Object.assign(err, {
+      status: response.status,
+      statusText: response.statusText,
+      url,
+      body,
+    })
+    throw err
   }
   return body as T
 }
@@ -42,7 +54,17 @@ export function fetchYahooFull(ticker: string) {
   return getJson<YahooTickerBundle>(`/api/yahoo/${encodeURIComponent(ticker)}/full`)
 }
 
-export type YahooChartRange = '1d' | '5d' | '1mo' | '3mo' | '6mo' | 'ytd' | '1y' | '5y' | 'max'
+export type YahooChartRange =
+  | '1d'
+  | '5d'
+  | '1mo'
+  | '3mo'
+  | '6mo'
+  | 'ytd'
+  | '1y'
+  | '5y'
+  | '10y'
+  | 'max'
 
 /** Yahoo Finance bar sizes supported by chart(). */
 export type YahooChartInterval =
@@ -66,13 +88,14 @@ export const CHART_INTERVAL_BY_RANGE: Record<
   { default: YahooChartInterval; options: YahooChartInterval[] }
 > = {
   '1d': { default: '1m', options: ['1m', '2m', '5m'] },
-  '5d': { default: '15m', options: ['5m', '15m', '30m', '60m', '1h'] },
+  '5d': { default: '15m', options: ['1m', '2m', '5m', '15m', '30m', '60m', '1h'] },
   '1mo': { default: '1h', options: ['15m', '30m', '60m', '1h', '1d'] },
   '3mo': { default: '1d', options: ['1h', '1d'] },
   '6mo': { default: '1d', options: ['1d', '1wk'] },
   ytd: { default: '1d', options: ['1d', '1wk'] },
   '1y': { default: '1d', options: ['1d', '1wk'] },
   '5y': { default: '1wk', options: ['1d', '1wk', '1mo'] },
+  '10y': { default: '1wk', options: ['1d', '1wk', '1mo'] },
   max: { default: '1mo', options: ['1wk', '1mo'] },
 }
 
@@ -88,22 +111,45 @@ export function fetchYahooChart(
     symbol: string
     range: YahooChartRange
     interval: string
+    includePrePost?: boolean
     allowedIntervals?: string[]
     chart: unknown
     source: 'yahoo-finance'
   }>(`/api/yahoo/${encodeURIComponent(ticker)}/chart?${params.toString()}`)
 }
 
+/**
+ * Live quote from /api/yahoo. Extended hours:
+ * - No overnightMarket* fields — overnight is postMarket* when marketState=PREPRE
+ * - PRE → preMarket*; POST/POSTPOST → postMarket* (after-hours); REGULAR → regularMarket*
+ */
 export type YahooLiveQuote = {
   symbol: string
   shortName: string | null
+  longName?: string | null
   regularMarketPrice: number | null
   regularMarketChange: number | null
   regularMarketChangePercent: number | null
   regularMarketPreviousClose: number | null
+  regularMarketTime?: string | null
+  preMarketPrice?: number | null
+  preMarketChange?: number | null
+  preMarketChangePercent?: number | null
+  preMarketTime?: string | null
+  /** After-hours AND overnight (when marketState is PREPRE) */
+  postMarketPrice?: number | null
+  postMarketChange?: number | null
+  postMarketChangePercent?: number | null
+  postMarketTime?: string | null
+  hasPrePostMarketData?: boolean | null
   currency: string | null
+  /**
+   * PREPRE=Overnight(post*), PRE=pre*, REGULAR=reg*, POST/POSTPOST=AH(post*), CLOSED=at close
+   */
   marketState: string | null
   exchange: string | null
+  liveSource?: 'yahoo-streamer' | 'yahoo-quote' | string | null
+  streamReceivedAt?: string | null
   website?: string | null
   logoUrl?: string | null
 }
@@ -132,6 +178,81 @@ export function fetchYahooQuote(ticker: string) {
   }>(`/api/yahoo/${encodeURIComponent(ticker)}/quote`)
 }
 
+/** Company fundamentals for detail header (market cap, about, sector, …). */
+export type YahooCompanyProfile = {
+  shortName?: string | null
+  longName?: string | null
+  marketCap: number | null
+  currency?: string | null
+  sector?: string | null
+  industry?: string | null
+  website?: string | null
+  fullTimeEmployees?: number | null
+  city?: string | null
+  state?: string | null
+  country?: string | null
+  founded?: string | null
+  ceo?: string | null
+  ceoTitle?: string | null
+  about?: string | null
+  exchange?: string | null
+}
+
+export function fetchYahooCompanyProfile(ticker: string, signal?: AbortSignal) {
+  return getJson<{
+    ok?: boolean
+    ticker: string
+    symbol: string
+    source: 'yahoo-finance'
+    profile: YahooCompanyProfile
+  }>(`/api/yahoo/${encodeURIComponent(ticker)}/profile`, {
+    cache: 'no-store',
+    signal,
+  })
+}
+
+/** One lightweight Yahoo request for live prices across a ticker list. */
+export async function fetchYahooQuotes(tickers: string[], signal?: AbortSignal) {
+  const clean = [...new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean))]
+  if (!clean.length) {
+    return {
+      source: 'yahoo-finance' as const,
+      fetchedAt: new Date().toISOString(),
+      quotes: {} as Record<string, YahooLiveQuote>,
+    }
+  }
+
+  type YahooQuotesBatch = {
+    source: 'yahoo-finance'
+    fetchedAt: string
+    quotes: Record<string, YahooLiveQuote>
+  }
+
+  const batches: string[][] = []
+  for (let index = 0; index < clean.length; index += 80) {
+    batches.push(clean.slice(index, index + 80))
+  }
+
+  const results = await Promise.all(
+    batches.map((batch) => {
+      const params = new URLSearchParams({ tickers: batch.join(',') })
+      return getJson<YahooQuotesBatch>(`/api/yahoo/quotes?${params}`, {
+        cache: 'no-store',
+        signal,
+      })
+    }),
+  )
+
+  return {
+    source: 'yahoo-finance' as const,
+    fetchedAt: results.reduce(
+      (latest, result) => (result.fetchedAt > latest ? result.fetchedAt : latest),
+      results[0]?.fetchedAt || new Date().toISOString(),
+    ),
+    quotes: Object.assign({}, ...results.map((result) => result.quotes)),
+  }
+}
+
 export function getSavedYahooTicker(ticker: string) {
   return getJsonOrNull<YahooSavedSnapshot>(`/api/yahoo/${encodeURIComponent(ticker)}/saved`)
 }
@@ -147,6 +268,52 @@ export async function getSavedYahooTickerMap(tickers: string[]): Promise<Record<
 
 export function searchYahooSaved(query: string) {
   return getJson<YahooSearchResults>(`/api/yahoo/search?q=${encodeURIComponent(query)}`)
+}
+
+/** One row from Yahoo day_gainers / day_losers (filtered for large moves + size). */
+export type YahooExtremeMover = {
+  ticker: string
+  symbol: string
+  company_name: string
+  long_name?: string | null
+  regularMarketPrice: number | null
+  regularMarketChange: number | null
+  regularMarketChangePercent: number
+  marketCap: number | null
+  currency?: string | null
+  exchange?: string | null
+  marketState?: string | null
+  quoteType?: string | null
+  direction?: 'up' | 'down' | 'flat'
+}
+
+export type YahooExtremeMoversResponse = {
+  ok?: boolean
+  source: 'yahoo-finance'
+  screener?: string[]
+  minPercent: number
+  minMarketCap: number
+  fetchedAt: string
+  count: number
+  movers: YahooExtremeMover[]
+}
+
+/** Big equities with extreme same-day % moves (default ≥10%, market cap ≥ $1B). */
+export function fetchYahooExtremeMovers(options?: {
+  minPercent?: number
+  minMarketCap?: number
+  count?: number
+  signal?: AbortSignal
+}) {
+  const params = new URLSearchParams()
+  if (options?.minPercent != null) params.set('minPercent', String(options.minPercent))
+  if (options?.minMarketCap != null) params.set('minMarketCap', String(options.minMarketCap))
+  if (options?.count != null) params.set('count', String(options.count))
+  const qs = params.toString()
+  return getJson<YahooExtremeMoversResponse>(
+    `/api/yahoo/extreme-movers${qs ? `?${qs}` : ''}`,
+    { cache: 'no-store', signal: options?.signal },
+  )
 }
 
 export async function saveYahooSnapshot(

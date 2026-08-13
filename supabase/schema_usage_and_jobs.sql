@@ -7,7 +7,7 @@
 create table if not exists public.usage_daily_ledger (
   id bigserial primary key,
   day date not null,
-  provider text not null check (provider in ('gemini', 'firecrawl')),
+  provider text not null check (provider in ('gemini', 'firecrawl', 'perplexity')),
   ticker text null,
   credits_used numeric not null default 0,
   cost_usd numeric not null default 0,

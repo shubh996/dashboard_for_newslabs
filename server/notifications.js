@@ -21,6 +21,11 @@ import {
   resolveTradingEconomicsTarget,
   scrapeTradingEconomicsNotableMovements,
 } from './tradingEconomics.js'
+import {
+  buildMomentumAlertTitle,
+  formatDashesToCommas,
+  resolveLookbackMinutes,
+} from './momentum/notifyCopy.js'
 
 const FIRECRAWL_BASE = 'https://api.firecrawl.dev/v1'
 const MONTHS = {
@@ -56,6 +61,199 @@ function normalizeTicker(value) {
 
 function perplexityFinanceUrl(ticker) {
   return `https://www.perplexity.ai/finance/${encodeURIComponent(ticker)}`
+}
+
+/**
+ * Perplexity Agent API — multi-provider models with web_search tool.
+ * Model default: perplexity/deepseek-v4-flash-0731
+ *
+ * Endpoint: POST https://api.perplexity.ai/v1/agent
+ * (NOT legacy /chat/completions Sonar-only path)
+ *
+ * Env: PERPLEXITY_API_KEY, optional PERPLEXITY_MODEL
+ */
+export async function callPerplexityResearch({
+  apiKey,
+  model,
+  prompt,
+  maxTokens = 4096,
+}) {
+  const resolvedModel =
+    String(
+      model ||
+        process.env.PERPLEXITY_MODEL ||
+        'perplexity/deepseek-v4-flash-0731',
+    ).trim() || 'perplexity/deepseek-v4-flash-0731'
+  const url = 'https://api.perplexity.ai/v1/agent'
+  // Keep Agent "instructions" short; full rules live in the user prompt (INSTRUCTIONS → OUTPUT → INPUT).
+  const instructions = [
+    'Financial market-move research agent.',
+    'Use web_search for live catalysts.',
+    'Follow the prompt sections in order: INSTRUCTIONS, then OUTPUT format, then INPUT.',
+    'Return only the OUTPUT block format. Do not invent facts. British English.',
+  ].join(' ')
+
+  const body = {
+    model: resolvedModel,
+    input: String(prompt || ''),
+    instructions,
+    tools: [{ type: 'web_search' }],
+    max_output_tokens: Math.min(Math.max(Number(maxTokens) || 4096, 256), 8192),
+    tool_choice: 'auto',
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const message =
+      data?.error?.message ||
+      data?.error ||
+      data?.message ||
+      `Perplexity Agent API failed (${res.status})`
+    const err = new Error(String(message))
+    err.status = res.status === 429 ? 429 : res.status || 502
+    err.model = resolvedModel
+    err.body = data
+    err.quota = res.status === 429 || /quota|rate limit/i.test(String(message))
+    err.provider = 'perplexity'
+    throw err
+  }
+
+  // Agent API: output is an array of message / search_results / tool items
+  const outputItems = Array.isArray(data?.output) ? data.output : []
+  let summary = ''
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) {
+    summary = data.output_text.trim()
+  } else {
+    const parts = []
+    for (const item of outputItems) {
+      if (item?.type === 'message' && Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if (c?.type === 'output_text' && c.text) parts.push(String(c.text))
+          else if (typeof c?.text === 'string') parts.push(c.text)
+        }
+      }
+    }
+    summary = parts.join('\n').trim()
+  }
+  summary = String(summary)
+    .replace(/^```(?:text|markdown)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+
+  // Collect web hits from search_results output blocks
+  const searchResults = []
+  const citations = []
+  for (const item of outputItems) {
+    if (item?.type === 'search_results' && Array.isArray(item.results)) {
+      for (const r of item.results) {
+        searchResults.push({
+          title: r?.title || null,
+          url: r?.url || null,
+          source: r?.source || 'web',
+          date: r?.date || r?.last_updated || null,
+          snippet: r?.snippet ? String(r.snippet).slice(0, 280) : null,
+        })
+        if (r?.url) citations.push(String(r.url))
+      }
+    }
+  }
+
+  const toolsUsed = Array.isArray(data?.tools)
+    ? data.tools.map((t) => ({
+        name: t?.type || t?.name || 'tool',
+        provider: 'perplexity',
+        description:
+          t?.type === 'web_search'
+            ? 'Agent API web_search tool'
+            : t?.type === 'fetch_url'
+              ? 'Agent API fetch_url tool'
+              : t?.type === 'finance_search'
+                ? 'Agent API finance_search tool'
+                : `Agent tool: ${t?.type || 'unknown'}`,
+      }))
+    : [
+        {
+          name: 'web_search',
+          provider: 'perplexity',
+          description: 'Agent API web_search tool',
+        },
+      ]
+
+  const usage = data?.usage || null
+  const cost = usage?.cost && typeof usage.cost === 'object' ? usage.cost : null
+  const promptTokens = Number(usage?.input_tokens ?? usage?.prompt_tokens)
+  const completionTokens = Number(
+    usage?.output_tokens ?? usage?.completion_tokens,
+  )
+  const totalTokens = Number(
+    usage?.total_tokens ??
+      (Number.isFinite(promptTokens) && Number.isFinite(completionTokens)
+        ? promptTokens + completionTokens
+        : NaN),
+  )
+  const totalCost = Number(cost?.total_cost)
+  const costUsdDisplay = Number.isFinite(totalCost)
+    ? `$${totalCost.toFixed(totalCost < 0.01 ? 6 : 4)}`
+    : null
+
+  // Normalize cost field names for UI (Agent uses input_cost / output_cost)
+  const costNormalized = cost
+    ? {
+        input_tokens_cost: cost.input_cost ?? cost.input_tokens_cost ?? null,
+        output_tokens_cost: cost.output_cost ?? cost.output_tokens_cost ?? null,
+        request_cost: cost.request_cost ?? cost.tool_calls_cost ?? null,
+        tool_calls_cost: cost.tool_calls_cost ?? null,
+        total_cost: cost.total_cost ?? null,
+        currency: cost.currency || 'USD',
+        total_cost_display: costUsdDisplay,
+      }
+    : null
+
+  return {
+    summary,
+    model: resolvedModel,
+    modelVersion: data?.model || resolvedModel,
+    requestId: data?.id || null,
+    usageMetadata: usage
+      ? {
+          promptTokenCount: Number.isFinite(promptTokens) ? promptTokens : null,
+          candidatesTokenCount: Number.isFinite(completionTokens)
+            ? completionTokens
+            : null,
+          totalTokenCount: Number.isFinite(totalTokens) ? totalTokens : null,
+          searchContextSize: usage.search_context_size || null,
+        }
+      : null,
+    usageRaw: {
+      ...usage,
+      // aliases for UI token cards
+      prompt_tokens: Number.isFinite(promptTokens) ? promptTokens : null,
+      completion_tokens: Number.isFinite(completionTokens)
+        ? completionTokens
+        : null,
+      total_tokens: Number.isFinite(totalTokens) ? totalTokens : null,
+    },
+    cost: costNormalized,
+    cost_usd_display: costUsdDisplay,
+    citations: [...new Set(citations)],
+    search_results: searchResults,
+    tools: toolsUsed,
+    finishReason: data?.status || null,
+    provider: 'perplexity',
+    use_web_search: true,
+    endpoint: url,
+    agent_status: data?.status || null,
+  }
 }
 
 /**
@@ -347,7 +545,7 @@ function sumGeminiUsageFromDates(datesOrEvents) {
   }
 }
 
-function geminiMaxOutputTokens() {
+export function geminiMaxOutputTokens() {
   const raw = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS)
   if (Number.isFinite(raw) && raw >= 256) return Math.min(Math.floor(raw), 8192)
   return 8192
@@ -436,6 +634,212 @@ async function recordGeminiUsageLedger(supabase, {
   return { day, credits_used: credits, cost_usd: cost }
 }
 
+/**
+ * Log one Perplexity research call (tokens as credits_used, real USD in cost_usd).
+ * Also appends a local JSON fallback so the dashboard still works if Supabase is down.
+ */
+export async function recordPerplexityUsageLedger(
+  supabase,
+  {
+    ticker = null,
+    credits_used = 0,
+    cost_usd = 0,
+    total_tokens = 0,
+    prompt_tokens = 0,
+    completion_tokens = 0,
+    meta = {},
+  } = {},
+) {
+  const tokens = Number(total_tokens) || Number(credits_used) || 0
+  const cost = Number(cost_usd) || 0
+  if (tokens <= 0 && cost <= 0) return null
+  const day = todayIsoEastern()
+  const row = {
+    day,
+    provider: 'perplexity',
+    ticker: ticker || null,
+    credits_used: tokens,
+    cost_usd: cost,
+    meta: {
+      total_tokens: tokens,
+      prompt_tokens: Number(prompt_tokens) || 0,
+      completion_tokens: Number(completion_tokens) || 0,
+      ...meta,
+    },
+  }
+
+  // Local fallback file (always)
+  try {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const dir = path.join(process.cwd(), 'data')
+    const file = path.join(dir, 'perplexity-usage-ledger.json')
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    let list = []
+    if (fs.existsSync(file)) {
+      try {
+        list = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (!Array.isArray(list)) list = []
+      } catch {
+        list = []
+      }
+    }
+    list.push({
+      ...row,
+      created_at: new Date().toISOString(),
+    })
+    // Cap file size
+    if (list.length > 5000) list = list.slice(-5000)
+    fs.writeFileSync(file, JSON.stringify(list, null, 0), 'utf8')
+  } catch (e) {
+    console.warn('[perplexity usage] local ledger write failed:', e?.message || e)
+  }
+
+  if (!supabase) return { day, credits_used: tokens, cost_usd: cost, source: 'local' }
+  const { error } = await supabase.from('usage_daily_ledger').insert({
+    day: row.day,
+    provider: 'perplexity',
+    ticker: row.ticker,
+    credits_used: row.credits_used,
+    cost_usd: row.cost_usd,
+    meta: row.meta,
+  })
+  if (error) {
+    console.warn('[usage_daily_ledger] perplexity insert failed:', error.message)
+    return { day, credits_used: tokens, cost_usd: cost, source: 'local', error: error.message }
+  }
+  return { day, credits_used: tokens, cost_usd: cost, source: 'supabase' }
+}
+
+async function loadPerplexityUsageDaily({ supabase, days = 30 } = {}) {
+  const cutoff = new Date()
+  cutoff.setUTCDate(cutoff.getUTCDate() - Math.max(1, days))
+  const cutoffDay = cutoff.toISOString().slice(0, 10)
+  const byDay = new Map()
+
+  const addRow = (dayRaw, credits, cost, tokens, calls = 1) => {
+    const day = String(dayRaw || '').slice(0, 10)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoffDay) return
+    const prev = byDay.get(day) || {
+      day,
+      cost_usd: 0,
+      credits_used: 0,
+      total_tokens: 0,
+      calls: 0,
+    }
+    prev.cost_usd += Number(cost) || 0
+    prev.credits_used += Number(credits) || 0
+    prev.total_tokens += Number(tokens) || Number(credits) || 0
+    prev.calls += calls
+    byDay.set(day, prev)
+  }
+
+  // 1) Supabase ledger
+  if (supabase) {
+    try {
+      const { data: rows, error } = await supabase
+        .from('usage_daily_ledger')
+        .select('day, credits_used, cost_usd, meta, created_at')
+        .eq('provider', 'perplexity')
+        .gte('day', cutoffDay)
+        .order('day', { ascending: false })
+      if (!error && Array.isArray(rows)) {
+        for (const row of rows) {
+          const meta = row.meta && typeof row.meta === 'object' ? row.meta : {}
+          const tokens =
+            Number(meta.total_tokens) || Number(row.credits_used) || 0
+          addRow(row.day, row.credits_used, row.cost_usd, tokens, 1)
+        }
+      }
+    } catch (e) {
+      console.warn('[perplexity usage] supabase read failed:', e?.message || e)
+    }
+  }
+
+  // 2) Local file fallback (merge; avoid double-count if same rows — file is source when supabase empty)
+  if (byDay.size === 0) {
+    try {
+      const fs = await import('node:fs')
+      const path = await import('node:path')
+      const file = path.join(process.cwd(), 'data', 'perplexity-usage-ledger.json')
+      if (fs.existsSync(file)) {
+        const list = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (Array.isArray(list)) {
+          for (const row of list) {
+            const meta = row.meta && typeof row.meta === 'object' ? row.meta : {}
+            const tokens =
+              Number(meta.total_tokens) || Number(row.credits_used) || 0
+            addRow(row.day, row.credits_used, row.cost_usd, tokens, 1)
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // 3) Research tables (historical saves)
+  if (supabase && byDay.size === 0) {
+    const tables = [
+      'momentum_research_monitored_stocks',
+      'momentum_research_commodities',
+      'momentum_research_forex',
+      'momentum_research_crypto',
+      'momentum_research_indexes',
+    ]
+    for (const table of tables) {
+      try {
+        const { data, error } = await supabase
+          .from(table)
+          .select('created_at, cost_usd, tokens, cost')
+          .gte('created_at', `${cutoffDay}T00:00:00.000Z`)
+          .order('created_at', { ascending: false })
+          .limit(500)
+        if (error || !Array.isArray(data)) continue
+        for (const row of data) {
+          const day = isoToDateEt(row.created_at)
+          const cost =
+            Number(row.cost_usd) ||
+            Number(row.cost?.total_cost) ||
+            0
+          const tokens =
+            Number(row.tokens?.total) ||
+            Number(row.tokens?.total_tokens) ||
+            0
+          addRow(day, tokens, cost, tokens, 1)
+        }
+      } catch {
+        /* table may not exist */
+      }
+    }
+  }
+
+  const daily = [...byDay.values()]
+    .map((row) => ({
+      day: row.day,
+      cost_usd: Math.round(row.cost_usd * 1e8) / 1e8,
+      cost_usd_display: formatUsdDisplay(row.cost_usd),
+      credits_used: Math.round(row.credits_used),
+      total_tokens: Math.round(row.total_tokens),
+      calls: row.calls,
+    }))
+    .sort((a, b) => String(b.day).localeCompare(String(a.day)))
+
+  const total_cost = daily.reduce((s, d) => s + (Number(d.cost_usd) || 0), 0)
+  const total_credits = daily.reduce((s, d) => s + (Number(d.credits_used) || 0), 0)
+  const total_tokens = daily.reduce((s, d) => s + (Number(d.total_tokens) || 0), 0)
+  const total_calls = daily.reduce((s, d) => s + (Number(d.calls) || 0), 0)
+
+  return {
+    daily,
+    total_cost_usd: Math.round(total_cost * 1e8) / 1e8,
+    total_cost_usd_display: formatUsdDisplay(total_cost),
+    total_credits,
+    total_tokens,
+    total_calls,
+  }
+}
+
 /** Aggregate Gemini spend by ET day from stored notable_price_movements dates. */
 function aggregateGeminiSpendByDay(rows, { days = 30 } = {}) {
   const byDay = new Map()
@@ -519,7 +923,7 @@ function mockResCapture() {
   }
 }
 
-function structuredReasonHasLikelyDriver(text) {
+export function structuredReasonHasLikelyDriver(text) {
   const raw = String(text || '').trim()
   if (!raw) return false
   if (!/likely\s*driver\s*:/i.test(raw)) return false
@@ -605,68 +1009,86 @@ function shouldSwitchGeminiModel(error) {
  * On high demand / quota / unavailable, callGeminiWithModelCascade walks this list.
  */
 function geminiModelCascade(preferred = '') {
+  // 3.x Flash + stable aliases. Many 2.0/2.5 ids 404 for new API keys.
   const defaults = [
-    // Newest Flash family first
     'gemini-3.6-flash',
     'gemini-3.5-flash',
     'gemini-3.5-flash-lite',
-    'gemini-3.4-flash',
-    'gemini-3.2-flash',
     'gemini-3.1-flash-lite',
+    'gemini-3.1-flash-lite-preview',
+    'gemini-flash-latest',
+    'gemini-flash-lite-latest',
     'gemini-3-flash-preview',
-    'gemini-omni-flash-preview',
-    // Pro / preview fallbacks
     'gemini-3.1-pro-preview',
-    'gemini-3-pro-preview',
-    // 2.5 family
-    'gemini-2.5-pro',
+    'gemini-omni-flash-preview',
+    'gemini-pro-latest',
+  ]
+  // Still listed in some docs / env cascades but blocked for new users
+  const blocked = new Set([
     'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
     'gemini-2.5-flash-lite-preview',
-    // 2.x family
-    'gemini-2.1-flash',
+    'gemini-2.5-pro',
     'gemini-2.0-flash',
     'gemini-2.0-flash-001',
     'gemini-2.0-flash-lite',
     'gemini-2.0-flash-lite-001',
-    // Older stable text models (last resort)
+    'gemini-2.1-flash',
     'gemini-1.5-flash',
     'gemini-1.5-flash-latest',
     'gemini-1.5-flash-8b',
     'gemini-1.5-pro',
     'gemini-1.5-pro-latest',
-  ]
+  ])
   const fromEnv = String(process.env.GEMINI_MODEL_CASCADE || '')
     .split(/[,|\s]+/)
     .map((item) => item.trim())
     .filter(Boolean)
-  const base = fromEnv.length ? fromEnv : defaults
+  const base = (fromEnv.length ? fromEnv : defaults).filter(
+    (m) => m && !blocked.has(m),
+  )
   const pref = String(
     preferred || process.env.GEMINI_MODEL || '',
   ).trim()
   const ordered = []
-  if (pref) ordered.push(pref)
-  for (const model of base) {
-    if (model && !ordered.includes(model)) ordered.push(model)
+  if (pref && !blocked.has(pref)) ordered.push(pref)
+  for (const model of base.length ? base : defaults) {
+    if (model && !ordered.includes(model) && !blocked.has(model)) {
+      ordered.push(model)
+    }
   }
-  return ordered
+  return ordered.length ? ordered : defaults
 }
 
-async function callGeminiGenerateContent({ apiKey, model, prompt, maxOutputTokens }) {
+async function callGeminiGenerateContent({
+  apiKey,
+  model,
+  prompt,
+  maxOutputTokens,
+  /** When true, enable Google Search grounding (commodity / crypto / FX research). */
+  useGoogleSearch = false,
+}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model,
   )}:generateContent?key=${encodeURIComponent(apiKey)}`
 
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: useGoogleSearch ? 0.35 : 0.25,
+      maxOutputTokens,
+    },
+  }
+  // Google Search grounding (momentum live research + optional commodity flows).
+  // Gemini API: tools: [{ google_search: {} }]
+  if (useGoogleSearch) {
+    body.tools = [{ google_search: {} }]
+  }
+
   const geminiResponse = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.25,
-        maxOutputTokens,
-      },
-    }),
+    body: JSON.stringify(body),
   })
 
   const geminiBody = await geminiResponse.json().catch(() => ({}))
@@ -715,6 +1137,8 @@ async function callGeminiGenerateContent({ apiKey, model, prompt, maxOutputToken
 /**
  * Try models in cascade order.
  * Switch immediately on: free-tier quota, high demand / capacity, missing model.
+ * If Google Search hits quota/unavailable, retry the SAME model without search
+ * before walking to the next model (search has its own free-tier pool).
  * Same model gets one structure-retry if "Likely driver:" is missing.
  */
 async function callGeminiWithModelCascade({
@@ -722,21 +1146,83 @@ async function callGeminiWithModelCascade({
   models,
   prompt,
   maxOutputTokens,
+  useGoogleSearch = false,
+  /**
+   * When true (momentum research): never fall back to plain generateContent
+   * without Google Search. Search grounding is mandatory.
+   */
+  requireGoogleSearch = false,
 }) {
   const usageAttempts = []
   const modelsTried = []
   const modelErrors = []
   let lastError = null
+  let usedGoogleSearch = false
+  const mustSearch = Boolean(useGoogleSearch && requireGoogleSearch)
+
+  async function generateWithSearchFallback(model, textPrompt) {
+    try {
+      const result = await callGeminiGenerateContent({
+        apiKey,
+        model,
+        prompt: textPrompt,
+        maxOutputTokens,
+        useGoogleSearch,
+      })
+      if (useGoogleSearch) usedGoogleSearch = true
+      return result
+    } catch (error) {
+      // Optional soft path only when search is not required
+      if (
+        useGoogleSearch &&
+        !mustSearch &&
+        (error?.quota ||
+          error?.status === 429 ||
+          error?.model_unavailable ||
+          error?.capacity)
+      ) {
+        modelErrors.push({
+          model,
+          error: `search: ${error instanceof Error ? error.message : String(error)}`,
+          quota: Boolean(error?.quota),
+          capacity: Boolean(error?.capacity),
+          model_unavailable: Boolean(error?.model_unavailable),
+          search_fallback: true,
+        })
+        const plain = await callGeminiGenerateContent({
+          apiKey,
+          model,
+          prompt: textPrompt,
+          maxOutputTokens,
+          useGoogleSearch: false,
+        })
+        return plain
+      }
+      // Required search failed — do not invent a no-web answer
+      if (mustSearch) {
+        const msg =
+          error instanceof Error ? error.message : String(error)
+        const err = new Error(
+          /quota|rate|429|exceeded/i.test(msg)
+            ? 'Web grounding (Google Search) is unavailable — quota exceeded or rate limited. Momentum research will not run without live web search. Fix billing/quota in Google AI Studio, then try again.'
+            : `Web grounding (Google Search) failed: ${msg}. Momentum research will not run without live web search.`,
+        )
+        err.status = error?.status === 429 || error?.quota ? 429 : error?.status || 503
+        err.quota = Boolean(error?.quota || error?.status === 429)
+        err.capacity = Boolean(error?.capacity)
+        err.model_unavailable = Boolean(error?.model_unavailable)
+        err.require_google_search = true
+        err.model = model
+        throw err
+      }
+      throw error
+    }
+  }
 
   for (const model of models) {
     modelsTried.push(model)
     try {
-      const first = await callGeminiGenerateContent({
-        apiKey,
-        model,
-        prompt,
-        maxOutputTokens,
-      })
+      const first = await generateWithSearchFallback(model, prompt)
       usageAttempts.push(
         buildGeminiUsageReport(first.usageMetadata, model, first.modelVersion),
       )
@@ -762,12 +1248,7 @@ async function callGeminiWithModelCascade({
         ].join('\n')
 
         try {
-          const second = await callGeminiGenerateContent({
-            apiKey,
-            model,
-            prompt: retryPrompt,
-            maxOutputTokens,
-          })
+          const second = await generateWithSearchFallback(model, retryPrompt)
           usageAttempts.push(
             buildGeminiUsageReport(second.usageMetadata, model, second.modelVersion),
           )
@@ -816,6 +1297,15 @@ async function callGeminiWithModelCascade({
         else if (modelErrors.some((e) => e.model_unavailable)) switchReason = 'unavailable'
         else switchReason = 'structure_or_error'
       }
+      if (mustSearch && !usedGoogleSearch) {
+        const err = new Error(
+          'Web grounding (Google Search) did not attach to this run. Momentum research will not return a result without live web search.',
+        )
+        err.status = 503
+        err.require_google_search = true
+        throw err
+      }
+
       return {
         summary,
         model,
@@ -825,6 +1315,7 @@ async function callGeminiWithModelCascade({
         modelsTried,
         modelErrors,
         usageAttempts,
+        use_google_search: usedGoogleSearch,
         model_switched: switched,
         model_switch_from: switched ? modelsTried[0] : null,
         model_switch_to: switched ? model : null,
@@ -1076,8 +1567,11 @@ function inferMoveDirection(summary) {
 
 /**
  * Perplexity often prints unsigned "2.21%" even on down days.
- * Prefer an explicit +/- from the page; otherwise infer from the summary language.
- * Never force everything to positive.
+ * Prefer an explicit +/- from the page; otherwise use visual arrow/color.
+ *
+ * IMPORTANT: only pass session-specific narrative into `summary` (e.g. close
+ * reason for close %). Never sign after-hours / pre-market using the close
+ * "fell/rose" sentence — that flips extended-hours moves incorrectly.
  */
 function normalizeSignedChange(priceChange, summary, visualDirection = null) {
   if (priceChange == null || priceChange === '') return null
@@ -1085,16 +1579,19 @@ function normalizeSignedChange(priceChange, summary, visualDirection = null) {
   const numeric = raw.replace(/^[+\-]/, '').trim()
   if (!numeric) return raw
 
-  // The finance page's arrow/color is authoritative.
+  // The finance page's arrow/color is authoritative for that session.
   if (visualDirection === 'down') return `-${numeric}`
   if (visualDirection === 'up') return `+${numeric}`
 
   if (raw.startsWith('-')) return `-${numeric}`
   if (raw.startsWith('+')) return `+${numeric}`
 
-  const direction = inferMoveDirection(summary)
-  if (direction === 'down') return `-${numeric}`
-  if (direction === 'up') return `+${numeric}`
+  // Optional: only when caller passed a session-appropriate narrative.
+  if (summary) {
+    const direction = inferMoveDirection(summary)
+    if (direction === 'down') return `-${numeric}`
+    if (direction === 'up') return `+${numeric}`
+  }
   // Ambiguous / flat — keep unsigned rather than inventing a sign
   return numeric
 }
@@ -1205,6 +1702,141 @@ function afterHoursPriceFromEvent(event) {
     event?.post_market_price ??
     null
   )
+}
+
+/**
+ * Reason / summary should explain WHY the stock moved — never restate the
+ * session move % (that already lives on price_change / premarket_change).
+ * Strip leading metric residue Firecrawl often leaves in the narrative blob.
+ */
+function stripRedundantMovePercentFromReason(summary, changes = {}) {
+  let text = String(summary || '').replace(/\s+/g, ' ').trim()
+  if (!text) return text
+
+  const normalizePct = (value) => {
+    if (value == null || value === '') return null
+    const match = String(value)
+      .replace(/,/g, '')
+      .replace(/^−/, '-')
+      .match(/[+\-]?\d+(?:\.\d+)?/)
+    if (!match) return null
+    return match[0].replace(/^\+/, '').replace(/^-/, '')
+  }
+
+  const known = new Set(
+    [changes.priceChange, changes.premarketChange, changes.afterHoursChange]
+      .map(normalizePct)
+      .filter(Boolean),
+  )
+
+  // Drop pure "6.03%" / "6.03% at Close" heads (repeat until clean).
+  let guard = 0
+  while (guard < 6) {
+    guard += 1
+    const lead = text.match(
+      /^([+\-−]?\d+(?:\.\d+)?)%\s*(?:(?:at\s*)?close|after[\s-]?hours?|(?:in\s+)?pre[\s-]?market)?\s*[:·–—,\|\-]*\s*/i,
+    )
+    if (!lead) break
+    const n = normalizePct(lead[1])
+    const hasSessionLabel = /(?:close|after|pre)/i.test(lead[0])
+    // Always strip when it matches the event move, or when it's clearly a
+    // session metric header (with label). Bare unknown % at start of a
+    // longer sentence is left alone only if not in known moves.
+    if (n && (known.has(n) || hasSessionLabel || known.size === 0)) {
+      // If known is empty and no session label, only strip when the entire
+      // remainder would be empty or starts with a separator — otherwise a
+      // real sentence starting with "50% of revenue…" stays.
+      if (!known.has(n) && !hasSessionLabel) {
+        const rest = text.slice(lead[0].length).trim()
+        if (rest && !/^[:·–—,\|\-]/.test(rest)) break
+      }
+      text = text.slice(lead[0].length).trim()
+      continue
+    }
+    break
+  }
+
+  // If the whole "reason" is just the move % itself, clear it.
+  const onlyPct = text.match(/^([+\-−]?\d+(?:\.\d+)?)%\s*$/)
+  if (onlyPct) {
+    const n = normalizePct(onlyPct[1])
+    if (n && (known.has(n) || known.size === 0)) return ''
+  }
+
+  return text
+}
+
+/**
+ * Remove URLs / publisher chips that leaked into the reason narrative after
+ * they were already captured in `sources[]`.
+ */
+function stripSourceLeakageFromReason(summary, sources = []) {
+  let text = String(summary || '').replace(/\s+/g, ' ').trim()
+  if (!text) return text
+
+  // Drop bare URLs and markdown links from the narrative.
+  text = text
+    .replace(/\[([^\]]*)\]\(https?:\/\/[^)\s]+\)/gi, ' ')
+    .replace(/https?:\/\/[^\s)\]>"']+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  for (const source of Array.isArray(sources) ? sources : []) {
+    const domain = String(source?.domain || '')
+      .replace(/^www\./i, '')
+      .trim()
+    const title = String(source?.title || '').trim()
+    if (domain) {
+      const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      text = text
+        .replace(new RegExp(`\\b(?:https?:\\/\\/)?(?:www\\.)?${escaped}\\b`, 'gi'), ' ')
+        .trim()
+    }
+    // Only strip exact trailing/standalone publisher titles (avoid eating words
+    // like "Apple" mid-sentence when a source is titled that way).
+    if (title && title.length >= 3 && title.length <= 48 && !/\s{2,}/.test(title)) {
+      const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      text = text
+        .replace(new RegExp(`(?:^|[\\s·|,;—-])${escapedTitle}(?=$|[\\s·|,;—-])`, 'gi'), ' ')
+        .trim()
+    }
+  }
+
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s,·|:—-]+|[\s,·|:—-]+$/g, '')
+    .trim()
+}
+
+/**
+ * True when a scrape line is only a session metric (price move), not narrative.
+ */
+function isSessionMetricOnlyLine(line) {
+  const t = String(line || '').trim()
+  if (!t) return false
+  if (/^[+\-−]?\d+(?:\.\d+)?%\s*$/.test(t)) return true
+  if (
+    /^[+\-−]?\d+(?:\.\d+)?%\s*(?:at\s*close|after[\s-]?hours?|(?:in\s+)?pre[\s-]?market)\s*[:·–—-]*\s*$/i.test(
+      t,
+    )
+  ) {
+    return true
+  }
+  if (
+    /^(?:at\s*close|after[\s-]?hours?|pre[\s-]?market)(?:\s+(?:movement|change|trading))?\s*[:·–—-]?\s*[+\-−]?\d+(?:\.\d+)?%\s*$/i.test(
+      t,
+    )
+  ) {
+    return true
+  }
+  if (
+    /^(?:at\s*close|after[\s-]?hours?|pre[\s-]?market)(?:\s+(?:movement|change|trading))?\s*[:·–—-]?\s*$/i.test(
+      t,
+    )
+  ) {
+    return true
+  }
+  return false
 }
 
 /**
@@ -1419,6 +2051,56 @@ function pickStoredGeminiFields(previous, row = {}) {
  *   v1: { events_by_date: { … } }
  *   legacy: { "YYYY-MM-DD": event, … }
  */
+
+/**
+ * Score a stored event for merge conflicts (multiple device rows / re-scrapes).
+ * Higher = richer / more trustworthy for timeline display.
+ */
+function eventRichnessScore(event) {
+  if (!event || typeof event !== 'object') return -1
+  let score = 0
+  const summary = String(event.summary || '').trim()
+  if (event.gemini_formating || event.gemini_classified_at) score += 1000
+  if (/likely\s*driver\s*:/i.test(summary)) score += 400
+  if (summary.length > 40) score += Math.min(200, summary.length)
+  if (event.price) score += 20
+  if (event.price_change || event.momentum) score += 20
+  if (premarketChangeFromEvent(event)) score += 15
+  if (afterHoursChangeFromEvent(event) || afterHoursPriceFromEvent(event)) score += 15
+  if (Array.isArray(event.sources) && event.sources.length) score += 10 + event.sources.length
+  if (event.time_label) score += 5
+  if (event.saved_at) score += 1
+  const savedAt = Date.parse(String(event.saved_at || event.gemini_usage_updated_at || '')) || 0
+  score += Math.min(50, Math.floor(savedAt / 1e11))
+  return score
+}
+
+/**
+ * When two rows claim the same event_date, keep the richer one (Gemini +
+ * complete metrics beat a bare scrape stub). Never blindly last-write-wins.
+ */
+function preferRicherEvent(current, incoming) {
+  if (!current) return incoming
+  if (!incoming) return current
+  const a = eventRichnessScore(current)
+  const b = eventRichnessScore(incoming)
+  if (b > a) return incoming
+  if (a > b) return current
+  const aAt = String(current.saved_at || '')
+  const bAt = String(incoming.saved_at || '')
+  return bAt > aAt ? incoming : current
+}
+
+/** Merge date maps without clobbering richer Gemini/full events. */
+function mergeDateMaps(base, extra) {
+  const out = { ...(base || {}) }
+  for (const [date, event] of Object.entries(extra || {})) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue
+    out[date] = preferRicherEvent(out[date], event)
+  }
+  return out
+}
+
 function extractDatesMap(notable) {
   if (!notable || typeof notable !== 'object' || Array.isArray(notable)) return {}
 
@@ -1525,16 +2207,33 @@ function normalizeEventRow(event) {
 }
 
 /**
+ * True when Supabase already holds a Gemini-structured reason for this date.
+ * Those must never be wiped by a later Perplexity re-fetch (except today when
+ * the story timestamp actually moved — see markChanged).
+ */
+function hasStoredGeminiReason(event) {
+  if (!event || typeof event !== 'object') return false
+  if (event.gemini_formating || event.gemini_classified_at) return true
+  return /likely\s*driver\s*:/i.test(String(event.summary || ''))
+}
+
+/**
  * Classify scraped events against already-saved dates for a ticker.
  * status: "new" | "changed" | "saved"
  *
+ * Intended product flow:
+ *  1) Fetch Perplexity → save new/changed to Supabase
+ *  2) Gemini on selected dates → summary becomes Gemini version (kept forever)
+ *  3) Re-open dashboard → timeline is always Supabase (Gemini where done)
+ *  4) Re-fetch never overwrites past Gemini dates
+ *  5) Today only may refresh from Perplexity when time/content actually moved
+ *
  * Rules (date + time, ET calendar):
- *  - Missing date in DB → new (any calendar day)
- *  - Older than today (already in DB) → saved (leave alone; no content re-write)
- *  - Today already in DB → compare scrape time_label vs stored time_label:
- *      different time → changed (content/reason will differ with a newer stamp)
- *      same time → saved
- *      times missing → fall back to content fingerprint
+ *  - Missing date in DB → new
+ *  - Older than today (already in DB) → always saved (keep Supabase / Gemini)
+ *  - Today + Gemini already done + same time_label → saved (keep Gemini)
+ *  - Today + different time_label (or content) → changed (fresh Perplexity;
+ *    Gemini tag cleared until re-run)
  */
 function classifyEventsAgainstSaved(events, existingDates) {
   const saved = existingDates && typeof existingDates === 'object' ? existingDates : {}
@@ -1545,23 +2244,60 @@ function classifyEventsAgainstSaved(events, existingDates) {
 
   const keepStored = (raw, row, previous, extra = {}) => {
     savedCount += 1
+    const hadGemini = hasStoredGeminiReason(previous)
+    // Metrics: fill holes from scrape, but never drop stored values.
+    // Reason: if Gemini already ran, Supabase Gemini text always wins.
     return {
       ...raw,
       ...row,
-      // Prefer stored Gemini-structured summary + flags over a bare scrape re-normalize.
-      summary: previous.summary || row.summary,
-      original_summary: previous.original_summary || row.original_summary || null,
-      reasons:
-        Array.isArray(previous.reasons) && previous.reasons.length
-          ? previous.reasons
-          : row.reasons,
+      // Start from previous (DB) so scrape cannot clobber stored fields by default.
+      ...previous,
+      // Session metrics: prefer stored, fall back to fresh scrape if missing.
       time_label: previous.time_label || row.time_label || null,
       display_date: previous.display_date || row.display_date || null,
       price: previous.price || row.price || null,
-      price_change: previous.price_change || previous.momentum || row.price_change || null,
-      momentum: previous.momentum || previous.price_change || row.momentum || null,
+      price_change:
+        previous.price_change || previous.momentum || row.price_change || row.momentum || null,
+      momentum:
+        previous.momentum || previous.price_change || row.momentum || row.price_change || null,
+      direction: previous.direction || row.direction || null,
       premarket_change:
         premarketChangeFromEvent(previous) || premarketChangeFromEvent(row) || null,
+      premarket_direction:
+        previous.premarket_direction || row.premarket_direction || null,
+      premarket_reason:
+        premarketReasonFromEvent(previous) || premarketReasonFromEvent(row) || '',
+      after_hours_price:
+        afterHoursPriceFromEvent(previous) || afterHoursPriceFromEvent(row) || null,
+      after_hours_change:
+        afterHoursChangeFromEvent(previous) || afterHoursChangeFromEvent(row) || null,
+      after_hours_direction:
+        previous.after_hours_direction || row.after_hours_direction || null,
+      sources:
+        Array.isArray(previous.sources) && previous.sources.length
+          ? previous.sources
+          : Array.isArray(row.sources)
+            ? row.sources
+            : [],
+      // Reason body: Gemini (or any stored summary) wins over Perplexity re-scrape.
+      summary: hadGemini
+        ? previous.summary || row.summary || ''
+        : previous.summary || row.summary || '',
+      original_summary:
+        previous.original_summary ||
+        (!hadGemini ? previous.summary : null) ||
+        row.original_summary ||
+        null,
+      reasons:
+        Array.isArray(previous.reasons) && previous.reasons.length
+          ? previous.reasons
+          : previous.summary
+            ? [previous.summary]
+            : Array.isArray(row.reasons) && row.reasons.length
+              ? row.reasons
+              : row.summary
+                ? [row.summary]
+                : [],
       ...pickStoredGeminiFields(previous, row),
       save_status: 'saved',
       previously_saved_at: previous.saved_at || null,
@@ -1571,26 +2307,43 @@ function classifyEventsAgainstSaved(events, existingDates) {
 
   const markChanged = (raw, row, previous, reason) => {
     changedCount += 1
+    // Today only: accept fresh Perplexity narrative. Preserve first scrape text
+    // in original_summary so Gemini can re-run from the raw move reason later.
+    const priorOriginal =
+      previous.original_summary ||
+      (!hasStoredGeminiReason(previous) ? previous.summary : null) ||
+      row.original_summary ||
+      null
     return {
       ...raw,
       ...row,
-      // New crawl content for today; keep original scrape reason if Gemini already ran.
-      original_summary:
-        previous.original_summary ||
-        (!previous.gemini_formating && !previous.gemini_classified_at
-          ? previous.summary
-          : null) ||
-        row.original_summary ||
-        null,
-      ...pickStoredGeminiFields(previous, row),
-      // Fresh scrape replaces structured reason until Gemini re-runs.
-      // Only reset gemini tag when time (or content) actually moved.
+      original_summary: priorOriginal,
+      // Fresh scrape body until Gemini is re-run for this new timestamp.
+      summary: row.summary || '',
+      reasons:
+        Array.isArray(row.reasons) && row.reasons.length
+          ? row.reasons
+          : row.summary
+            ? [row.summary]
+            : [],
+      // Clear Gemini tag — content moved; needs a new Gemini pass.
       gemini_formating: false,
       gemini_classified_at: null,
+      // Keep cumulative usage meters from previous (spend history).
+      gemini_prompt_tokens: Number(previous?.gemini_prompt_tokens) || 0,
+      gemini_output_tokens: Number(previous?.gemini_output_tokens) || 0,
+      gemini_thoughts_tokens: Number(previous?.gemini_thoughts_tokens) || 0,
+      gemini_total_tokens: Number(previous?.gemini_total_tokens) || 0,
+      gemini_credits_used: Number(previous?.gemini_credits_used) || 0,
+      gemini_cost_usd: Number(previous?.gemini_cost_usd) || 0,
+      gemini_cost_usd_display:
+        previous?.gemini_cost_usd_display ||
+        formatUsdDisplay(Number(previous?.gemini_cost_usd) || 0),
       save_status: 'changed',
       previously_saved_at: previous.saved_at || null,
       change_reason: reason,
       previous_time_label: previous.time_label || null,
+      had_gemini_before: hasStoredGeminiReason(previous),
     }
   }
 
@@ -1607,15 +2360,25 @@ function classifyEventsAgainstSaved(events, existingDates) {
 
     const isToday = row.event_date === today
 
-    // Historical dates already stored: never re-auto-save noise as "updated".
+    // Past dates: Supabase is source of truth (Gemini stays Gemini forever).
     if (!isToday) {
       return keepStored(raw, row, previous, {
-        change_reason: 'older_date_left_alone',
+        change_reason: hasStoredGeminiReason(previous)
+          ? 'historical_gemini_protected'
+          : 'older_date_left_alone',
+      })
+    }
+
+    // Today + Gemini already done + same Perplexity time stamp → keep Gemini.
+    // (Re-fetch does not thrash a finished Gemini reason for the same story.)
+    const timeDiff = timeLabelsDiffer(previous.time_label, row.time_label)
+    if (timeDiff === false && hasStoredGeminiReason(previous)) {
+      return keepStored(raw, row, previous, {
+        change_reason: 'today_gemini_same_time_protected',
       })
     }
 
     // Today: time stamp is the primary signal that the story was re-written.
-    const timeDiff = timeLabelsDiffer(previous.time_label, row.time_label)
     if (timeDiff === true) {
       return markChanged(raw, row, previous, 'time_label_diff')
     }
@@ -1626,6 +2389,13 @@ function classifyEventsAgainstSaved(events, existingDates) {
     }
 
     // Missing time on one/both sides — fall back to content fingerprint.
+    // If Gemini already structured today's reason, keep it unless metrics/time
+    // clearly moved (handled above). Fingerprint alone must not wipe Gemini.
+    if (hasStoredGeminiReason(previous)) {
+      return keepStored(raw, row, previous, {
+        change_reason: 'today_gemini_fingerprint_protected',
+      })
+    }
     const prevFp =
       previous.content_fingerprint || eventContentFingerprint(previous)
     const nextFp = row.content_fingerprint || eventContentFingerprint(row)
@@ -1675,9 +2445,47 @@ function buildNotablePayload({
   }
 }
 
-async function loadTickerMeta(supabase, ticker) {
+/** Users list → device_monitored_tickers · Extreme/Pinned → pinned_monitored_tickers */
+const MONITOR_TABLE_DEVICE = 'device_monitored_tickers'
+const MONITOR_TABLE_PINNED = 'pinned_monitored_tickers'
+
+function normalizeMonitorScope(value) {
+  const scope = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+  if (
+    scope === 'pinned' ||
+    scope === 'pin' ||
+    scope === 'extreme' ||
+    scope === 'pinnedmonitored' ||
+    scope === 'pinnedmonitoredtickers'
+  ) {
+    return 'pinned'
+  }
+  return 'device'
+}
+
+function monitorTableForScope(scope) {
+  return normalizeMonitorScope(scope) === 'pinned'
+    ? MONITOR_TABLE_PINNED
+    : MONITOR_TABLE_DEVICE
+}
+
+function resolveMonitorScope(request) {
+  return normalizeMonitorScope(
+    request?.body?.monitor_scope ||
+      request?.body?.scope ||
+      request?.query?.monitor_scope ||
+      request?.query?.scope ||
+      'device',
+  )
+}
+
+async function loadTickerMeta(supabase, ticker, scope = 'device') {
+  const table = monitorTableForScope(scope)
   const { data, error } = await supabase
-    .from('device_monitored_tickers')
+    .from(table)
     .select('ticker, company_name')
     .eq('ticker', ticker)
     .limit(5)
@@ -1688,21 +2496,34 @@ async function loadTickerMeta(supabase, ticker) {
     return {
       ticker,
       company_name: named?.company_name || data[0]?.company_name || ticker,
+      monitor_scope: normalizeMonitorScope(scope),
     }
   }
 
   // Case-insensitive fallback
   const { data: soft, error: softError } = await supabase
-    .from('device_monitored_tickers')
+    .from(table)
     .select('ticker, company_name')
     .ilike('ticker', ticker)
     .limit(5)
   if (softError) throw softError
-  if (!soft?.length) return { ticker, company_name: ticker }
+  if (!soft?.length) {
+    // Pinned miss → still try device name as a display fallback (never write cross-table here).
+    if (normalizeMonitorScope(scope) === 'pinned') {
+      try {
+        const deviceMeta = await loadTickerMeta(supabase, ticker, 'device')
+        return { ...deviceMeta, monitor_scope: 'pinned' }
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ticker, company_name: ticker, monitor_scope: normalizeMonitorScope(scope) }
+  }
   const named = soft.find((row) => row.company_name && row.company_name !== row.ticker)
   return {
     ticker: soft[0]?.ticker || ticker,
     company_name: named?.company_name || soft[0]?.company_name || ticker,
+    monitor_scope: normalizeMonitorScope(scope),
   }
 }
 
@@ -1731,6 +2552,7 @@ function mergeDatesIntoMap(existingDates, eventsToWrite, nowIso) {
   const next = { ...(existingDates || {}) }
   const written = []
   const skipped = []
+  const today = todayIsoEastern()
 
   for (const event of eventsToWrite) {
     const row = normalizeEventRow(event)
@@ -1738,8 +2560,61 @@ function mergeDatesIntoMap(existingDates, eventsToWrite, nowIso) {
       skipped.push({ reason: 'invalid_date', event })
       continue
     }
+    const previous = next[row.event_date]
+    // Hard guard: never let a non-Gemini re-fetch clobber a past Gemini date
+    // (or today's Gemini if the client accidentally sent save_status=changed).
+    if (
+      previous &&
+      hasStoredGeminiReason(previous) &&
+      !hasStoredGeminiReason(row) &&
+      row.event_date !== today
+    ) {
+      skipped.push({
+        reason: 'historical_gemini_protected',
+        event_date: row.event_date,
+      })
+      continue
+    }
+    // Today: allow overwrite (fresh Perplexity / new Gemini). Past non-Gemini:
+    // still allow normal new/changed writes.
     next[row.event_date] = {
       ...row,
+      // If we are re-writing Gemini for today, keep cumulative spend meters.
+      ...(previous && hasStoredGeminiReason(previous) && hasStoredGeminiReason(row)
+        ? {
+            gemini_prompt_tokens:
+              Number(row.gemini_prompt_tokens) ||
+              Number(previous.gemini_prompt_tokens) ||
+              0,
+            gemini_output_tokens:
+              Number(row.gemini_output_tokens) ||
+              Number(previous.gemini_output_tokens) ||
+              0,
+            gemini_total_tokens:
+              Number(row.gemini_total_tokens) ||
+              Number(previous.gemini_total_tokens) ||
+              0,
+            gemini_credits_used:
+              Number(row.gemini_credits_used) ||
+              Number(previous.gemini_credits_used) ||
+              0,
+            gemini_cost_usd:
+              Number(row.gemini_cost_usd) || Number(previous.gemini_cost_usd) || 0,
+          }
+        : previous && !hasStoredGeminiReason(row)
+          ? {
+              // Preserve cumulative meters even when today's Gemini is cleared
+              // by a fresh Perplexity story (time_label moved).
+              gemini_prompt_tokens: Number(previous.gemini_prompt_tokens) || 0,
+              gemini_output_tokens: Number(previous.gemini_output_tokens) || 0,
+              gemini_total_tokens: Number(previous.gemini_total_tokens) || 0,
+              gemini_credits_used: Number(previous.gemini_credits_used) || 0,
+              gemini_cost_usd: Number(previous.gemini_cost_usd) || 0,
+              gemini_cost_usd_display:
+                previous.gemini_cost_usd_display ||
+                formatUsdDisplay(Number(previous.gemini_cost_usd) || 0),
+            }
+          : {}),
       saved_at: nowIso,
     }
     written.push(row.event_date)
@@ -1748,29 +2623,172 @@ function mergeDatesIntoMap(existingDates, eventsToWrite, nowIso) {
   return { dates: next, written, skipped }
 }
 
-async function loadTickerDates(supabase, ticker) {
+async function loadTickerDates(supabase, ticker, scope = 'device') {
+  const table = monitorTableForScope(scope)
   const { data, error } = await supabase
-    .from('device_monitored_tickers')
-    .select('ticker, notable_price_movements')
+    .from(table)
+    .select('ticker, company_name, notable_price_movements, updated_at')
     .eq('ticker', ticker)
 
   if (error) throw error
-  if (!data?.length) return { rows: [], dates: {}, found: false }
-
-  // Multiple device rows may share a ticker — merge all date maps (union).
-  const dates = {}
-  for (const row of data) {
-    Object.assign(dates, extractDatesMap(row.notable_price_movements))
+  if (!data?.length) {
+    // Case-insensitive fallback
+    const soft = await supabase
+      .from(table)
+      .select('ticker, company_name, notable_price_movements, updated_at')
+      .ilike('ticker', ticker)
+    if (soft.error) throw soft.error
+    if (!soft.data?.length) {
+      return {
+        rows: [],
+        dates: {},
+        found: false,
+        monitor_scope: normalizeMonitorScope(scope),
+        table,
+      }
+    }
+    let dates = {}
+    for (const row of soft.data) {
+      dates = mergeDateMaps(dates, extractDatesMap(row.notable_price_movements))
+    }
+    return {
+      rows: soft.data,
+      dates,
+      found: true,
+      monitor_scope: normalizeMonitorScope(scope),
+      table,
+    }
   }
-  return { rows: data, dates, found: true }
+
+  // Multiple device rows may share a ticker — merge all date maps (union),
+  // preferring richer Gemini / complete metric payloads over sparse stubs.
+  let dates = {}
+  for (const row of data) {
+    dates = mergeDateMaps(dates, extractDatesMap(row.notable_price_movements))
+  }
+  return {
+    rows: data,
+    dates,
+    found: true,
+    monitor_scope: normalizeMonitorScope(scope),
+    table,
+  }
 }
 
-async function persistTickerDates(supabase, ticker, payload) {
+/**
+ * Ensure a row exists in the target monitor table (device or pinned).
+ * Pinned Extreme scrapes call this so auto-save never fails for “not in device list”.
+ */
+async function ensureMonitorTickerRow(
+  supabase,
+  ticker,
+  { companyName = '', scope = 'device' } = {},
+) {
+  const monitorScope = normalizeMonitorScope(scope)
+  const table = monitorTableForScope(monitorScope)
+  const loaded = await loadTickerDates(supabase, ticker, monitorScope)
+  if (loaded.found) {
+    return { created: false, loaded, table, monitor_scope: monitorScope }
+  }
+
+  const nowIso = new Date().toISOString()
+  const name = String(companyName || ticker).trim() || ticker
+  const notable = buildNotablePayload({
+    ticker,
+    dates: {},
+    sourceUrl: perplexityFinanceUrl(ticker),
+    scrapedAt: null,
+    nowIso,
+    sourceProvider: 'perplexity',
+    assetClass: 'equity',
+  })
+
+  if (monitorScope === 'pinned') {
+    const row = {
+      ticker,
+      company_name: name,
+      notable_price_movements: notable,
+      pinned_at: nowIso,
+      created_at: nowIso,
+      updated_at: nowIso,
+    }
+    const { data, error } = await supabase
+      .from(table)
+      .upsert(row, { onConflict: 'ticker' })
+      .select('ticker, company_name, notable_price_movements, updated_at')
+      .limit(1)
+    if (error) throw error
+    return {
+      created: true,
+      loaded: {
+        rows: data || [row],
+        dates: {},
+        found: true,
+        monitor_scope: 'pinned',
+        table,
+      },
+      table,
+      monitor_scope: 'pinned',
+    }
+  }
+
+  // Device (Users) — same insert shapes as addTicker
+  const baseRow = {
+    ticker,
+    company_name: name,
+    subscribers: [],
+    notable_price_movements: notable,
+    updated_at: nowIso,
+  }
+  const candidates = [
+    baseRow,
+    { ...baseRow, created_at: nowIso },
+    { ...baseRow, device_id: 'dashboard' },
+    { ...baseRow, device_id: 'dashboard', created_at: nowIso },
+  ]
+  let data = null
+  let lastError = null
+  for (const insertRow of candidates) {
+    const result = await supabase
+      .from(table)
+      .insert(insertRow)
+      .select('ticker, company_name, notable_price_movements, updated_at')
+      .limit(1)
+    if (!result.error) {
+      data = result.data
+      lastError = null
+      break
+    }
+    lastError = result.error
+    if (/duplicate|unique/i.test(result.error.message || '')) {
+      lastError = null
+      data = [{ ticker, company_name: name, notable_price_movements: notable, updated_at: nowIso }]
+      break
+    }
+  }
+  if (lastError) throw lastError
+  return {
+    created: true,
+    loaded: {
+      rows: data || [],
+      dates: {},
+      found: true,
+      monitor_scope: 'device',
+      table,
+    },
+    table,
+    monitor_scope: 'device',
+  }
+}
+
+async function persistTickerDates(supabase, ticker, payload, scope = 'device') {
+  const monitorScope = normalizeMonitorScope(scope)
+  const table = monitorTableForScope(monitorScope)
   const nowIso = payload.updated_at || new Date().toISOString()
 
   // Prefer exact ticker match first.
   let { data, error } = await supabase
-    .from('device_monitored_tickers')
+    .from(table)
     .update({
       notable_price_movements: payload,
       updated_at: nowIso,
@@ -1783,7 +2801,7 @@ async function persistTickerDates(supabase, ticker, payload) {
   // Case-insensitive fallback (e.g. row stored as "aapl").
   if (!data?.length) {
     ;({ data, error } = await supabase
-      .from('device_monitored_tickers')
+      .from(table)
       .update({
         notable_price_movements: payload,
         updated_at: nowIso,
@@ -1793,10 +2811,30 @@ async function persistTickerDates(supabase, ticker, payload) {
     if (error) throw error
   }
 
+  // Pinned (and optional device ensure): create row then update once.
+  if (!data?.length) {
+    await ensureMonitorTickerRow(supabase, ticker, {
+      companyName: payload?.ticker || ticker,
+      scope: monitorScope,
+    })
+    ;({ data, error } = await supabase
+      .from(table)
+      .update({
+        notable_price_movements: payload,
+        updated_at: nowIso,
+      })
+      .eq('ticker', ticker)
+      .select('ticker, company_name, notable_price_movements, updated_at'))
+    if (error) throw error
+  }
+
   if (!data?.length) {
     throw new Error(
-      `Supabase update matched 0 rows for ticker ${ticker}. ` +
-        'Check the ticker exists in device_monitored_tickers and that the service role can UPDATE (RLS).',
+      `Supabase update matched 0 rows for ticker ${ticker} in ${table}. ` +
+        `Check the row exists and that the service role can UPDATE (RLS). ` +
+        (monitorScope === 'pinned'
+          ? 'Run supabase/schema_pinned_monitored_tickers.sql if the table is missing.'
+          : 'Check the ticker exists in device_monitored_tickers.'),
     )
   }
   return data
@@ -1825,38 +2863,304 @@ function subscriberNotificationApp(subscriber) {
     subscriber?.app ??
     subscriber?.app_id ??
     subscriber?.app_name ??
+    subscriber?.notification_app ??
+    subscriber?.client_app ??
     subscriber?.project ??
-    subscriber?.project_id
+    subscriber?.project_id ??
+    subscriber?.bundle_id ??
+    subscriber?.package_name
   // Existing subscriber records predate app tagging and belong to 9AM.
-  return explicit == null || explicit === ''
-    ? 'nineam'
-    : normalizeNotificationApp(explicit)
+  if (explicit == null || explicit === '') return 'nineam'
+  const raw = String(explicit).trim().toLowerCase()
+  // Common mobile package / slug variants for Trigger.
+  if (
+    raw.includes('trigger') ||
+    raw === 'com.newslabs.trigger' ||
+    raw.endsWith('.trigger')
+  ) {
+    return 'trigger'
+  }
+  if (
+    raw.includes('nineam') ||
+    raw.includes('9am') ||
+    raw === 'com.newslabs.nineam' ||
+    raw.endsWith('.nineam')
+  ) {
+    return 'nineam'
+  }
+  return normalizeNotificationApp(explicit)
+}
+
+/**
+ * Robust on/off for subscriber JSON (apps write mixed shapes over time).
+ * Treats false / "false" / 0 / "off" / "disabled" as stopped.
+ * Missing flag → still considered on (legacy rows).
+ */
+function isSubscriberEnabled(subscriber) {
+  if (!subscriber || typeof subscriber !== 'object') return false
+  const candidates = [
+    subscriber.enabled,
+    subscriber.notifications_enabled,
+    subscriber.notification_enabled,
+    subscriber.push_enabled,
+    subscriber.is_enabled,
+    subscriber.active,
+    subscriber.subscribed,
+  ]
+  let sawTruthy = false
+  for (const value of candidates) {
+    if (value === undefined || value === null || value === '') continue
+    if (value === false || value === 0) return false
+    if (typeof value === 'string') {
+      const s = value.trim().toLowerCase()
+      if (['false', '0', 'no', 'off', 'disabled', 'inactive', 'stopped'].includes(s)) {
+        return false
+      }
+      if (['true', '1', 'yes', 'on', 'enabled', 'active'].includes(s)) {
+        sawTruthy = true
+      }
+    } else if (value === true || value === 1) {
+      sawTruthy = true
+    }
+  }
+  // Explicit true wins when no false was seen; no flags at all → legacy on.
+  return sawTruthy || candidates.every((v) => v === undefined || v === null || v === '')
+}
+
+/**
+ * Temporary delivery allowlist — when set, Expo pushes only go to listed
+ * device_id(s) and/or Expo token(s). Empty = no filter (all eligible devices).
+ *
+ * Env (comma-separated):
+ *   PUSH_ALLOWLIST_DEVICE_IDS=ios-…
+ *   PUSH_ALLOWLIST_TOKENS=ExponentPushToken[…]
+ *
+ * When active: ALL notifications are forced to these recipients even if the
+ * ticker has zero watchlist subscribers (dev / single-tester mode).
+ */
+function getPushAllowlist() {
+  const deviceIds = String(process.env.PUSH_ALLOWLIST_DEVICE_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const tokens = String(process.env.PUSH_ALLOWLIST_TOKENS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return {
+    active: deviceIds.length > 0 || tokens.length > 0,
+    deviceIds,
+    tokens,
+    deviceIdSet: new Set(deviceIds),
+    tokenSet: new Set(tokens),
+  }
+}
+
+/**
+ * Build forced recipients from env allowlist (token required for Expo).
+ * Pairs device_id[i] with token[i], or reuses the only token/id when lengths differ.
+ * @param {string} [appKey='trigger']
+ * @returns {Array<{ device_id: string|null, expo_push_token: string, enabled: boolean, app_key: string, forced: boolean }>|null}
+ *   null when allowlist is inactive
+ */
+function forceAllowlistRecipients(appKey = 'trigger') {
+  const allow = getPushAllowlist()
+  if (!allow.active) return null
+  const selectedApp = normalizeNotificationApp(appKey)
+  const ids = allow.deviceIds
+  const tokens = allow.tokens
+  const n = Math.max(ids.length, tokens.length, 1)
+  const out = []
+  const seen = new Set()
+  for (let i = 0; i < n; i += 1) {
+    const token = String(tokens[i] || tokens[0] || '').trim()
+    const device_id = String(ids[i] || ids[0] || '').trim() || null
+    if (!token || !isExpoPushToken(token)) continue
+    if (seen.has(token)) continue
+    seen.add(token)
+    out.push({
+      device_id,
+      expo_push_token: token,
+      enabled: true,
+      app_key: selectedApp,
+      forced: true,
+    })
+  }
+  return out
+}
+
+/**
+ * Filter recipients / Expo messages to the allowlist (if configured).
+ * Matches device_id OR expo_push_token / message.to.
+ * @template T
+ * @param {T[]} list
+ * @param {(item: T) => { device_id?: string|null, expo_push_token?: string|null, to?: string|null }} pick
+ * @returns {T[]}
+ */
+function applyPushAllowlist(list, pick) {
+  const allow = getPushAllowlist()
+  if (!allow.active) return list || []
+  const filtered = (list || []).filter((item) => {
+    const { device_id, expo_push_token, to } = pick(item) || {}
+    const id = device_id != null ? String(device_id).trim() : ''
+    const token = String(expo_push_token || to || '').trim()
+    if (id && allow.deviceIdSet.has(id)) return true
+    if (token && allow.tokenSet.has(token)) return true
+    return false
+  })
+  if ((list || []).length > 0 && filtered.length === 0) {
+    console.warn(
+      '[push allowlist] blocked all recipients — none matched PUSH_ALLOWLIST_DEVICE_IDS / PUSH_ALLOWLIST_TOKENS',
+    )
+  } else if ((list || []).length !== filtered.length) {
+    console.log(
+      `[push allowlist] ${filtered.length}/${(list || []).length} recipient(s) after allowlist`,
+    )
+  }
+  return filtered
+}
+
+/** Mask Expo token for UI logs (keep start + end). */
+function maskExpoToken(token) {
+  const t = String(token || '').trim()
+  if (!t) return '—'
+  if (t.length <= 28) return t
+  return `${t.slice(0, 18)}…${t.slice(-8)}`
 }
 
 /**
  * Collect enabled subscribers with valid Expo tokens from ticker row(s).
  * Dedupes by token (same phone subscribed once even if listed twice).
+ * Only tokens with ≥1 enabled subscription for the selected app are returned
+ * (used for actual push sends).
+ *
+ * When PUSH_ALLOWLIST_* is set: returns forced allowlist recipients only
+ * (ignores empty watchlist — still delivers to the tester device).
  */
 function collectPushRecipients(rows, appKey = 'nineam') {
   const selectedApp = normalizeNotificationApp(appKey)
+  const forced = forceAllowlistRecipients(selectedApp)
+  if (forced && forced.length) {
+    console.log(
+      `[push allowlist] force-deliver to ${forced.length} device(s) (watchlist ignored)`,
+    )
+    return forced
+  }
+
   const byToken = new Map()
   for (const row of rows || []) {
     const subs = Array.isArray(row?.subscribers) ? row.subscribers : []
     for (const sub of subs) {
-      if (!sub || sub.enabled === false) continue
+      if (!sub || !isSubscriberEnabled(sub)) continue
       if (subscriberNotificationApp(sub) !== selectedApp) continue
       const token = String(sub.expo_push_token || '').trim()
       if (!isExpoPushToken(token)) continue
-      if (byToken.has(token)) continue
+      if (byToken.has(token)) {
+        // Prefer a real device_id if a later row has one.
+        const prev = byToken.get(token)
+        if (!prev.device_id && sub.device_id) {
+          prev.device_id = sub.device_id
+        }
+        continue
+      }
       byToken.set(token, {
         device_id: sub.device_id || null,
         expo_push_token: token,
-        enabled: sub.enabled !== false,
+        enabled: true,
         app_key: selectedApp,
       })
     }
   }
-  return [...byToken.values()]
+  return applyPushAllowlist([...byToken.values()], (r) => ({
+    device_id: r.device_id,
+    expo_push_token: r.expo_push_token,
+  }))
+}
+
+/**
+ * Build Audience device cards for one app: includes stopped devices so the
+ * dashboard can show Notifications off (not only the alertable subset).
+ */
+function buildAudienceDevices(rows, appKey = 'nineam') {
+  const selectedApp = normalizeNotificationApp(appKey)
+  /** @type {Map<string, any>} */
+  const byToken = new Map()
+
+  for (const row of rows || []) {
+    const ticker = normalizeTicker(row.ticker)
+    const assetClass = classifyAsset(ticker, row.company_name || '').asset_class
+    const subs = Array.isArray(row?.subscribers) ? row.subscribers : []
+    for (const sub of subs) {
+      if (!sub) continue
+      if (subscriberNotificationApp(sub) !== selectedApp) continue
+      const token = String(sub.expo_push_token || '').trim()
+      if (!isExpoPushToken(token)) continue
+
+      if (!byToken.has(token)) {
+        byToken.set(token, {
+          device_id: sub.device_id || null,
+          expo_push_token: token,
+          app_key: selectedApp,
+          enabled_tickers: new Set(),
+          disabled_tickers: new Set(),
+          crypto_tickers: new Set(),
+        })
+      }
+      const entry = byToken.get(token)
+      if (!entry.device_id && sub.device_id) entry.device_id = sub.device_id
+
+      if (!ticker) continue
+      if (isSubscriberEnabled(sub)) {
+        entry.enabled_tickers.add(ticker)
+        entry.disabled_tickers.delete(ticker)
+        if (assetClass === 'crypto') entry.crypto_tickers.add(ticker)
+      } else {
+        // Only mark stopped if they are not also enabled on this ticker.
+        if (!entry.enabled_tickers.has(ticker)) {
+          entry.disabled_tickers.add(ticker)
+        }
+      }
+    }
+  }
+
+  const devices = [...byToken.values()].map((entry) => {
+    const enabledTickers = [...entry.enabled_tickers].sort()
+    const disabledTickers = [...entry.disabled_tickers]
+      .filter((t) => !entry.enabled_tickers.has(t))
+      .sort()
+    const cryptoTickers = [...entry.crypto_tickers].sort()
+    const notificationsOn = enabledTickers.length > 0
+    let subscription_status = 'off'
+    if (notificationsOn && disabledTickers.length > 0) subscription_status = 'partial'
+    else if (notificationsOn) subscription_status = 'on'
+    return {
+      device_id: entry.device_id,
+      expo_push_token: entry.expo_push_token,
+      app_key: selectedApp,
+      enabled: notificationsOn,
+      subscription_status,
+      // Back-compat: tickers = currently enabled stock/crypto symbols.
+      tickers: enabledTickers,
+      enabled_tickers: enabledTickers,
+      disabled_tickers: disabledTickers,
+      crypto_tickers: cryptoTickers,
+      pro_crypto: cryptoTickers.length > 0,
+      enabled_count: enabledTickers.length,
+      disabled_count: disabledTickers.length,
+    }
+  })
+
+  // Alertable first, then partial, then fully stopped; stable by device_id.
+  const rank = { on: 0, partial: 1, off: 2 }
+  devices.sort((a, b) => {
+    const dr = (rank[a.subscription_status] ?? 9) - (rank[b.subscription_status] ?? 9)
+    if (dr !== 0) return dr
+    return String(a.device_id || a.expo_push_token).localeCompare(
+      String(b.device_id || b.expo_push_token),
+    )
+  })
+
+  return devices
 }
 
 function latestMovementEvent(notable) {
@@ -1907,6 +3211,37 @@ function extractLikelyDriver(text) {
       .split(/\n/)[0]
       .replace(/\s+/g, ' ')
       .trim()
+  }
+
+  return ''
+}
+
+/**
+ * First headline line of a Gemini structured reason — everything before
+ * "Likely driver:" (typically: "[ASSET] [PRICE MOVE] [TIME PERIOD PHRASE]").
+ * Falls back to the first non-empty free-text line when labels are missing.
+ */
+function extractGeminiHeadline(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+
+  const likelyIdx = raw.search(/likely\s*driver\s*:/i)
+  const before = likelyIdx > 0 ? raw.slice(0, likelyIdx).trim() : ''
+  if (before) {
+    const firstLine = before
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean)
+    if (firstLine) return firstLine.replace(/\s+/g, ' ').trim()
+  }
+
+  // Unstructured / pre-Gemini scrape: first short non-empty line.
+  const firstLine = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !/^likely\s*driver\s*:/i.test(line))
+  if (firstLine && firstLine.length > 0 && firstLine.length <= 160) {
+    return firstLine.replace(/\s+/g, ' ').trim()
   }
 
   return ''
@@ -1970,7 +3305,8 @@ function reasonTextOnly(event) {
 
 /**
  * Push copy for a notable move:
- *   title (line 1):  "AAPL +1.2% · Pre-market +0.8% · Notable move"
+ *   title (line 1):  "🔴 SNDK fell 4.2% so far in regular trading"
+ *                    (Gemini first headline line + direction icon)
  *   body  (line 2):  Gemini "Likely driver" only (or legacy cleaned reason)
  */
 function buildAlertMessage({
@@ -1989,9 +3325,17 @@ function buildAlertMessage({
   const formattedAfterHoursChange = formatMomentumForTitle(afterHoursChange)
   // Prefer Likely driver from Gemini response for the user-facing push body.
   const reason = reasonTextOnly(event)
+  // Prefer Gemini first headline line for the push title (before "Likely driver:").
+  const reasonsJoined = Array.isArray(event?.reasons)
+    ? event.reasons.map((r) => String(r || '').trim()).filter(Boolean).join('\n')
+    : ''
+  const geminiHeadline =
+    extractGeminiHeadline(event?.summary) ||
+    extractGeminiHeadline(reasonsJoined) ||
+    extractGeminiHeadline(premarketReasonFromEvent(event))
 
   const sym = String(ticker || '').trim().toUpperCase() || 'TICKER'
-  const company = companyName || sym
+  const company = String(companyName || sym).trim() || sym
   const notificationApp = normalizeNotificationApp(appKey)
   const deepLinkScheme = notificationApp === 'trigger' ? 'trigger' : 'nineam'
   const eventDate = event?.event_date || null
@@ -2024,17 +3368,29 @@ function buildAlertMessage({
   if (eventDate) deepLinkParams.set('event_date', eventDate)
   const deepLink = `${deepLinkScheme}://ticker/${encodeURIComponent(sym)}?${deepLinkParams.toString()}`
 
-  // Line 1 — symbol + close momentum + pre-market / after-hours when present.
-  const title =
-    (titleOverride && String(titleOverride).trim()) ||
-    [
-      change ? `${sym} ${change}` : sym,
-      formattedPremarketChange ? `Pre-market ${formattedPremarketChange}` : '',
-      formattedAfterHoursChange ? `After hours ${formattedAfterHoursChange}` : '',
-      'Notable move',
-    ]
-      .filter(Boolean)
-      .join(' · ')
+  // Direction icon from the latest session move (premarket → after hours → regular).
+  // Negative % → red, positive % → green. No hardcoded "Market close" session tag.
+  const titleMovement = formattedPremarketChange || formattedAfterHoursChange || change
+  const directionEmoji = titleMovement
+    ? /^[\s]*[-−]/.test(titleMovement)
+      ? '🔴'
+      : /^[\s]*\+/.test(titleMovement)
+        ? '🟢'
+        : '🟠'
+    : '🟠'
+
+  // Line 1 — direction icon + Gemini first-line headline.
+  // Fallback when Gemini hasn't classified yet: company + percentage only.
+  let title = titleOverride && String(titleOverride).trim()
+  if (!title) {
+    if (geminiHeadline) {
+      title = `${directionEmoji} ${geminiHeadline}`
+    } else {
+      title = `${directionEmoji} ${company}${titleMovement ? ` ${titleMovement}` : ''}`.trim()
+    }
+    // Keep lock-screen titles compact (dashboard input maxLength is 120).
+    if (title.length > 120) title = `${title.slice(0, 117)}…`
+  }
 
   // Line 2 — reason text only (never date / price / momentum)
   let body = bodyOverride && String(bodyOverride).trim()
@@ -2222,8 +3578,34 @@ async function sendExpoPushMessages(messages) {
   const errors = []
   const expoAccessToken = String(process.env.EXPO_ACCESS_TOKEN || '').trim()
 
-  for (let i = 0; i < messages.length; i += EXPO_PUSH_BATCH) {
-    const batch = messages.slice(i, i + EXPO_PUSH_BATCH)
+  // Hard gate: even if a caller builds messages without collectPushRecipients,
+  // never send outside the allowlist when configured.
+  const outbound = applyPushAllowlist(messages || [], (m) => ({
+    device_id: m?._device_id,
+    expo_push_token: m?.to,
+    to: m?.to,
+  }))
+  if ((messages || []).length > 0 && outbound.length === 0) {
+    return {
+      tickets: [],
+      errors: [
+        {
+          batch_start: 0,
+          failed_count: 0,
+          device_ids: [],
+          status: 0,
+          error:
+            'Push allowlist active — no messages matched PUSH_ALLOWLIST_DEVICE_IDS / PUSH_ALLOWLIST_TOKENS',
+        },
+      ],
+      ok: 0,
+      failed: 0,
+      allowlist_blocked: true,
+    }
+  }
+
+  for (let i = 0; i < outbound.length; i += EXPO_PUSH_BATCH) {
+    const batch = outbound.slice(i, i + EXPO_PUSH_BATCH)
     // Never send internal bookkeeping fields to Expo.
     const payload = batch.map(({ _device_id, ...msg }) => {
       void _device_id
@@ -2277,6 +3659,312 @@ async function sendExpoPushMessages(messages) {
     tickets.filter((t) => t.status !== 'ok').length +
     errors.reduce((total, error) => total + (error.failed_count || 1), 0)
   return { tickets, errors, ok, failed }
+}
+
+/**
+ * Same Expo push transport used by Trigger alert / news / digest handlers.
+ * Exported so the momentum episode engine can reuse the exact path.
+ * @param {Array<Record<string, unknown>>} messages
+ */
+export async function sendExpoPush(messages) {
+  return sendExpoPushMessages(messages)
+}
+
+/**
+ * Enabled Expo recipients for one ticker from device_monitored_tickers.subscribers.
+ * This is the mobile in-app watchlist (synced to Supabase) — source of truth for delivery.
+ * Only devices with that exact ticker + app + valid Expo token + notifications on.
+ *
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @param {string} ticker
+ * @param {string} [appKey='trigger']
+ * @returns {Promise<Array<{ device_id: string|null, expo_push_token: string, enabled: boolean, app_key: string }>>}
+ */
+export async function loadExpoRecipientsForTicker(supabase, ticker, appKey = 'trigger') {
+  const symbol = normalizeTicker(ticker)
+  if (!symbol || !supabase) return []
+
+  let { data: rows, error } = await supabase
+    .from('device_monitored_tickers')
+    .select('ticker, company_name, subscribers')
+    .eq('ticker', symbol)
+
+  if (error) throw error
+  if (!rows?.length) {
+    ;({ data: rows, error } = await supabase
+      .from('device_monitored_tickers')
+      .select('ticker, company_name, subscribers')
+      .ilike('ticker', symbol))
+    if (error) throw error
+  }
+
+  // Exact ticker match after normalize (ilike can over-match)
+  const matched = (rows || []).filter((row) => normalizeTicker(row.ticker) === symbol)
+  return collectPushRecipients(matched, appKey)
+}
+
+/**
+ * Build Expo `data` bag for a Trigger episode alert (string values only — Android bridge).
+ * Same deep-link style as notable-move alerts so the Trigger app can open the ticker.
+ */
+export function buildTriggerEpisodePushData({
+  ticker,
+  title,
+  body,
+  eventType,
+  direction,
+  movePercent,
+  price,
+  episodeId,
+  detectedWindow,
+  reason,
+  marketSession,
+  appKey = 'trigger',
+}) {
+  const sym = normalizeTicker(ticker) || String(ticker || '').toUpperCase()
+  const notificationApp = normalizeNotificationApp(appKey)
+  const deepLinkScheme = notificationApp === 'trigger' ? 'trigger' : 'nineam'
+  const kind = 'episode_alert'
+  const notificationType =
+    notificationApp === 'trigger'
+      ? `trigger_episode_${String(eventType || 'alert')
+          .toLowerCase()
+          .replace(/^momentum_/, '')}`
+      : `nineam_episode_${String(eventType || 'alert').toLowerCase()}`
+  const deepLinkParams = new URLSearchParams({
+    kind,
+    notification_type: notificationType,
+    event_type: String(eventType || ''),
+  })
+  if (episodeId) deepLinkParams.set('episode_id', String(episodeId))
+  const deepLink = `${deepLinkScheme}://ticker/${encodeURIComponent(sym)}?${deepLinkParams.toString()}`
+  const str = (v) => (v == null || v === '' ? '' : String(v))
+
+  return {
+    type: 'episode_alert',
+    notification_type: notificationType,
+    movement_type: 'episode',
+    kind,
+    screen: 'notable_move',
+    path: `/ticker/${encodeURIComponent(sym)}`,
+    app_key: notificationApp,
+    deep_link: deepLink,
+    url: deepLink,
+    app_url: deepLink,
+    ticker: sym,
+    company_name: sym,
+    event_type: str(eventType),
+    direction: str(direction),
+    move_percent: str(movePercent),
+    price: str(price),
+    episode_id: str(episodeId),
+    detected_window: str(detectedWindow),
+    reason: str(reason),
+    market_session: str(marketSession),
+    notification_title: str(title),
+    notification_body: str(body),
+  }
+}
+
+/**
+ * Send a Trigger episode push via the same Expo pipeline as `/api/notifications/alert/:ticker`.
+ * Eligibility: device must currently have `ticker` in its in-app watchlist
+ * (device_monitored_tickers.subscribers) for the Trigger app with push enabled.
+ *
+ * @param {{
+ *   supabase: import('@supabase/supabase-js').SupabaseClient|null,
+ *   ticker: string,
+ *   title: string,
+ *   body: string,
+ *   eventType?: string,
+ *   direction?: string,
+ *   movePercent?: number|null,
+ *   price?: number|null,
+ *   episodeId?: string|null,
+ *   detectedWindow?: string|null,
+ *   reason?: string|null,
+ *   marketSession?: string|null,
+ *   appKey?: string,
+ *   dryRun?: boolean,
+ * }} opts
+ */
+export async function sendTriggerEpisodePush(opts = {}) {
+  const {
+    supabase,
+    ticker,
+    title,
+    body,
+    eventType = 'MOMENTUM_STARTED',
+    direction = '',
+    movePercent = null,
+    price = null,
+    episodeId = null,
+    detectedWindow = null,
+    reason = null,
+    marketSession = null,
+    appKey = 'trigger',
+    dryRun = false,
+  } = opts
+
+  const sym = normalizeTicker(ticker)
+  // Final safety: never ship em/en dashes in push copy
+  const titleText = formatDashesToCommas(String(title || '').trim())
+  const bodyText = formatDashesToCommas(String(body || '').trim())
+  if (!sym || !titleText) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'ticker and title required',
+      recipient_count: 0,
+      sent_ok: 0,
+      sent_failed: 0,
+      tickets: [],
+      errors: [],
+      device_ids: [],
+    }
+  }
+
+  if (!supabase) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'supabase not configured',
+      recipient_count: 0,
+      sent_ok: 0,
+      sent_failed: 0,
+      tickets: [],
+      errors: [],
+      device_ids: [],
+    }
+  }
+
+  // Allowlist mode: always deliver to forced tester device(s), even if
+  // zero devices are watching this ticker on the watchlist.
+  const forced = forceAllowlistRecipients(appKey)
+  let recipients = []
+  let forcedAllowlist = false
+  if (forced && forced.length) {
+    recipients = forced
+    forcedAllowlist = true
+  } else {
+    try {
+      recipients = await loadExpoRecipientsForTicker(supabase, sym, appKey)
+    } catch (err) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: err instanceof Error ? err.message : String(err),
+        recipient_count: 0,
+        sent_ok: 0,
+        sent_failed: 0,
+        tickets: [],
+        errors: [{ error: err instanceof Error ? err.message : String(err) }],
+        device_ids: [],
+        recipients: [],
+      }
+    }
+  }
+
+  if (!recipients.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: `No enabled ${normalizeNotificationApp(appKey) === 'trigger' ? 'Trigger' : '9AM'} devices with Expo tokens watching ${sym}`,
+      recipient_count: 0,
+      sent_ok: 0,
+      sent_failed: 0,
+      tickets: [],
+      errors: [],
+      device_ids: [],
+      recipients: [],
+    }
+  }
+
+  const pushData = buildTriggerEpisodePushData({
+    ticker: sym,
+    title: titleText,
+    body: bodyText || titleText,
+    eventType,
+    direction,
+    movePercent,
+    price,
+    episodeId,
+    detectedWindow,
+    reason,
+    marketSession,
+    appKey,
+  })
+
+  const messages = recipients.map((r) => ({
+    to: r.expo_push_token,
+    sound: 'default',
+    title: titleText,
+    body: bodyText || titleText,
+    data: pushData,
+    priority: 'high',
+    _device_id: r.device_id,
+  }))
+
+  const recipientSummaries = recipients.map((r) => ({
+    device_id: r.device_id || null,
+    expo_push_token: r.expo_push_token,
+    expo_push_token_masked: maskExpoToken(r.expo_push_token),
+    forced: Boolean(r.forced || forcedAllowlist),
+  }))
+
+  if (dryRun) {
+    return {
+      ok: true,
+      dry_run: true,
+      recipient_count: recipients.length,
+      sent_ok: 0,
+      sent_failed: 0,
+      tickets: [],
+      errors: [],
+      device_ids: recipients.map((r) => r.device_id).filter(Boolean),
+      recipients: recipientSummaries,
+      forced_allowlist: forcedAllowlist,
+      sample: messages[0]
+        ? { title: messages[0].title, body: messages[0].body, data: messages[0].data }
+        : null,
+    }
+  }
+
+  const pushResult = await sendExpoPushMessages(messages)
+  // Merge ticket status onto recipient rows for UI
+  const ticketByDevice = new Map()
+  const ticketByToken = new Map()
+  for (const t of pushResult.tickets || []) {
+    if (t.device_id) ticketByDevice.set(String(t.device_id), t)
+    if (t.to) ticketByToken.set(String(t.to), t)
+  }
+  const recipientsWithStatus = recipientSummaries.map((r) => {
+    const ticket =
+      (r.device_id && ticketByDevice.get(String(r.device_id))) ||
+      ticketByToken.get(String(r.expo_push_token)) ||
+      null
+    return {
+      ...r,
+      status: ticket?.status || (pushResult.allowlist_blocked ? 'blocked' : 'unknown'),
+      ticket_id: ticket?.id || null,
+      error: ticket?.status && ticket.status !== 'ok' ? ticket.message || null : null,
+    }
+  })
+
+  return {
+    ok: pushResult.failed === 0 && pushResult.errors.length === 0,
+    skipped: false,
+    recipient_count: recipients.length,
+    sent_ok: pushResult.ok,
+    sent_failed: pushResult.failed,
+    tickets: pushResult.tickets,
+    errors: pushResult.errors,
+    device_ids: recipients.map((r) => r.device_id).filter(Boolean),
+    recipients: recipientsWithStatus,
+    forced_allowlist: forcedAllowlist,
+    deep_link: pushData.deep_link,
+    notification_type: pushData.notification_type,
+  }
 }
 
 function expoFailureSummary(pushResult) {
@@ -2367,13 +4055,14 @@ export function parseNotablePriceMovements(
         continue
       }
 
-      // "$1,288.03" — first = close, second = after hours when not already set.
+      // "$1,288.03" — first = close, second distinct price = after hours.
+      // If sessionQuotes already set close, don't re-tag the same $ line as AH.
       if (/^\$[\d,]+(?:\.\d+)?$/.test(line)) {
         if (!price) {
           price = line
           continue
         }
-        if (!afterHoursPrice && price) {
+        if (!afterHoursPrice && line !== price) {
           afterHoursPrice = line
           continue
         }
@@ -2433,11 +4122,15 @@ export function parseNotablePriceMovements(
         if (inlineChange && !premarketChange) {
           premarketChange = inlineChange[0].replace(/^−/, '-')
           awaitingPremarketChange = false
+          // Keep only the narrative remainder — never the move % itself.
           const narrative = line
             .replace(inlineChange[0], '')
             .replace(/\bpre[\s-]?market\b\s*(?:movement|change)?/i, '')
             .replace(/^[\s:·–—-]+|[\s:·–—-]+$/g, '')
-          if (narrative) bodyLines.push(line)
+            .trim()
+          if (narrative && !isSessionMetricOnlyLine(narrative)) {
+            bodyLines.push(narrative)
+          }
           continue
         }
         if (labelOnly) {
@@ -2454,22 +4147,26 @@ export function parseNotablePriceMovements(
         awaitingPremarketChange = false
         continue
       }
-      // Bare percent — only if we still lack close change and it is not a session line.
-      if (
-        /^[+\-−]?\d+(?:\.\d+)?%$/.test(line) &&
-        !priceChange &&
-        !/\b(at\s*close|after|pre)/i.test(line)
-      ) {
-        priceChange = line.replace(/^−/, '-')
+      // Bare percent line = session metric only. Capture as close % if missing,
+      // but never put it into the reason body (UI already shows price_change).
+      if (/^[+\-−]?\d+(?:\.\d+)?%\s*$/.test(line)) {
+        if (!priceChange) priceChange = line.replace(/^−/, '-')
         continue
       }
       if (/^\d+\s+sources?$/i.test(line)) continue
       if (/^!\[/.test(line)) continue
       if (/^View more$/i.test(line)) continue
-      // Skip pure session-quote lines from narrative body (not sentences that mention them).
+      // Skip pure session-quote / metric lines from narrative body.
+      if (isSessionMetricOnlyLine(line)) continue
+      // Source chrome belongs in `sources[]`, never in the reason narrative.
+      if (/^https?:\/\//i.test(line)) continue
+      if (/^\[[^\]]*\]\(https?:\/\//i.test(line)) continue
+      if (/domain=[a-z0-9.-]+\.[a-z]{2,}/i.test(line)) continue
+      if (/google\.com\/s2\/favicons/i.test(line)) continue
+      // Bare publisher chip like "Bloomberg" / "Reuters" with no sentence structure
+      if (/^[A-Za-z0-9][A-Za-z0-9.-]{1,40}\.[a-z]{2,}$/i.test(line)) continue
       if (
-        /^[+\-−]?\d+(?:\.\d+)?%\s*(?:at\s*close|after[\s-]?hours?)\s*$/i.test(line) ||
-        /^(?:at\s*close|after[\s-]?hours?)(?:\s+(?:movement|change|trading))?\s*[:·–—-]?\s*$/i.test(
+        /^(Bloomberg|Reuters|CNBC|WSJ|Wall Street Journal|Financial Times|FT|Barron'?s|MarketWatch|Yahoo Finance|Seeking Alpha|The Verge|TechCrunch|Benzinga|Investor'?s Business Daily|AP|Associated Press|Dow Jones)\s*$/i.test(
           line,
         )
       ) {
@@ -2478,24 +4175,36 @@ export function parseNotablePriceMovements(
       bodyLines.push(line)
     }
 
-    const summary = bodyLines.join(' ').replace(/\s+/g, ' ').trim()
     const sources = extractSources(trimmed)
+    // Reason = narrative only. Strip residual move % + any source leakage.
+    let summary = stripRedundantMovePercentFromReason(
+      bodyLines.join(' ').replace(/\s+/g, ' ').trim(),
+      {
+        priceChange,
+        premarketChange,
+        afterHoursChange,
+      },
+    )
+    summary = stripSourceLeakageFromReason(summary, sources)
     const claimedMatch = trimmed.match(/(\d+)\s+sources?/i)
     const claimedSourceCount = claimedMatch ? Number(claimedMatch[1]) : null
     const visualDirections = directionsByDate[eventDate] || {}
+    // Close may infer sign from the day's narrative when HTML arrows are missing.
     const signedChange = normalizeSignedChange(
       priceChange,
       summary,
       visualDirections.regular,
     )
+    // Pre-market / after-hours: only visual arrow or explicit +/-.
+    // Do NOT reuse the close "fell/rose" sentence — that corrupts AH/PM signs.
     const signedPremarketChange = normalizeSignedChange(
       premarketChange,
-      summary,
+      null,
       visualDirections.premarket,
     )
     const signedAfterHoursChange = normalizeSignedChange(
       afterHoursChange,
-      summary,
+      null,
       visualDirections.after_hours,
     )
 
@@ -2667,6 +4376,132 @@ export async function scrapePerplexityNotableMovements(ticker) {
   }
 }
 
+/**
+ * Map asset class → Supabase table for Perplexity momentum research saves.
+ * Five isolated tables (stocks / commodities / forex / crypto / indexes).
+ */
+export function momentumResearchTableForAssetClass(assetClass) {
+  const cls = String(assetClass || 'equity')
+    .trim()
+    .toLowerCase()
+  if (cls === 'commodity') return 'momentum_research_commodities'
+  if (cls === 'forex' || cls === 'fx' || cls === 'currency') {
+    return 'momentum_research_forex'
+  }
+  if (cls === 'crypto' || cls === 'cryptocurrency') {
+    return 'momentum_research_crypto'
+  }
+  if (cls === 'index' || cls === 'indices' || cls === 'etf') {
+    return 'momentum_research_indexes'
+  }
+  // equity / stock / default
+  return 'momentum_research_monitored_stocks'
+}
+
+function extractSecondaryDriverFromReason(reason) {
+  const text = String(reason || '')
+  const m = text.match(
+    /^secondary\s*driver\s*:\s*(.+?)(?=\n\s*(?:move\s*classification|confidence)\s*:|\n\s*$)/ims,
+  )
+  if (!m) return null
+  return m[1].replace(/\s+/g, ' ').trim() || null
+}
+
+/**
+ * Persist a successful Perplexity momentum research run to the asset-class table.
+ */
+export async function saveMomentumResearchRow(supabase, payload = {}) {
+  if (!supabase) {
+    return { ok: false, error: 'Supabase not configured' }
+  }
+  const assetClass = String(payload.asset_class || 'equity').toLowerCase()
+  const table = momentumResearchTableForAssetClass(assetClass)
+  const movePercent = Number(payload.move_percent)
+  const costUsd = Number(
+    payload.cost?.total_cost ??
+      payload.cost_usd ??
+      String(payload.cost_usd_display || '')
+        .replace(/[^0-9.eE+-]/g, ''),
+  )
+  const row = {
+    ticker: String(payload.ticker || '').toUpperCase(),
+    company_name: payload.company_name || null,
+    asset_class: assetClass,
+    event_date: payload.event_date || todayIsoEastern(),
+    window_key: payload.window_key || null,
+    window_label: payload.window_label || null,
+    exact_label: payload.exact_label || null,
+    exact_minutes: Number.isFinite(Number(payload.exact_minutes))
+      ? Number(payload.exact_minutes)
+      : null,
+    move_percent: Number.isFinite(movePercent) ? movePercent : null,
+    user_movement: payload.user_movement || null,
+    market_session: payload.market_session || null,
+    live_price:
+      payload.live_price != null && Number.isFinite(Number(payload.live_price))
+        ? Number(payload.live_price)
+        : null,
+    reference_price:
+      payload.reference_price != null &&
+      Number.isFinite(Number(payload.reference_price))
+        ? Number(payload.reference_price)
+        : null,
+    reference_time: payload.reference_time || null,
+    headline: payload.headline || null,
+    likely_driver: payload.likely_driver || null,
+    secondary_driver:
+      payload.secondary_driver ||
+      extractSecondaryDriverFromReason(payload.reason) ||
+      null,
+    reason: String(payload.reason || '').trim() || '(empty)',
+    push_title: payload.push_title || null,
+    push_body: payload.push_body || null,
+    model: payload.model || null,
+    model_version: payload.model_version || null,
+    request_id: payload.request_id || null,
+    provider: payload.provider || 'perplexity',
+    citations: Array.isArray(payload.citations) ? payload.citations : [],
+    search_results: Array.isArray(payload.search_results)
+      ? payload.search_results
+      : [],
+    tools: Array.isArray(payload.tools) ? payload.tools : [],
+    tokens: payload.tokens || null,
+    cost: payload.cost || null,
+    cost_usd: Number.isFinite(costUsd) ? costUsd : null,
+    cost_usd_display: payload.cost_usd_display || null,
+    prompt: payload.prompt || null,
+    input_facts: payload.input_facts || null,
+    process_steps: Array.isArray(payload.process_steps)
+      ? payload.process_steps
+      : null,
+  }
+
+  if (!row.ticker) {
+    return { ok: false, error: 'ticker required to save research', table }
+  }
+
+  const { data, error } = await supabase
+    .from(table)
+    .insert(row)
+    .select('id, created_at')
+    .maybeSingle()
+
+  if (error) {
+    return {
+      ok: false,
+      error: error.message || String(error),
+      table,
+      code: error.code || null,
+    }
+  }
+  return {
+    ok: true,
+    table,
+    id: data?.id || null,
+    created_at: data?.created_at || null,
+  }
+}
+
 export function createNotificationsRouter({ getSupabase }) {
   // Express 5-compatible router factory without depending on express import order.
   // Use a const object so marketCloseJob can call sibling handlers (scrape, gemini, digest).
@@ -2713,7 +4548,9 @@ export function createNotificationsRouter({ getSupabase }) {
             })
             continue
           }
-          Object.assign(existing.dates, dates)
+          // Prefer richer date payloads (Gemini / complete metrics) — do not
+          // let a sparse device row clobber a full timeline event.
+          existing.dates = mergeDateMaps(existing.dates, dates)
           if (row.company_name && existing.company_name === ticker) {
             existing.company_name = row.company_name
           }
@@ -2732,6 +4569,12 @@ export function createNotificationsRouter({ getSupabase }) {
             }
           }
         }
+
+        // Users list = only tickers that have ≥1 enabled device for this app.
+        // Zero-subscriber / dashboard-only / Extreme-pinned rows must not appear here.
+        const includeZero = ['1', 'true', 'yes'].includes(
+          String(request.query?.include_zero || '').toLowerCase(),
+        )
 
         const tickers = [...byTicker.values()]
           .map((item) => {
@@ -2774,6 +4617,7 @@ export function createNotificationsRouter({ getSupabase }) {
                   : perplexityFinanceUrl(item.ticker),
             }
           })
+          .filter((item) => includeZero || (item.subscriber_count ?? 0) > 0)
           .sort((a, b) => a.ticker.localeCompare(b.ticker))
 
         const gemini_totals = sumGeminiUsageFromDates(
@@ -2914,9 +4758,11 @@ export function createNotificationsRouter({ getSupabase }) {
           autoSaveRaw === undefined || autoSaveRaw === null || autoSaveRaw === ''
             ? true
             : !['0', 'false', 'no'].includes(String(autoSaveRaw).toLowerCase())
+        const monitorScope = resolveMonitorScope(request)
+        const monitorTable = monitorTableForScope(monitorScope)
 
         const supabase = getSupabase()
-        const meta = await loadTickerMeta(supabase, ticker)
+        const meta = await loadTickerMeta(supabase, ticker, monitorScope)
         const companyName =
           (request.body?.company_name && String(request.body.company_name).trim()) ||
           meta.company_name ||
@@ -2938,10 +4784,37 @@ export function createNotificationsRouter({ getSupabase }) {
             reason: route.reason,
             company_name: companyName,
             source_url: result.url,
+            monitor_scope: monitorScope,
+            monitor_table: monitorTable,
           },
         })
 
-        const loaded = await loadTickerDates(supabase, ticker)
+        // Extreme/Pinned: only write to pinned_monitored_tickers when the row already
+        // exists (user clicked Pin) or the client explicitly asks to create.
+        // Never create a Users/device_monitored_tickers row from this path.
+        // Never auto-pin just because Extreme scrape ran.
+        let loaded = await loadTickerDates(supabase, ticker, monitorScope)
+        const createPinnedIfMissing =
+          monitorScope === 'pinned' &&
+          (request.body?.create_if_missing === true ||
+            request.body?.create_if_missing === 1 ||
+            request.body?.create_if_missing === '1' ||
+            request.query?.create_if_missing === '1' ||
+            request.query?.create_if_missing === 'true')
+        if (!loaded.found && createPinnedIfMissing) {
+          const ensured = await ensureMonitorTickerRow(supabase, ticker, {
+            companyName,
+            scope: 'pinned',
+          })
+          loaded = ensured.loaded
+          result.logs.push({
+            at: new Date().toISOString(),
+            level: 'info',
+            message: `Created ${ticker} in ${monitorTable} (Pinned store only · not Users)`,
+            detail: { created: ensured.created, monitor_scope: 'pinned' },
+          })
+        }
+
         const classified = classifyEventsAgainstSaved(result.events, loaded.dates)
 
         result.logs.push({
@@ -2958,6 +4831,8 @@ export function createNotificationsRouter({ getSupabase }) {
             today_et: classified.summary.today_et,
             scrape_source: result.scrape_source || route.scrape_source,
             asset_class: result.asset_class || route.asset_class,
+            monitor_scope: monitorScope,
+            monitor_table: monitorTable,
             change_reasons: classified.events
               .filter((e) => e.save_status === 'changed' || e.change_reason)
               .map((e) => ({
@@ -2979,7 +4854,8 @@ export function createNotificationsRouter({ getSupabase }) {
               mode: 'new_and_changed_dates',
               inserted: 0,
               updated: 0,
-              message: `Auto-save skipped — ${ticker} not found in device_monitored_tickers`,
+              message: `Auto-save skipped — ${ticker} not found in ${monitorTable}`,
+              monitor_scope: monitorScope,
             }
             result.logs.push({
               at: new Date().toISOString(),
@@ -3013,7 +4889,12 @@ export function createNotificationsRouter({ getSupabase }) {
                 sourceProvider: result.source_provider || route.scrape_source,
                 assetClass: result.asset_class || route.asset_class,
               })
-              const rows = await persistTickerDates(supabase, ticker, payload)
+              const rows = await persistTickerDates(
+                supabase,
+                ticker,
+                payload,
+                monitorScope,
+              )
               autoSaveResult = {
                 ok: true,
                 mode: 'new_and_changed_dates',
@@ -3023,9 +4904,11 @@ export function createNotificationsRouter({ getSupabase }) {
                 updated_dates: updatedDates,
                 unchanged: classified.summary.already_saved,
                 total_saved_events: Object.keys(dates).length,
+                monitor_scope: monitorScope,
+                monitor_table: monitorTable,
                 message:
                   written.length > 0
-                    ? `Auto-saved ${insertedDates.length} new and ${updatedDates.length} updated date(s) to Supabase.`
+                    ? `Auto-saved ${insertedDates.length} new and ${updatedDates.length} updated date(s) to ${monitorTable}.`
                     : 'No new or changed dates to auto-save.',
                 rows_updated: rows.length,
               }
@@ -3039,6 +4922,8 @@ export function createNotificationsRouter({ getSupabase }) {
                   total_saved_events: autoSaveResult.total_saved_events,
                   rows_updated: rows.length,
                   structure: 'notable_price_movements.dates[YYYY-MM-DD]',
+                  monitor_scope: monitorScope,
+                  monitor_table: monitorTable,
                 },
               })
 
@@ -3056,6 +4941,7 @@ export function createNotificationsRouter({ getSupabase }) {
                 inserted: 0,
                 updated: 0,
                 message,
+                monitor_scope: monitorScope,
               }
               result.logs.push({
                 at: new Date().toISOString(),
@@ -3105,6 +4991,8 @@ export function createNotificationsRouter({ getSupabase }) {
           events: classified.events,
           compare: classified.summary,
           auto_save: autoSaveResult,
+          monitor_scope: monitorScope,
+          monitor_table: monitorTable,
         })
       } catch (error) {
         response.status(error.status && error.status < 500 ? error.status : 500).json({
@@ -3120,6 +5008,8 @@ export function createNotificationsRouter({ getSupabase }) {
         const events = Array.isArray(request.body?.events) ? request.body.events : []
         // Default: only new + content-changed. Pass only_new=true to skip updates.
         const onlyNew = Boolean(request.body?.only_new)
+        const monitorScope = resolveMonitorScope(request)
+        const monitorTable = monitorTableForScope(monitorScope)
         if (!ticker) {
           response.status(400).json({ error: 'Ticker is required' })
           return
@@ -3130,12 +5020,30 @@ export function createNotificationsRouter({ getSupabase }) {
         }
 
         const supabase = getSupabase()
-        const loaded = await loadTickerDates(supabase, ticker)
+        let loaded = await loadTickerDates(supabase, ticker, monitorScope)
         if (!loaded.found) {
-          response.status(404).json({
-            error: `Ticker ${ticker} not found in device_monitored_tickers`,
-          })
-          return
+          const allowCreatePinned =
+            monitorScope === 'pinned' &&
+            (request.body?.create_if_missing === true ||
+              request.body?.create_if_missing === 1 ||
+              request.body?.create_if_missing === '1')
+          if (allowCreatePinned) {
+            const companyName =
+              String(request.body?.company_name || '').trim() || ticker
+            const ensured = await ensureMonitorTickerRow(supabase, ticker, {
+              companyName,
+              scope: 'pinned',
+            })
+            loaded = ensured.loaded
+          } else {
+            response.status(404).json({
+              error:
+                monitorScope === 'pinned'
+                  ? `Ticker ${ticker} is not pinned yet. Pin from Extreme first (Pinned tab · not Users).`
+                  : `Ticker ${ticker} not found in ${monitorTable}`,
+            })
+            return
+          }
         }
 
         const classified = classifyEventsAgainstSaved(events, loaded.dates)
@@ -3156,6 +5064,8 @@ export function createNotificationsRouter({ getSupabase }) {
             inserted_dates: [],
             updated_dates: [],
             total_saved_events: Object.keys(loaded.dates).length,
+            monitor_scope: monitorScope,
+            monitor_table: monitorTable,
             message:
               skippedSaved.length > 0
                 ? `No writes — all ${skippedSaved.length} date(s) already saved with the same content.`
@@ -3175,7 +5085,7 @@ export function createNotificationsRouter({ getSupabase }) {
           .map((e) => e.event_date)
 
         const { dates, written } = mergeDatesIntoMap(loaded.dates, toWrite, nowIso)
-        const meta = await loadTickerMeta(supabase, ticker)
+        const meta = await loadTickerMeta(supabase, ticker, monitorScope)
         const route = classifyAsset(ticker, meta.company_name)
         const teUrl =
           route.scrape_source === 'trading_economics'
@@ -3196,7 +5106,7 @@ export function createNotificationsRouter({ getSupabase }) {
             null,
           assetClass: request.body?.asset_class || route.asset_class || null,
         })
-        const rows = await persistTickerDates(supabase, ticker, payload)
+        const rows = await persistTickerDates(supabase, ticker, payload, monitorScope)
 
         response.json({
           ok: true,
@@ -3210,6 +5120,8 @@ export function createNotificationsRouter({ getSupabase }) {
           updated_dates: updatedDates,
           written_dates: written,
           total_saved_events: Object.keys(dates).length,
+          monitor_scope: monitorScope,
+          monitor_table: monitorTable,
           message: [
             insertedDates.length
               ? `Inserted ${insertedDates.length} new date(s): ${insertedDates.join(', ')}`
@@ -3235,6 +5147,140 @@ export function createNotificationsRouter({ getSupabase }) {
       }
     },
 
+    /**
+     * Extreme → Pinned list (pinned_monitored_tickers). Independent of Users/subscribers.
+     */
+    async listPinnedTickers(_request, response) {
+      try {
+        const supabase = getSupabase()
+        const { data, error } = await supabase
+          .from(MONITOR_TABLE_PINNED)
+          .select('ticker, company_name, notable_price_movements, pinned_at, created_at, updated_at')
+          .order('updated_at', { ascending: false })
+
+        if (error) {
+          if (/does not exist|relation|42P01/i.test(error.message || '')) {
+            response.status(503).json({
+              error:
+                'pinned_monitored_tickers table missing. Run supabase/schema_pinned_monitored_tickers.sql in Supabase.',
+              code: 'pinned_table_missing',
+            })
+            return
+          }
+          throw error
+        }
+
+        const tickers = (data || []).map((row) => {
+          const dates = extractDatesMap(row.notable_price_movements)
+          const events = Object.values(dates)
+            .map((event) => normalizeEventRow(event))
+            .filter(Boolean)
+            .sort((a, b) => String(b.event_date).localeCompare(String(a.event_date)))
+          return {
+            ticker: String(row.ticker || '').toUpperCase(),
+            company_name: row.company_name || row.ticker,
+            pinned_at: row.pinned_at || row.created_at || null,
+            created_at: row.created_at || null,
+            updated_at: row.updated_at || null,
+            has_saved_movements: events.length > 0,
+            saved_event_count: events.length,
+            last_saved_at: row.notable_price_movements?.updated_at || row.updated_at || null,
+            subscriber_count: 0,
+            device_ids: [],
+            saved_events: events,
+            asset_class: 'equity',
+            scrape_source: 'perplexity',
+            monitor_scope: 'pinned',
+          }
+        })
+
+        response.json({
+          ok: true,
+          monitor_scope: 'pinned',
+          monitor_table: MONITOR_TABLE_PINNED,
+          count: tickers.length,
+          tickers,
+        })
+      } catch (error) {
+        response.status(500).json({
+          error: error instanceof Error ? error.message : 'Failed to load pinned tickers',
+        })
+      }
+    },
+
+    async addPinnedTicker(request, response) {
+      try {
+        const ticker = normalizeTicker(request.body?.ticker || request.params?.ticker)
+        if (!ticker) {
+          response.status(400).json({ error: 'Ticker is required' })
+          return
+        }
+        const companyName =
+          String(request.body?.company_name || request.body?.companyName || '')
+            .trim() || ticker
+        const supabase = getSupabase()
+        const ensured = await ensureMonitorTickerRow(supabase, ticker, {
+          companyName,
+          scope: 'pinned',
+        })
+        // Touch company_name / pinned_at if already existed
+        if (!ensured.created) {
+          await supabase
+            .from(MONITOR_TABLE_PINNED)
+            .update({
+              company_name: companyName,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('ticker', ticker)
+        }
+        response.status(ensured.created ? 201 : 200).json({
+          ok: true,
+          created: ensured.created,
+          already_exists: !ensured.created,
+          ticker,
+          company_name: companyName,
+          monitor_scope: 'pinned',
+          monitor_table: MONITOR_TABLE_PINNED,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to pin ticker'
+        const status = /does not exist|relation|42P01/i.test(message) ? 503 : 500
+        response.status(status).json({
+          error: message,
+          hint:
+            status === 503
+              ? 'Run supabase/schema_pinned_monitored_tickers.sql in Supabase SQL editor.'
+              : undefined,
+        })
+      }
+    },
+
+    async removePinnedTicker(request, response) {
+      try {
+        const ticker = normalizeTicker(request.params?.ticker || request.body?.ticker)
+        if (!ticker) {
+          response.status(400).json({ error: 'Ticker is required' })
+          return
+        }
+        const supabase = getSupabase()
+        const { error } = await supabase
+          .from(MONITOR_TABLE_PINNED)
+          .delete()
+          .eq('ticker', ticker)
+        if (error) throw error
+        response.json({
+          ok: true,
+          ticker,
+          removed: true,
+          monitor_scope: 'pinned',
+        })
+      } catch (error) {
+        response.status(500).json({
+          error: error instanceof Error ? error.message : 'Failed to unpin ticker',
+        })
+      }
+    },
+
     async credits(_request, response) {
       try {
         const usage = await getFirecrawlCreditUsage()
@@ -3247,7 +5293,309 @@ export function createNotificationsRouter({ getSupabase }) {
     },
 
     /**
-     * All unique devices that have notifications enabled (any monitored ticker).
+     * App release config from public.app_releases (ios | android | all).
+     * Query: ?id=ios optional — omit to list all rows.
+     */
+    async getAppSettings(request, response) {
+      try {
+        const supabase = getSupabase()
+        const id = String(request.query?.id || request.body?.id || '')
+          .trim()
+          .toLowerCase()
+
+        let query = supabase
+          .from('app_releases')
+          .select(
+            'id, min_version, min_build, latest_version, latest_build, force_update, title, message, store_url, check_eas_update, enabled, updated_at',
+          )
+          .order('id', { ascending: true })
+
+        if (id) query = query.eq('id', id)
+
+        const { data, error } = id ? await query.maybeSingle() : await query
+
+        if (error) {
+          const code = String(error.code || '')
+          const msg = String(error.message || '')
+          const missing =
+            code === 'PGRST205' ||
+            code === '42P01' ||
+            (/could not find the table/i.test(msg) && /app_releases/i.test(msg)) ||
+            (/relation .*app_releases.* does not exist/i.test(msg)) ||
+            (/schema cache/i.test(msg) && /app_releases/i.test(msg))
+          if (missing) {
+            response.status(503).json({
+              ok: false,
+              error: 'Table public.app_releases is missing or not readable.',
+              needs_schema: true,
+              details: msg || null,
+              code: code || null,
+            })
+            return
+          }
+          response.status(500).json({
+            ok: false,
+            error: msg || 'Failed to load app releases',
+            code: code || null,
+          })
+          return
+        }
+
+        if (id) {
+          response.json({
+            ok: true,
+            id,
+            settings: data || null,
+            releases: data ? [data] : [],
+          })
+          return
+        }
+
+        response.json({
+          ok: true,
+          releases: Array.isArray(data) ? data : [],
+          settings: Array.isArray(data) ? data[0] || null : data,
+        })
+      } catch (error) {
+        response.status(500).json({
+          error: error instanceof Error ? error.message : 'Failed to load app releases',
+        })
+      }
+    },
+
+    /**
+     * Update one app_releases row by id (ios | android | all).
+     * Body maps to latest_version / latest_build (current release) and optional min_* / force_update / copy fields.
+     * Upserts if the row does not exist yet.
+     *
+     * Writes require SUPABASE_SERVICE_ROLE_KEY (or RLS policies that allow update/insert).
+     * With the publishable/anon key alone, SELECT usually works but UPDATE is blocked by RLS.
+     */
+    async updateAppSettings(request, response) {
+      try {
+        const id = String(request.body?.id || request.query?.id || '')
+          .trim()
+          .toLowerCase()
+        if (!id) {
+          response.status(400).json({ error: 'id is required (ios | android | all)' })
+          return
+        }
+        if (!['ios', 'android', 'all'].includes(id)) {
+          response.status(400).json({ error: 'id must be ios, android, or all' })
+          return
+        }
+
+        const latestVersion = String(
+          request.body?.latest_version ??
+            request.body?.version ??
+            request.body?.current_version ??
+            '',
+        ).trim()
+        const latestBuildRaw =
+          request.body?.latest_build ??
+          request.body?.build_number ??
+          request.body?.buildNumber ??
+          request.body?.current_build
+        const minVersion =
+          request.body?.min_version != null
+            ? String(request.body.min_version).trim()
+            : undefined
+        const minBuildRaw =
+          request.body?.min_build != null ? request.body.min_build : undefined
+
+        const parseBuild = (value) => {
+          if (value === undefined || value === null || value === '') return null
+          const n = Number.parseInt(String(value).trim(), 10)
+          return Number.isFinite(n) ? n : null
+        }
+
+        const latestBuild = parseBuild(latestBuildRaw)
+        const minBuild = minBuildRaw === undefined ? undefined : parseBuild(minBuildRaw)
+
+        if (!latestVersion && latestBuild == null && minVersion === undefined && minBuild === undefined) {
+          response.status(400).json({
+            error: 'Provide at least latest_version or latest_build (or min_* fields)',
+          })
+          return
+        }
+
+        // Do not put primary key `id` in the update body — only use it in .eq().
+        const patch = {
+          updated_at: new Date().toISOString(),
+        }
+        if (latestVersion) patch.latest_version = latestVersion
+        if (latestBuild != null) patch.latest_build = latestBuild
+        if (minVersion !== undefined) patch.min_version = minVersion || '0.0.0'
+        if (minBuild !== undefined && minBuild != null) patch.min_build = minBuild
+        if (typeof request.body?.force_update === 'boolean') {
+          patch.force_update = request.body.force_update
+        }
+        if (request.body?.title !== undefined) {
+          patch.title = request.body.title == null ? null : String(request.body.title).trim() || null
+        }
+        if (request.body?.message !== undefined) {
+          patch.message =
+            request.body.message == null ? null : String(request.body.message).trim() || null
+        }
+        if (request.body?.store_url !== undefined) {
+          patch.store_url =
+            request.body.store_url == null
+              ? null
+              : String(request.body.store_url).trim() || null
+        }
+        if (typeof request.body?.check_eas_update === 'boolean') {
+          patch.check_eas_update = request.body.check_eas_update
+        }
+        if (typeof request.body?.enabled === 'boolean') {
+          patch.enabled = request.body.enabled
+        }
+
+        const supabase = getSupabase()
+        const usingServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY)
+        const selectCols =
+          'id, min_version, min_build, latest_version, latest_build, force_update, title, message, store_url, check_eas_update, enabled, updated_at'
+
+        const rlsWriteDenied = (error) => {
+          if (!error) return false
+          const code = String(error.code || '')
+          const msg = String(error.message || '')
+          return (
+            code === '42501' ||
+            code === 'PGRST301' ||
+            /row-level security/i.test(msg) ||
+            /permission denied/i.test(msg) ||
+            /violates row-level security/i.test(msg)
+          )
+        }
+
+        const tableMissing = (error) => {
+          if (!error) return false
+          const code = String(error.code || '')
+          const msg = String(error.message || '')
+          return (
+            code === 'PGRST205' ||
+            code === '42P01' ||
+            (/could not find the table/i.test(msg) && /app_releases/i.test(msg)) ||
+            /relation .*app_releases.* does not exist/i.test(msg) ||
+            (/schema cache/i.test(msg) && /app_releases/i.test(msg))
+          )
+        }
+
+        const permissionHelp =
+          'Writes to app_releases are blocked by RLS. Add SUPABASE_SERVICE_ROLE_KEY to .env.local ' +
+          '(Supabase → Project Settings → API → service_role), restart the API server, and try again. ' +
+          'Alternatively add UPDATE/INSERT policies for your key.'
+
+        // Prefer update; if row truly missing, upsert so first save works.
+        let { data, error } = await supabase
+          .from('app_releases')
+          .update(patch)
+          .eq('id', id)
+          .select(selectCols)
+          .maybeSingle()
+
+        // RLS often returns { data: null, error: null } for blocked updates.
+        // Distinguish "no row" vs "blocked" by checking whether the row exists.
+        if (!error && !data) {
+          const existing = await supabase
+            .from('app_releases')
+            .select('id')
+            .eq('id', id)
+            .maybeSingle()
+
+          if (existing.error) {
+            error = existing.error
+          } else if (existing.data) {
+            // Row exists but update returned nothing → write blocked (almost always RLS + anon key).
+            response.status(403).json({
+              ok: false,
+              error: permissionHelp,
+              code: 'RLS_WRITE_DENIED',
+              needs_service_role: !usingServiceRole,
+            })
+            return
+          } else {
+            const upsert = await supabase
+              .from('app_releases')
+              .upsert(
+                {
+                  id,
+                  min_version: patch.min_version ?? '0.0.0',
+                  min_build: patch.min_build ?? 0,
+                  latest_version: patch.latest_version ?? '0.0.0',
+                  latest_build: patch.latest_build ?? 0,
+                  force_update: patch.force_update ?? false,
+                  title: patch.title ?? null,
+                  message: patch.message ?? null,
+                  store_url: patch.store_url ?? null,
+                  check_eas_update: patch.check_eas_update ?? true,
+                  enabled: patch.enabled ?? true,
+                  updated_at: patch.updated_at,
+                },
+                { onConflict: 'id' },
+              )
+              .select(selectCols)
+              .maybeSingle()
+            data = upsert.data
+            error = upsert.error
+          }
+        }
+
+        if (error) {
+          if (tableMissing(error)) {
+            response.status(503).json({
+              ok: false,
+              error: 'Table public.app_releases is missing or not readable.',
+              needs_schema: true,
+              details: error.message || null,
+              code: error.code || null,
+            })
+            return
+          }
+          if (rlsWriteDenied(error)) {
+            response.status(403).json({
+              ok: false,
+              error: permissionHelp,
+              details: error.message || null,
+              code: error.code || null,
+              needs_service_role: !usingServiceRole,
+            })
+            return
+          }
+          response.status(500).json({
+            ok: false,
+            error: error.message || 'Failed to update app release',
+            code: error.code || null,
+          })
+          return
+        }
+
+        if (!data) {
+          response.status(500).json({
+            ok: false,
+            error: `Failed to save app_releases row id="${id}".`,
+          })
+          return
+        }
+
+        response.json({
+          ok: true,
+          id,
+          settings: data,
+          message: `Saved ${id} · v${data.latest_version} · build ${data.latest_build}`,
+        })
+      } catch (error) {
+        response.status(500).json({
+          error: error instanceof Error ? error.message : 'Failed to update app release',
+        })
+      }
+    },
+
+    /**
+     * Audience devices for an app (Trigger / 9AM).
+     * Returns every device that has any subscriber row for that app — including
+     * fully stopped ones — so the dashboard can show Notifications on/off correctly.
+     * Alertable subset = devices where enabled === true (subscription_status on|partial).
      */
     async listDevices(request, response) {
       try {
@@ -3259,40 +5607,20 @@ export function createNotificationsRouter({ getSupabase }) {
 
         if (error) throw error
 
-        const recipients = collectPushRecipients(data || [], appKey)
-        // Map token → which tickers they subscribe to (full list + crypto pro signal)
-        const tickerByToken = new Map()
-        const cryptoByToken = new Map()
-        for (const row of data || []) {
-          const ticker = normalizeTicker(row.ticker)
-          const assetClass = classifyAsset(ticker, row.company_name || '').asset_class
-          for (const sub of Array.isArray(row.subscribers) ? row.subscribers : []) {
-            if (!sub || sub.enabled === false) continue
-            if (subscriberNotificationApp(sub) !== appKey) continue
-            const token = String(sub.expo_push_token || '').trim()
-            if (!isExpoPushToken(token)) continue
-            if (!tickerByToken.has(token)) tickerByToken.set(token, new Set())
-            if (!cryptoByToken.has(token)) cryptoByToken.set(token, new Set())
-            if (ticker) tickerByToken.get(token).add(ticker)
-            if (ticker && assetClass === 'crypto') cryptoByToken.get(token).add(ticker)
-          }
-        }
+        const devices = buildAudienceDevices(data || [], appKey)
+        const alertable = devices.filter((d) => d.enabled)
+        const stopped = devices.filter((d) => !d.enabled)
 
         response.json({
           ok: true,
           app_key: appKey,
-          count: recipients.length,
-          devices: recipients.map((r) => {
-            const allTickers = [...(tickerByToken.get(r.expo_push_token) || [])].sort()
-            const cryptoTickers = [...(cryptoByToken.get(r.expo_push_token) || [])].sort()
-            return {
-              device_id: r.device_id,
-              expo_push_token: r.expo_push_token,
-              tickers: allTickers,
-              crypto_tickers: cryptoTickers,
-              pro_crypto: cryptoTickers.length > 0,
-            }
-          }),
+          count: devices.length,
+          alertable_count: alertable.length,
+          stopped_count: stopped.length,
+          // Full list for Audience UI (on + partial + off).
+          devices,
+          // Back-compat for any caller that only wants push-ready tokens.
+          recipients: collectPushRecipients(data || [], appKey),
         })
       } catch (error) {
         response.status(500).json({
@@ -3726,7 +6054,7 @@ export function createNotificationsRouter({ getSupabase }) {
             const hasSubscription = (Array.isArray(row.subscribers) ? row.subscribers : []).some(
               (subscriber) =>
                 subscriber &&
-                subscriber.enabled !== false &&
+                isSubscriberEnabled(subscriber) &&
                 subscriberNotificationApp(subscriber) === 'trigger' &&
                 String(subscriber.expo_push_token || '').trim() === recipient.expo_push_token,
             )
@@ -3843,11 +6171,16 @@ export function createNotificationsRouter({ getSupabase }) {
     /**
      * Read-only preview of the exact notable-movement notification copy.
      * Accepts an optional event so a dashboard card can preview that card only.
+     * Extreme / Pinned: works even when ticker is not in device_monitored_tickers.
      */
     async previewAlert(request, response) {
       try {
         const ticker = normalizeTicker(request.params.ticker || request.body?.ticker)
         const appKey = normalizeNotificationApp(request.body?.app_key || request.query?.app)
+        const allRecipients =
+          request.body?.all_recipients === true ||
+          request.body?.recipient_scope === 'all' ||
+          String(request.body?.recipient_scope || '').toLowerCase() === 'all'
         if (!ticker) {
           response.status(400).json({ error: 'Ticker is required' })
           return
@@ -3867,18 +6200,23 @@ export function createNotificationsRouter({ getSupabase }) {
             .ilike('ticker', ticker))
           if (error) throw error
         }
-        if (!rows?.length) {
+
+        // Non-monitored Extreme/Pinned tickers: still build copy from body.event / company_name.
+        const hasEventBody =
+          request.body?.event && typeof request.body.event === 'object'
+        if (!rows?.length && !hasEventBody && !String(request.body?.title || '').trim()) {
           response.status(404).json({
             error: `Ticker ${ticker} not found in device_monitored_tickers`,
           })
           return
         }
+        if (!rows?.length) rows = []
 
         let event = null
-        if (request.body?.event && typeof request.body.event === 'object') {
+        if (hasEventBody) {
           event = normalizeEventRow(request.body.event) || request.body.event
         }
-        if (!event) {
+        if (!event && rows.length) {
           const merged = {}
           for (const row of rows) {
             Object.assign(merged, extractDatesMap(row.notable_price_movements))
@@ -3886,14 +6224,27 @@ export function createNotificationsRouter({ getSupabase }) {
           event = latestMovementEvent({ dates: merged })
         }
 
-        const companyName = rows.find((row) => row.company_name)?.company_name || ticker
+        const companyName =
+          String(request.body?.company_name || '').trim() ||
+          rows.find((row) => row.company_name)?.company_name ||
+          ticker
         const preview = buildAlertMessage({
           ticker,
           companyName,
           event,
+          titleOverride: request.body?.title,
+          bodyOverride: request.body?.body,
           appKey,
         })
-        const recipients = collectPushRecipients(rows, appKey)
+
+        let recipients = collectPushRecipients(rows, appKey)
+        if (allRecipients) {
+          const { data: allRows, error: allError } = await supabase
+            .from('device_monitored_tickers')
+            .select('subscribers')
+          if (allError) throw allError
+          recipients = collectPushRecipients(allRows || [], appKey)
+        }
 
         response.json({
           ok: true,
@@ -3905,6 +6256,7 @@ export function createNotificationsRouter({ getSupabase }) {
           notification_type: preview.data.notification_type,
           movement_type: preview.data.movement_type,
           deep_link: preview.data.deep_link,
+          all_recipients: allRecipients,
           recipient_count: recipients.length,
           device_ids: recipients.map((recipient) => recipient.device_id).filter(Boolean),
         })
@@ -3916,14 +6268,19 @@ export function createNotificationsRouter({ getSupabase }) {
     },
 
     /**
-     * Push an alert to every enabled Expo device subscribed to this ticker.
-     * Uses the latest saved notable_price_movements.dates entry for title/body
-     * (optional title/body overrides in request body).
+     * Push an alert to enabled Expo devices.
+     * Default: devices subscribed to this ticker.
+     * Extreme / Pinned (`all_recipients: true`): any selected app device, even if they
+     * never subscribed to this ticker (and ticker need not exist in monitored table).
      */
     async alert(request, response) {
       try {
         const ticker = normalizeTicker(request.params.ticker || request.body?.ticker)
         const appKey = normalizeNotificationApp(request.body?.app_key || request.query?.app)
+        const allRecipients =
+          request.body?.all_recipients === true ||
+          request.body?.recipient_scope === 'all' ||
+          String(request.body?.recipient_scope || '').toLowerCase() === 'all'
         if (!ticker) {
           response.status(400).json({ error: 'Ticker is required' })
           return
@@ -3943,14 +6300,7 @@ export function createNotificationsRouter({ getSupabase }) {
             .ilike('ticker', ticker))
           if (error) throw error
         }
-        if (!rows?.length) {
-          response.status(404).json({
-            error: `Ticker ${ticker} not found in device_monitored_tickers`,
-          })
-          return
-        }
 
-        let recipients = collectPushRecipients(rows, appKey)
         const selectedIds = Array.isArray(request.body?.device_ids)
           ? request.body.device_ids.map((id) => String(id || '').trim()).filter(Boolean)
           : []
@@ -3959,6 +6309,36 @@ export function createNotificationsRouter({ getSupabase }) {
               .map((token) => String(token || '').trim())
               .filter(Boolean)
           : []
+        const hasEventBody =
+          request.body?.event && typeof request.body.event === 'object'
+        const hasTitleOverride = Boolean(String(request.body?.title || '').trim())
+
+        // Extreme/Pinned: allow push without a monitored-tickers row when explicit
+        // recipients + event/title are provided.
+        if (!rows?.length) {
+          if (
+            !allRecipients &&
+            !(selectedIds.length || selectedTokens.length) &&
+            !hasEventBody &&
+            !hasTitleOverride
+          ) {
+            response.status(404).json({
+              error: `Ticker ${ticker} not found in device_monitored_tickers`,
+            })
+            return
+          }
+          rows = []
+        }
+
+        let recipients = collectPushRecipients(rows, appKey)
+        if (allRecipients || (!recipients.length && (selectedIds.length || selectedTokens.length))) {
+          const { data: allRows, error: allError } = await supabase
+            .from('device_monitored_tickers')
+            .select('subscribers')
+          if (allError) throw allError
+          recipients = collectPushRecipients(allRows || [], appKey)
+        }
+
         if (selectedIds.length || selectedTokens.length) {
           const idSet = new Set(selectedIds)
           const tokenSet = new Set(selectedTokens)
@@ -3967,6 +6347,17 @@ export function createNotificationsRouter({ getSupabase }) {
               (recipient.device_id && idSet.has(String(recipient.device_id))) ||
               tokenSet.has(recipient.expo_push_token),
           )
+        } else if (allRecipients) {
+          // All-recipients without an explicit selection is too dangerous — require pick.
+          response.status(400).json({
+            error:
+              'Select at least one device. Extreme/Pinned alerts require explicit recipients (use Select all or pick devices).',
+            ticker,
+            app_key: appKey,
+            recipient_count: 0,
+            all_recipients: true,
+          })
+          return
         }
         if (!recipients.length) {
           response.status(400).json({
@@ -3981,13 +6372,12 @@ export function createNotificationsRouter({ getSupabase }) {
           return
         }
 
-        // Prefer latest saved movement; fall back to body.event if provided.
+        // Prefer body.event (card send); else latest saved movement for monitored tickers.
         let event = null
-        if (request.body?.event && typeof request.body.event === 'object') {
+        if (hasEventBody) {
           event = normalizeEventRow(request.body.event) || request.body.event
         }
-        if (!event) {
-          // Merge all rows' movement maps then pick newest date.
+        if (!event && rows.length) {
           const merged = {}
           for (const row of rows) {
             Object.assign(merged, extractDatesMap(row.notable_price_movements))
@@ -3995,7 +6385,10 @@ export function createNotificationsRouter({ getSupabase }) {
           event = latestMovementEvent({ dates: merged })
         }
 
-        const companyName = rows.find((r) => r.company_name)?.company_name || ticker
+        const companyName =
+          String(request.body?.company_name || '').trim() ||
+          rows.find((r) => r.company_name)?.company_name ||
+          ticker
         const { title, body, data: pushData } = buildAlertMessage({
           ticker,
           companyName,
@@ -4323,14 +6716,32 @@ export function createNotificationsRouter({ getSupabase }) {
 
         // --- Auto-save: replace the reason/summary for this event date in Supabase ---
         let saveResult = null
+        const monitorScope = resolveMonitorScope(request)
+        const monitorTable = monitorTableForScope(monitorScope)
         if (autoSave && ticker && /^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
           const supabase = getSupabase()
-          const loaded = await loadTickerDates(supabase, ticker)
+          let loaded = await loadTickerDates(supabase, ticker, monitorScope)
+          const allowCreatePinned =
+            monitorScope === 'pinned' &&
+            (request.body?.create_if_missing === true ||
+              request.body?.create_if_missing === 1 ||
+              request.body?.create_if_missing === '1')
+          if (!loaded.found && allowCreatePinned) {
+            await ensureMonitorTickerRow(supabase, ticker, {
+              companyName,
+              scope: 'pinned',
+            })
+            loaded = await loadTickerDates(supabase, ticker, 'pinned')
+          }
           if (!loaded.found) {
             saveResult = {
               ok: false,
               saved: false,
-              error: `Ticker ${ticker} not found in device_monitored_tickers`,
+              error:
+                monitorScope === 'pinned'
+                  ? `Ticker ${ticker} is not pinned yet (Pinned store only · not Users)`
+                  : `Ticker ${ticker} not found in ${monitorTable}`,
+              monitor_scope: monitorScope,
             }
           } else {
             const existing = loaded.dates[eventDate] || {}
@@ -4462,7 +6873,7 @@ export function createNotificationsRouter({ getSupabase }) {
               [mergedEvent],
               nowIso,
             )
-            const meta = await loadTickerMeta(supabase, ticker)
+            const meta = await loadTickerMeta(supabase, ticker, monitorScope)
             const route = classifyAsset(ticker, meta.company_name || companyName)
             const teUrl =
               route.scrape_source === 'trading_economics'
@@ -4484,14 +6895,16 @@ export function createNotificationsRouter({ getSupabase }) {
                 request.body?.source_provider || route.scrape_source || null,
               assetClass: request.body?.asset_class || route.asset_class || null,
             })
-            await persistTickerDates(supabase, ticker, payload)
+            await persistTickerDates(supabase, ticker, payload, monitorScope)
             saveResult = {
               ok: true,
               saved: true,
               ticker,
               event_date: eventDate,
               written_dates: written,
-              message: `Saved Gemini notification for ${ticker} · dates[${eventDate}]`,
+              monitor_scope: monitorScope,
+              monitor_table: monitorTable,
+              message: `Saved Gemini notification for ${ticker} · dates[${eventDate}] · ${monitorTable}`,
               structure: 'notable_price_movements.dates[YYYY-MM-DD].summary',
             }
             // Mirror Gemini spend into daily ledger for header popup (also derived from dates).
@@ -4574,6 +6987,707 @@ export function createNotificationsRouter({ getSupabase }) {
       } catch (error) {
         response.status(500).json({
           error: error instanceof Error ? error.message : 'Gemini summarize failed',
+        })
+      }
+    },
+
+    /**
+     * Momentum research — single-shot Gemini live research (no scraping).
+     *
+     * phase = "run" (default) | "gemini": build asset-class prompt + call Gemini
+     * phase = "prepare": build prompt only (optional expand/edit)
+     *
+     * Body: ticker, company_name?, window_key, window_label?, exact_label?,
+     * exact_minutes?, move_percent?, live_price?, reference_price?,
+     * reference_time?, market_session?, asset_class?, prompt? (override)
+     */
+    async momentumResearch(request, response) {
+      try {
+        const phaseRaw = String(request.body?.phase || 'run')
+          .trim()
+          .toLowerCase()
+        const phase = phaseRaw === 'prepare' ? 'prepare' : 'run'
+
+        const ticker = normalizeTicker(
+          request.body?.ticker || request.params?.ticker || '',
+        )
+        if (!ticker) {
+          response.status(400).json({ error: 'ticker is required' })
+          return
+        }
+        const companyName = String(
+          request.body?.company_name || request.body?.label || '',
+        ).trim()
+        const windowKey = String(request.body?.window_key || 'day').trim() || 'day'
+        const windowLabel = String(
+          request.body?.window_label || windowKey,
+        ).trim()
+        const exactLabel = String(request.body?.exact_label || '').trim()
+        const exactMinutes = Number(request.body?.exact_minutes)
+        const movePercent = Number(request.body?.move_percent)
+        const moveText = Number.isFinite(movePercent)
+          ? `${movePercent > 0 ? '+' : ''}${movePercent.toFixed(2)}%`
+          : String(request.body?.price_change || request.body?.momentum || '').trim()
+        const livePrice = request.body?.live_price
+        const referencePrice = request.body?.reference_price
+        const referenceTime = request.body?.reference_time
+          ? String(request.body.reference_time)
+          : null
+        const marketSession = String(request.body?.market_session || '').trim()
+        const assetClassIn = String(request.body?.asset_class || '').trim()
+        const classification = classifyAsset(ticker, companyName)
+        const assetClass =
+          assetClassIn ||
+          classification.asset_class ||
+          classification.scrape_source ||
+          'equity'
+        const cls = String(assetClass || 'equity').toLowerCase()
+
+        let preferredTimePhrase = String(
+          request.body?.preferred_time_phrase || '',
+        ).trim()
+        const sess = marketSession.toUpperCase()
+        if (!preferredTimePhrase) {
+          if (windowKey === 'day') {
+            if (sess === 'PRE') preferredTimePhrase = 'in pre-market trading'
+            else if (sess === 'PREPRE') preferredTimePhrase = 'overnight'
+            else if (sess === 'POST' || sess === 'POSTPOST')
+              preferredTimePhrase = 'in after-hours trading'
+            else if (sess === 'CLOSED') preferredTimePhrase = 'at the close'
+            else preferredTimePhrase = 'so far in regular trading'
+          } else if (exactLabel) {
+            preferredTimePhrase = `in the last ${exactLabel}`
+          } else {
+            preferredTimePhrase = `over the last ${windowLabel}`
+          }
+        }
+
+        const userMovement = buildMomentumUserMovementLine({
+          ticker,
+          companyName,
+          moveText,
+          preferredTimePhrase,
+          exactLabel,
+          windowLabel,
+          windowKey,
+        })
+        const inputFacts = buildMomentumInputFacts({
+          ticker,
+          companyName,
+          assetClass: cls,
+          moveText,
+          preferredTimePhrase,
+          exactLabel,
+          exactMinutes,
+          windowLabel,
+          windowKey,
+          livePrice,
+          referencePrice,
+          referenceTime,
+          marketSession,
+        })
+        const eventDate =
+          String(request.body?.event_date || '').trim().slice(0, 10) ||
+          todayIsoEastern()
+
+        const promptTemplate =
+          String(
+            request.body?.prompt_template || request.body?.custom_prompt || '',
+          ).trim() || buildMomentumResearchGeminiPromptTemplate(cls)
+
+        let fullPrompt = String(request.body?.prompt || '').trim()
+        if (!fullPrompt) {
+          fullPrompt = fillMomentumResearchPrompt(
+            promptTemplate,
+            userMovement,
+            inputFacts,
+          )
+        } else if (
+          !fullPrompt.includes(userMovement) &&
+          fullPrompt.includes('{{USER_MOVEMENT}}')
+        ) {
+          fullPrompt = fillMomentumResearchPrompt(
+            fullPrompt,
+            userMovement,
+            inputFacts,
+          )
+        } else if (!/USER MOVEMENT/i.test(fullPrompt)) {
+          // Client edited template without movement — always append input
+          fullPrompt = `${fullPrompt}\n\n─── AUTHORITATIVE INPUT ───\n\nUSER MOVEMENT:\n${userMovement}\n\nINPUT FACTS:\n${inputFacts}`
+        }
+
+        const preferredModel =
+          String(
+            process.env.PERPLEXITY_MODEL || request.body?.model || '',
+          ).trim() || 'perplexity/deepseek-v4-flash-0731'
+
+        if (phase === 'prepare') {
+          response.json({
+            ok: true,
+            phase: 'prepare',
+            provider: 'perplexity',
+            model: preferredModel,
+            tools: [
+              {
+                name: 'web_search',
+                provider: 'perplexity',
+                description: 'Sonar built-in live web search',
+              },
+            ],
+            ticker,
+            company_name: companyName || null,
+            asset_class: cls,
+            event_date: eventDate,
+            window_key: windowKey,
+            window_label: windowLabel,
+            exact_label: exactLabel || null,
+            preferred_time_phrase: preferredTimePhrase,
+            user_movement: userMovement,
+            input_facts: inputFacts,
+            scrape_source: 'none',
+            source_url: null,
+            sources: [],
+            raw_summary: null,
+            information_block: `USER MOVEMENT:\n${userMovement}\n\nINPUT FACTS:\n${inputFacts}`,
+            prompt_template: promptTemplate,
+            prompt: fullPrompt,
+            process_steps: [
+              {
+                id: 'classify',
+                label: 'Asset class + movement',
+                status: 'done',
+                detail: `${cls} · ${userMovement}`,
+              },
+              {
+                id: 'build_prompt',
+                label: 'Build research prompt',
+                status: 'done',
+                detail: `${fullPrompt.length.toLocaleString()} chars · model ${preferredModel}`,
+              },
+              {
+                id: 'await_run',
+                label: 'Ready for Perplexity',
+                status: 'pending',
+                detail: 'Web search via Sonar on Run research',
+              },
+            ],
+          })
+          return
+        }
+
+        // ─── RUN: Perplexity Sonar (built-in web search) — no Gemini ───
+        const apiKey = String(process.env.PERPLEXITY_API_KEY || '').trim()
+        if (!apiKey) {
+          response.status(500).json({
+            error:
+              'Add PERPLEXITY_API_KEY to .env.local (server-side only). Momentum research uses Perplexity web search.',
+          })
+          return
+        }
+
+        if (!String(fullPrompt || '').trim()) {
+          response.status(400).json({
+            error: 'Empty research prompt — missing USER MOVEMENT input',
+          })
+          return
+        }
+
+        const maxOutputTokens = geminiMaxOutputTokens()
+
+        let summary = ''
+        let model = preferredModel
+        let modelVersion = null
+        let requestId = null
+        let usageReport = null
+        let modelsTried = [preferredModel]
+        let modelErrors = []
+        let citations = []
+        let searchResults = []
+        let toolsUsed = []
+        let costInfo = null
+        let costUsdDisplay = null
+        let usageRaw = null
+        let structureRetried = false
+        let finishReason = null
+        let searchActuallyUsed = true
+
+        try {
+          let result = await callPerplexityResearch({
+            apiKey,
+            model: preferredModel,
+            prompt: fullPrompt,
+            maxTokens: maxOutputTokens,
+          })
+
+          // One structure retry if Likely driver missing
+          if (!structuredReasonHasLikelyDriver(result.summary)) {
+            structureRetried = true
+            const retryPrompt = [
+              fullPrompt,
+              '',
+              'CRITICAL REVISION:',
+              'Your previous answer did not include a valid structured reason.',
+              'You MUST output the exact format with these labels on their own lines:',
+              'Likely driver: …',
+              'Secondary driver: …',
+              'Move classification: …',
+              'Confidence: …',
+              'Do not omit "Likely driver:".',
+            ].join('\n')
+            try {
+              result = await callPerplexityResearch({
+                apiKey,
+                model: preferredModel,
+                prompt: retryPrompt,
+                maxTokens: maxOutputTokens,
+              })
+            } catch (retryErr) {
+              modelErrors.push({
+                model: preferredModel,
+                error:
+                  retryErr instanceof Error
+                    ? retryErr.message
+                    : String(retryErr),
+              })
+            }
+          }
+
+          summary = sanitizeGeminiSessionHeadline(result.summary, {
+            preferred_time_phrase: preferredTimePhrase,
+            allow_todays_session: windowKey === 'day' && sess === 'CLOSED',
+            phase:
+              sess === 'PRE'
+                ? 'pre_market'
+                : sess === 'PREPRE'
+                  ? 'overnight'
+                  : sess === 'POST' || sess === 'POSTPOST'
+                    ? 'after_hours'
+                    : sess === 'CLOSED'
+                      ? 'regular_closed'
+                      : 'regular_hours_open',
+          })
+          model = result.model
+          modelVersion = result.modelVersion
+          requestId = result.requestId || null
+          citations = result.citations || []
+          searchResults = result.search_results || []
+          toolsUsed = result.tools || []
+          costInfo = result.cost || null
+          costUsdDisplay = result.cost_usd_display || null
+          usageRaw = result.usageRaw || null
+          finishReason = result.finishReason || null
+          usageReport = result.usageMetadata
+            ? {
+                ...buildGeminiUsageReport(
+                  result.usageMetadata,
+                  model,
+                  modelVersion,
+                ),
+                cost_usd_display:
+                  costUsdDisplay ||
+                  buildGeminiUsageReport(
+                    result.usageMetadata,
+                    model,
+                    modelVersion,
+                  )?.cost_usd_display,
+                // Prefer Perplexity's own cost totals when present
+                perplexity_cost: costInfo,
+                prompt_tokens: result.usageMetadata.promptTokenCount,
+                completion_tokens: result.usageMetadata.candidatesTokenCount,
+                total_tokens: result.usageMetadata.totalTokenCount,
+                search_context_size:
+                  result.usageMetadata.searchContextSize || null,
+              }
+            : null
+          if (costUsdDisplay && usageReport) {
+            usageReport.cost_usd_display = costUsdDisplay
+          }
+        } catch (error) {
+          const status =
+            error?.status === 429 || error?.quota
+              ? 429
+              : error?.status === 401 || error?.status === 403
+                ? 401
+                : 502
+          response.status(status).json({
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Perplexity momentum research failed',
+            phase: 'run',
+            provider: 'perplexity',
+            require_web_search: true,
+            model: preferredModel,
+            models_tried: modelsTried,
+            model_errors: [
+              {
+                model: preferredModel,
+                error:
+                  error instanceof Error ? error.message : String(error),
+              },
+            ],
+            tools: [
+              {
+                name: 'web_search',
+                provider: 'perplexity',
+                description: 'Sonar built-in live web search',
+              },
+            ],
+            process_steps: [
+              {
+                id: 'call_perplexity',
+                label: 'Call Perplexity Sonar',
+                status: 'error',
+                detail:
+                  error instanceof Error ? error.message : String(error),
+              },
+            ],
+            prompt: fullPrompt,
+            user_movement: userMovement,
+            input_facts: inputFacts,
+          })
+          return
+        }
+
+        if (!summary) {
+          response.status(502).json({
+            error: 'Perplexity returned an empty reason',
+            phase: 'run',
+            provider: 'perplexity',
+            model,
+            prompt: fullPrompt,
+            user_movement: userMovement,
+          })
+          return
+        }
+
+        if (!structuredReasonHasLikelyDriver(summary)) {
+          response.status(502).json({
+            error:
+              'Perplexity response missing "Likely driver:" — try again or edit the prompt.',
+            phase: 'run',
+            provider: 'perplexity',
+            model,
+            reason: summary,
+            prompt: fullPrompt,
+            user_movement: userMovement,
+            citations,
+            search_results: searchResults,
+            usage: usageReport,
+            cost: costInfo,
+            cost_usd_display: costUsdDisplay,
+          })
+          return
+        }
+
+        const likelyLine = summary
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => /^likely driver:\s*/i.test(l))
+        // Dashes → commas before Supabase save + push
+        const likelyDriver = formatDashesToCommas(
+          likelyLine
+            ? likelyLine.replace(/^likely driver:\s*/i, '').trim()
+            : '',
+        )
+        summary = formatDashesToCommas(summary)
+        const headlineLine = formatDashesToCommas(
+          summary
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .find(
+              (l) =>
+                l &&
+                !/^likely driver:/i.test(l) &&
+                !/^secondary/i.test(l) &&
+                !/^move classification:/i.test(l) &&
+                !/^confidence:/i.test(l),
+            ) || '',
+        )
+
+        // Title: 🟢 SNDK +7.6% in last 42 minutes (ticker symbol, not company name)
+        // Body:  Likely driver only
+        const lookbackMinutes = resolveLookbackMinutes({
+          exactMinutes: Number.isFinite(exactMinutes) ? exactMinutes : null,
+          exactLabel: exactLabel || null,
+          windowKey,
+          referenceTime,
+          nowIso: new Date().toISOString(),
+        })
+        const dirForTitle =
+          Number.isFinite(movePercent) && movePercent < 0 ? 'DOWN' : 'UP'
+        const pushTitle = buildMomentumAlertTitle({
+          ticker,
+          direction: dirForTitle,
+          movePercent: Number.isFinite(movePercent) ? movePercent : null,
+          lookbackMinutes,
+        })
+        const pushBody = likelyDriver || ''
+
+        const processSteps = [
+          {
+            id: 'classify',
+            label: 'Asset class + movement',
+            status: 'done',
+            detail: `${cls} · ${userMovement}`,
+          },
+          {
+            id: 'build_prompt',
+            label: 'Build research prompt',
+            status: 'done',
+            detail: `${fullPrompt.length.toLocaleString()} chars`,
+          },
+          {
+            id: 'call_perplexity',
+            label: 'Call Perplexity Sonar',
+            status: 'done',
+            detail: `Model ${modelVersion || model}${structureRetried ? ' · structure retry' : ''}${finishReason ? ` · finish ${finishReason}` : ''}`,
+            result: {
+              endpoint: 'https://api.perplexity.ai/v1/agent',
+              model: modelVersion || model,
+              request_id: requestId,
+            },
+          },
+          {
+            id: 'web_search',
+            label: 'Web search / grounding',
+            status: 'done',
+            detail: `${searchResults.length} result(s) · ${citations.length} citation(s) · tool web_search`,
+            result: {
+              tool: 'web_search',
+              provider: 'perplexity',
+              endpoint: 'Agent API tools',
+              search_context_size: usageRaw?.search_context_size || null,
+            },
+          },
+          {
+            id: 'parse_output',
+            label: 'Parse Likely / Secondary driver',
+            status: 'done',
+            detail: likelyDriver
+              ? `Likely driver: ${String(likelyDriver).slice(0, 120)}`
+              : 'Structured reason parsed',
+          },
+          {
+            id: 'fill_push',
+            label: 'Fill push title + body',
+            status: 'done',
+            detail: 'Preview ready',
+          },
+        ]
+
+        // Save research findings into the asset-class Supabase table
+        let saveResult = null
+        try {
+          const supabase = getSupabase()
+          saveResult = await saveMomentumResearchRow(supabase, {
+            ticker,
+            company_name: companyName || null,
+            asset_class: cls,
+            event_date: eventDate,
+            window_key: windowKey,
+            window_label: windowLabel,
+            exact_label: exactLabel || null,
+            exact_minutes: Number.isFinite(exactMinutes) ? exactMinutes : null,
+            move_percent: Number.isFinite(movePercent) ? movePercent : null,
+            user_movement: userMovement,
+            market_session: marketSession || null,
+            live_price: livePrice,
+            reference_price: referencePrice,
+            reference_time: referenceTime,
+            headline: headlineLine || null,
+            likely_driver: likelyDriver || null,
+            reason: summary,
+            push_title: pushTitle,
+            push_body: pushBody,
+            model,
+            model_version: modelVersion,
+            request_id: requestId,
+            provider: 'perplexity',
+            citations,
+            search_results: searchResults,
+            tools: toolsUsed,
+            tokens: {
+              prompt: usageRaw?.prompt_tokens ?? null,
+              completion: usageRaw?.completion_tokens ?? null,
+              total: usageRaw?.total_tokens ?? null,
+            },
+            cost: costInfo,
+            cost_usd_display: costUsdDisplay,
+            prompt: fullPrompt,
+            input_facts: inputFacts,
+            process_steps: processSteps,
+          })
+          processSteps.push({
+            id: 'save_supabase',
+            label: `Save to Supabase (${saveResult.table || '…'})`,
+            status: saveResult.ok ? 'done' : 'error',
+            detail: saveResult.ok
+              ? `id ${saveResult.id || '—'} · ${saveResult.table}`
+              : saveResult.error || 'save failed',
+            result: saveResult,
+          })
+        } catch (saveErr) {
+          saveResult = {
+            ok: false,
+            error:
+              saveErr instanceof Error ? saveErr.message : String(saveErr),
+          }
+          processSteps.push({
+            id: 'save_supabase',
+            label: 'Save to Supabase',
+            status: 'error',
+            detail: saveResult.error,
+          })
+        }
+
+        response.json({
+          ok: true,
+          phase: 'run',
+          provider: 'perplexity',
+          use_google_search: searchActuallyUsed,
+          use_web_search: searchActuallyUsed,
+          require_web_search: true,
+          ticker,
+          company_name: companyName || null,
+          asset_class: cls,
+          event_date: eventDate,
+          window_key: windowKey,
+          window_label: windowLabel,
+          exact_label: exactLabel || null,
+          preferred_time_phrase: preferredTimePhrase,
+          user_movement: userMovement,
+          input_facts: inputFacts,
+          scrape_source: 'none',
+          source_url: null,
+          sources: citations,
+          citations,
+          search_results: searchResults,
+          tools: toolsUsed.length
+            ? toolsUsed
+            : [
+                {
+                  name: 'web_search',
+                  provider: 'perplexity',
+                  description: 'Agent API web_search tool',
+                },
+              ],
+          raw_summary: null,
+          information_block: `USER MOVEMENT:\n${userMovement}\n\nINPUT FACTS:\n${inputFacts}`,
+          prompt_template: promptTemplate,
+          prompt: fullPrompt,
+          reason: summary,
+          likely_driver: likelyDriver || null,
+          headline: headlineLine || null,
+          push_title: pushTitle,
+          push_body: pushBody,
+          model,
+          model_version: modelVersion,
+          request_id: requestId,
+          models_tried: modelsTried,
+          model_errors: modelErrors,
+          structure_retried: structureRetried,
+          finish_reason: finishReason,
+          usage: usageReport,
+          usage_raw: usageRaw,
+          cost: costInfo,
+          tokens: {
+            prompt: usageRaw?.prompt_tokens ?? usageReport?.prompt_tokens ?? null,
+            completion:
+              usageRaw?.completion_tokens ??
+              usageReport?.completion_tokens ??
+              null,
+            total:
+              usageRaw?.total_tokens ?? usageReport?.total_tokens ?? null,
+            search_context_size: usageRaw?.search_context_size || null,
+          },
+          credits_used: usageReport?.credits_used ?? 0,
+          cost_usd_display:
+            costUsdDisplay || usageReport?.cost_usd_display || '$0.000000',
+          chosen_event_date: eventDate,
+          process_steps: processSteps,
+          supabase_save: saveResult,
+        })
+
+        // Track Perplexity spend for dashboard (non-blocking)
+        try {
+          const supabase = getSupabase()
+          const totalTok =
+            Number(usageRaw?.total_tokens) ||
+            Number(usageReport?.total_tokens) ||
+            Number(usageReport?.credits_used) ||
+            0
+          const costUsd =
+            Number(costInfo?.total_cost) ||
+            Number(usageReport?.cost_usd_total) ||
+            Number(usageReport?.cost_usd) ||
+            0
+          void recordPerplexityUsageLedger(supabase, {
+            ticker,
+            credits_used: totalTok,
+            total_tokens: totalTok,
+            prompt_tokens:
+              Number(usageRaw?.prompt_tokens) ||
+              Number(usageReport?.prompt_tokens) ||
+              0,
+            completion_tokens:
+              Number(usageRaw?.completion_tokens) ||
+              Number(usageReport?.completion_tokens) ||
+              0,
+            cost_usd: costUsd,
+            meta: {
+              model,
+              request_id: requestId,
+              window_key: windowKey,
+              asset_class: cls,
+              structure_retried: structureRetried,
+            },
+          })
+        } catch (ledgerErr) {
+          console.warn(
+            '[perplexity usage] ledger failed:',
+            ledgerErr?.message || ledgerErr,
+          )
+        }
+      } catch (error) {
+        response.status(500).json({
+          error:
+            error instanceof Error ? error.message : 'Momentum research failed',
+        })
+      }
+    },
+
+    async usagePerplexity(request, response) {
+      try {
+        const days = Math.min(90, Math.max(1, Number(request.query?.days) || 30))
+        const supabase = getSupabase()
+        const agg = await loadPerplexityUsageDaily({ supabase, days })
+        response.json({
+          ok: true,
+          provider: 'perplexity',
+          days,
+          daily: agg.daily,
+          total_cost_usd: agg.total_cost_usd,
+          total_cost_usd_display: agg.total_cost_usd_display,
+          total_credits: agg.total_credits,
+          total_tokens: agg.total_tokens,
+          total_calls: agg.total_calls,
+          // Perplexity API does not expose remaining prepaid balance publicly
+          balance: {
+            remaining_usd: null,
+            note:
+              'Remaining prepaid balance is only on console.perplexity.ai — this app tracks spend from each research call.',
+            console_url: 'https://www.perplexity.ai/account/api/billing',
+          },
+          note:
+            'Credits = tokens used. Cost = Perplexity usage.cost.total_cost from each Agent call.',
+        })
+      } catch (error) {
+        response.status(500).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to load Perplexity usage',
         })
       }
     },
@@ -4745,7 +7859,7 @@ export function createNotificationsRouter({ getSupabase }) {
           const triggerCount = subs.filter(
             (s) =>
               s &&
-              s.enabled !== false &&
+              isSubscriberEnabled(s) &&
               subscriberNotificationApp(s) === 'trigger' &&
               String(s.expo_push_token || '').trim(),
           ).length
@@ -5110,7 +8224,7 @@ function resolveSessionPhaseForEvent(event = {}, now = new Date()) {
  * If Gemini still writes "in today's session" while the session is incomplete,
  * rewrite the first headline line to the preferred open-market phrase.
  */
-function sanitizeGeminiSessionHeadline(summary, sessionCtx) {
+export function sanitizeGeminiSessionHeadline(summary, sessionCtx) {
   const raw = String(summary || '')
   if (!raw.trim() || !sessionCtx || sessionCtx.allow_todays_session) return raw
 
@@ -5178,6 +8292,168 @@ function buildSessionContextLines(event = {}, now = new Date()) {
     ah ? `After-hours move field: ${ah}` : null,
   ].filter(Boolean)
   return { ctx, lines }
+}
+
+/**
+ * One-line asset-class focus for momentum research prompts.
+ */
+export function buildMomentumAssetClassFocus(assetClass) {
+  const cls = String(assetClass || 'equity')
+    .trim()
+    .toLowerCase()
+  if (cls === 'commodity') {
+    return 'Focus: commodity — inventory/supply, USD & yields, peers; classify as asset-specific.'
+  }
+  if (cls === 'crypto') {
+    return 'Focus: crypto — protocol/ETF/regulation/flows; classify as asset-specific.'
+  }
+  if (cls === 'forex' || cls === 'fx' || cls === 'currency') {
+    return 'Focus: FX — central banks, rate differentials, macro; classify as asset-specific.'
+  }
+  if (cls === 'index' || cls === 'etf') {
+    return 'Focus: index/ETF — macro, mega-caps, sector rotation; classify as asset-specific.'
+  }
+  return 'Focus: equity — company news first, then sector/macro; prefer company-specific when clear.'
+}
+
+/**
+ * Momentum research prompt for Perplexity Agent API.
+ * Order: INSTRUCTIONS (concise) → OUTPUT → INPUT.
+ * Placeholders: {{USER_MOVEMENT}}, {{INPUT_FACTS}}
+ */
+export function buildMomentumResearchGeminiPromptTemplate(assetClass) {
+  const focus = buildMomentumAssetClassFocus(assetClass)
+  return [
+    '## INSTRUCTIONS',
+    'Explain WHY the move below happened. Use web_search. Be concise, factual, British English.',
+    '',
+    'Rules:',
+    '- USER MOVEMENT % and lookback are authoritative — do not replace with other site prices.',
+    '- Research that exact window (now = end if no timestamp). Catalysts only before/during the move.',
+    '- Search: asset news, macro, rates, geo, peers, USD/yields, supply/demand, positioning.',
+    '- Likely driver = strongest catalyst only (1–2 short sentences). Secondary = other material factors (no duplicates).',
+    '- Do NOT restate USER MOVEMENT in Likely/Secondary driver (no “X moved +Y% over …”, no repeating asset + % + window). The headline line already has that.',
+    '- Do NOT pad Likely/Secondary with negatives or non-findings (e.g. “No single new company announcement was confirmed for the exact window”, “no press release found”, “nothing confirmed in the window”). State a real catalyst, or one short honest unknown — never that filler style.',
+    '- If no secondary: Secondary driver: No clear secondary driver identified.',
+    '- Do not invent prices, headlines, inventory, volume, or analyst views.',
+    '- If no credible catalyst: say so in one plain line (e.g. “Unclear — no confirmed catalyst found.”). Correlation ≠ causation.',
+    '- Classification totals 100%: company-specific (stocks) or asset-specific (commodities/crypto/FX/indices) + sector/market/macro-related. Or: Unattributed.',
+    '- Confidence: High / Medium / Low — one short reason.',
+    `- ${focus}`,
+    '',
+    '## OUTPUT strictly to be in this format only',
+    'Return only:',
+    '',
+    '[ASSET] [PRICE MOVE] [EXACT TIME PERIOD]',
+    '',
+    'Likely driver: [catalyst only — no restated move %, no “no announcement” filler, be direct and to the point]',
+    '',
+    'Secondary driver: [secondary catalyst(s) only — same rules]',
+    '',
+    'Move classification: [X]% asset/company-specific, [Y]% sector/market/macro-related.',
+    '',
+    'Confidence: [High/Medium/Low] — [brief explanation]',
+    '',
+    '## INPUT',
+    'USER MOVEMENT:',
+    '{{USER_MOVEMENT}}',
+    '',
+    'INPUT FACTS:',
+    '{{INPUT_FACTS}}',
+  ].join('\n')
+}
+
+/** Build the authoritative USER_MOVEMENT line for momentum research. */
+export function buildMomentumUserMovementLine({
+  ticker,
+  companyName,
+  moveText,
+  preferredTimePhrase,
+  exactLabel,
+  windowLabel,
+  windowKey,
+} = {}) {
+  const asset = String(companyName || ticker || 'Asset').trim()
+  const move = String(moveText || '').trim() || 'moved'
+  let period = String(preferredTimePhrase || '').trim()
+  if (exactLabel) {
+    period = `in the last ${String(exactLabel).trim()}`
+  } else if (windowKey && windowKey !== 'day' && windowLabel) {
+    period = `over the last ${String(windowLabel).trim()}`
+  } else if (!period) {
+    period = 'so far in regular trading'
+  }
+  // e.g. “Silver +3.2% in the last 45 minutes.”
+  return `${asset} ${move} ${period}.`.replace(/\s+/g, ' ').trim()
+}
+
+/** Structured facts block for the INPUT section. */
+export function buildMomentumInputFacts({
+  ticker,
+  companyName,
+  assetClass,
+  moveText,
+  preferredTimePhrase,
+  exactLabel,
+  exactMinutes,
+  windowLabel,
+  windowKey,
+  livePrice,
+  referencePrice,
+  referenceTime,
+  marketSession,
+} = {}) {
+  return [
+    `Ticker: ${ticker || '—'}`,
+    companyName ? `Name: ${companyName}` : null,
+    assetClass ? `Asset class: ${assetClass}` : null,
+    moveText ? `Move % (authoritative): ${moveText}` : null,
+    exactLabel ? `Lookback: ${exactLabel}` : null,
+    Number.isFinite(Number(exactMinutes))
+      ? `Exact minutes: ${exactMinutes}`
+      : null,
+    windowKey ? `Window: ${windowKey}${windowLabel ? ` (${windowLabel})` : ''}` : null,
+    preferredTimePhrase ? `Time phrase: ${preferredTimePhrase}` : null,
+    livePrice != null && Number.isFinite(Number(livePrice))
+      ? `Live price: ${livePrice}`
+      : null,
+    referencePrice != null && Number.isFinite(Number(referencePrice))
+      ? `Reference price: ${referencePrice}`
+      : null,
+    referenceTime ? `Reference time: ${referenceTime}` : null,
+    marketSession ? `Session: ${marketSession}` : null,
+    `As of (UTC): ${new Date().toISOString()}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+/** Fill research template with user movement + input facts. */
+export function fillMomentumResearchPrompt(
+  template,
+  userMovement,
+  inputFacts,
+) {
+  let out = String(template || '')
+  if (!out.includes('{{USER_MOVEMENT}}') || !out.includes('{{INPUT_FACTS}}')) {
+    // Ensure canonical order if template is incomplete
+    out = [
+      out.trim(),
+      '',
+      '## INPUT',
+      'USER MOVEMENT:',
+      '{{USER_MOVEMENT}}',
+      '',
+      'INPUT FACTS:',
+      '{{INPUT_FACTS}}',
+    ]
+      .filter((line, i, arr) => !(line === '' && arr[i - 1] === ''))
+      .join('\n')
+  }
+  return out
+    .replace(/\{\{USER_MOVEMENT\}\}/g, userMovement || '(missing movement)')
+    .replace(/\{\{INPUT_FACTS\}\}/g, inputFacts || '(no facts)')
+    .replace(/\{\{ASSET_CLASS_FOCUS\}\}/g, '')
 }
 
 /** Default Gemini classification prompt (without the per-event "Information to classify" block). */
@@ -5342,12 +8618,22 @@ export function mountNotificationsRoutes(app, { getSupabase }) {
 
   app.get('/api/notifications/monitored-tickers', (req, res) => handlers.listTickers(req, res))
   app.post('/api/notifications/monitored-tickers', (req, res) => handlers.addTicker(req, res))
+  app.get('/api/notifications/pinned-tickers', (req, res) => handlers.listPinnedTickers(req, res))
+  app.post('/api/notifications/pinned-tickers', (req, res) => handlers.addPinnedTicker(req, res))
+  app.delete('/api/notifications/pinned-tickers/:ticker', (req, res) =>
+    handlers.removePinnedTicker(req, res),
+  )
   app.get('/api/notifications/firecrawl/credits', (req, res) => handlers.credits(req, res))
   app.get('/api/notifications/devices', (req, res) => handlers.listDevices(req, res))
+  app.get('/api/notifications/app-settings', (req, res) => handlers.getAppSettings(req, res))
+  app.put('/api/notifications/app-settings', (req, res) => handlers.updateAppSettings(req, res))
   app.get('/api/notifications/news', (req, res) => handlers.listNews(req, res))
   app.get('/api/notifications/usage/gemini', (req, res) => handlers.usageGemini(req, res))
   app.get('/api/notifications/usage/firecrawl', (req, res) =>
     handlers.usageFirecrawl(req, res),
+  )
+  app.get('/api/notifications/usage/perplexity', (req, res) =>
+    handlers.usagePerplexity(req, res),
   )
   app.get('/api/notifications/gemini-prompt', (_req, res) => {
     res.json({
@@ -5365,6 +8651,9 @@ export function mountNotificationsRoutes(app, { getSupabase }) {
   )
   app.post('/api/notifications/gemini-summarize', (req, res) =>
     handlers.geminiSummarize(req, res),
+  )
+  app.post('/api/notifications/momentum-research', (req, res) =>
+    handlers.momentumResearch(req, res),
   )
   app.post('/api/notifications/jobs/market-close', (req, res) =>
     handlers.marketCloseJob(req, res),

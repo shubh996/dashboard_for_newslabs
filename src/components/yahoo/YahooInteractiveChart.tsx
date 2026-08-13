@@ -18,6 +18,7 @@ const RANGES: { id: YahooChartRange; label: string }[] = [
   { id: 'ytd', label: 'YTD' },
   { id: '1y', label: '1Y' },
   { id: '5y', label: '5Y' },
+  { id: '10y', label: '10Y' },
   { id: 'max', label: 'MAX' },
 ]
 
@@ -191,6 +192,7 @@ export function YahooInteractiveChart({
   height = 320,
   defaultRange = '1y',
   borderless = false,
+  compact = false,
 }: {
   ticker: string
   /** Optional already-fetched chart payload used as a daily seed for longer ranges. */
@@ -200,6 +202,11 @@ export function YahooInteractiveChart({
   defaultRange?: YahooChartRange
   /** When true, no SectionCard chrome / outer border — for Overview embeds. */
   borderless?: boolean
+  /**
+   * Collapsed mini chart: 1D line only (title + spark area).
+   * No range/interval controls, hover chrome, or period footer.
+   */
+  compact?: boolean
 }) {
   const [range, setRange] = useState<YahooChartRange>(defaultRange)
   const [barInterval, setBarInterval] = useState<YahooChartInterval>(() => defaultIntervalFor(defaultRange))
@@ -309,6 +316,7 @@ export function YahooInteractiveChart({
       ytd: startOfYear,
       '1y': now - 365 * 24 * 60 * 60 * 1000,
       '5y': now - 5 * 365 * 24 * 60 * 60 * 1000,
+      '10y': now - 10 * 365 * 24 * 60 * 60 * 1000,
     }
     const cutoff = cutoffs[range]
     if (cutoff == null) return allPoints
@@ -320,13 +328,14 @@ export function YahooInteractiveChart({
   const maxPlotPoints = activeInterval === '1m' || activeInterval === '2m' ? 600 : 400
   const points = useMemo(() => downsample(filteredPoints, maxPlotPoints), [filteredPoints, maxPlotPoints])
 
-  const width = 900
-  const padL = 52
-  const padR = 20
-  const padT = 16
-  const padB = 44
+  const width = compact ? 720 : 900
+  // Compact sparkline: edge-to-edge line, no axis chrome (tight vertical pad so line fills height)
+  const padL = compact ? 2 : 52
+  const padR = compact ? 4 : 20
+  const padT = compact ? 4 : 16
+  const padB = compact ? 4 : 44
   const plotW = width - padL - padR
-  const plotH = height - padT - padB
+  const plotH = Math.max(40, height - padT - padB)
 
   const geometry = useMemo(() => {
     if (points.length < 2) return null
@@ -344,11 +353,18 @@ export function YahooInteractiveChart({
     const first = points[0].close
     const last = points[points.length - 1].close
     const up = last >= first
-    const tickCount = isIntradayInterval(activeInterval) ? 6 : 7
+    const tickCount = compact ? 5 : isIntradayInterval(activeInterval) ? 6 : 7
     const xTicks = buildTimeAxisTicks(points, range, activeInterval, tickCount).map((tick) => ({
       ...tick,
       x: padL + (tick.index / (points.length - 1)) * plotW,
     }))
+    // Compact view always uses soft mint green like the product mock (not red/green day direction)
+    const stroke = compact ? '#1FA97A' : up ? '#10b981' : '#ef4444'
+    const fill = compact
+      ? 'rgba(31,169,122,0.12)'
+      : up
+        ? 'rgba(16,185,129,0.14)'
+        : 'rgba(239,68,68,0.12)'
     return {
       min,
       max,
@@ -360,10 +376,10 @@ export function YahooInteractiveChart({
       last,
       up,
       changePct: first !== 0 ? ((last - first) / first) * 100 : 0,
-      stroke: up ? '#10b981' : '#ef4444',
-      fill: up ? 'rgba(16,185,129,0.14)' : 'rgba(239,68,68,0.12)',
+      stroke,
+      fill,
     }
-  }, [points, plotW, plotH, range, activeInterval])
+  }, [points, plotW, plotH, range, activeInterval, compact, padL, padT])
 
   function handlePointer(event: ReactPointerEvent<SVGSVGElement>) {
     if (!geometry || !svgRef.current) return
@@ -382,6 +398,12 @@ export function YahooInteractiveChart({
     hoverIndex != null && geometry ? geometry.coords[hoverIndex] : geometry?.coords[geometry.coords.length - 1]
   const displayClose = active?.close ?? geometry?.last
   const displayLabel = active?.label ?? points[points.length - 1]?.label
+  // % always vs first bar of the selected range (period start → hovered/last point)
+  const displayChangePct =
+    geometry && displayClose != null && geometry.first !== 0
+      ? ((displayClose - geometry.first) / geometry.first) * 100
+      : null
+  const displayUp = displayChangePct != null ? displayChangePct >= 0 : geometry?.up
   const intervalOptions = intervalOptionsFor(range)
 
   const rangeDescription = geometry
@@ -450,21 +472,26 @@ export function YahooInteractiveChart({
             <div
               className={cn(
                 'text-lg font-semibold tabular-nums',
-                geometry?.up ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400',
+                displayUp
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : 'text-red-600 dark:text-red-400',
               )}
             >
               ${formatDecimal(displayClose)}
             </div>
             <div className="text-xs text-muted-foreground">{displayLabel}</div>
-            {geometry ? (
+            {geometry && displayChangePct != null ? (
               <div
                 className={cn(
                   'text-[11px] tabular-nums',
-                  geometry.up ? 'text-emerald-600/80 dark:text-emerald-400/80' : 'text-red-600/80 dark:text-red-400/80',
+                  displayUp
+                    ? 'text-emerald-600/80 dark:text-emerald-400/80'
+                    : 'text-red-600/80 dark:text-red-400/80',
                 )}
+                title={`Change from period start (${formatDecimal(geometry.first)}) to this point`}
               >
-                {geometry.changePct >= 0 ? '+' : ''}
-                {formatDecimal(geometry.changePct)}% · {range.toUpperCase()} ·{' '}
+                {displayChangePct >= 0 ? '+' : ''}
+                {formatDecimal(displayChangePct)}% from start · {range.toUpperCase()} ·{' '}
                 {INTERVAL_LABELS[activeInterval] || activeInterval}
               </div>
             ) : (
@@ -639,12 +666,115 @@ export function YahooInteractiveChart({
     </>
   )
 
+  // Period change strip under the whole chart (range start → hovered/end point)
+  const periodChangeFooter =
+    geometry && displayChangePct != null && displayClose != null ? (
+      <div
+        className={cn(
+          'mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2',
+          borderless ? 'border-[#E2EBE8] bg-[#F4F7F6]' : 'border-border/60 bg-muted/30',
+        )}
+      >
+        <div className="min-w-0 text-[11px] text-muted-foreground">
+          <span className="font-medium text-foreground">Period change</span>
+          <span className="mx-1.5 text-border">·</span>
+          <span className="tabular-nums">
+            ${formatDecimal(geometry.first)}
+            {points[0]?.label ? ` (${points[0].label})` : ''}
+          </span>
+          <span className="mx-1">→</span>
+          <span className="tabular-nums">
+            ${formatDecimal(displayClose)}
+            {displayLabel ? ` (${displayLabel})` : ''}
+          </span>
+        </div>
+        <div
+          className={cn(
+            'shrink-0 text-sm font-semibold tabular-nums',
+            displayUp
+              ? 'text-emerald-600 dark:text-emerald-400'
+              : 'text-red-600 dark:text-red-400',
+          )}
+        >
+          {displayChangePct >= 0 ? '+' : ''}
+          {formatDecimal(displayChangePct)}%
+          <span className="ml-1.5 text-[11px] font-medium text-muted-foreground">
+            {range.toUpperCase()}
+            {hoverIndex != null ? ' · at cursor' : ' · full range'}
+          </span>
+        </div>
+      </div>
+    ) : null
+
+  // Compact collapsed preview — thick line only, no title / axes / border.
+  // Fill parent height so the sparkline isn't a short strip with empty space below.
+  if (compact) {
+    const lastCoord = geometry?.coords[geometry.coords.length - 1]
+    return (
+      <div
+        className="relative h-full w-full min-h-0 overflow-hidden bg-transparent"
+        style={{ height: '100%', minHeight: height }}
+        aria-label={`${ticker} 1D chart`}
+      >
+        {loading && !geometry ? (
+          <div className="flex h-full min-h-[3rem] items-center justify-center">
+            <Loader2 className="size-3.5 animate-spin text-emerald-600/70" />
+          </div>
+        ) : null}
+
+        {error && !geometry ? (
+          <p className="flex h-full items-center justify-center text-center text-[11px] text-muted-foreground">
+            {error}
+          </p>
+        ) : null}
+
+        {!loading && !error && !geometry ? (
+          <p className="flex h-full items-center justify-center text-center text-[11px] text-muted-foreground">
+            No chart data
+          </p>
+        ) : null}
+
+        {geometry ? (
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="block h-full w-full"
+            role="img"
+            aria-label={`${ticker} price`}
+            preserveAspectRatio="none"
+          >
+            <path d={geometry.areaPath} fill={geometry.fill} />
+            <path
+              d={geometry.linePath}
+              fill="none"
+              stroke={geometry.stroke}
+              strokeWidth={3.25}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
+            />
+            {lastCoord ? (
+              <circle
+                cx={lastCoord.x}
+                cy={lastCoord.y}
+                r={4}
+                fill={geometry.stroke}
+                stroke="#ffffff"
+                strokeWidth={1.5}
+              />
+            ) : null}
+          </svg>
+        ) : null}
+      </div>
+    )
+  }
+
   // Overview embed: no card chrome, no "Yahoo Finance" badge, no chart box border.
   if (borderless) {
     return (
       <div className="w-full space-y-1">
         {controls}
         {chartBody}
+        {periodChangeFooter}
       </div>
     )
   }
@@ -658,6 +788,7 @@ export function YahooInteractiveChart({
     >
       {controls}
       {chartBody}
+      {periodChangeFooter}
       <p className="mt-2 text-xs text-muted-foreground">
         Range picks the window; Interval picks bar size (e.g. 1D → 1 min, 5D → 15 min, 1M → 1 hour). Yahoo
         limits: 1‑minute bars ~last 7 days; intraday bars ~last 60 days.

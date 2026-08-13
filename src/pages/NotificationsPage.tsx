@@ -6,12 +6,14 @@ import {
   useState,
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from 'react'
 import {
   ArrowUpDown,
   AlertTriangle,
   Bell,
   BellRing,
+  Bookmark,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -20,6 +22,7 @@ import {
   ExternalLink,
   Copy,
   Download,
+  LayoutGrid,
   Loader2,
   Moon,
   Newspaper,
@@ -28,19 +31,37 @@ import {
   RefreshCw,
   Save,
   Search,
+  Settings,
   Share2,
   Sparkles,
   Sun,
   Terminal,
   TrendingUp,
   Users,
+  X,
   Zap,
 } from 'lucide-react'
 import { useTheme } from '@/hooks/useTheme'
 import { useBottomToast } from '@/components/ui/bottom-toast'
+import { SndkMomentumPanel } from '@/components/hub/SndkMomentumPanel'
 import { readPref, writePref } from '@/lib/prefs'
-import { fetchYahooQuote, searchYahooSaved } from '@/services/yahooApi'
+import {
+  fetchYahooQuote,
+  fetchYahooQuotes,
+  fetchYahooChart,
+  fetchYahooExtremeMovers,
+  fetchYahooCompanyProfile,
+  searchYahooSaved,
+  type YahooCompanyProfile,
+  type YahooExtremeMover,
+  type YahooLiveQuote,
+} from '@/services/yahooApi'
 import type { YahooSearchResult } from '@/types/yahoo'
+import {
+  normalizeYahooMarketState,
+  resolveYahooActiveSession,
+  type YahooSessionKey,
+} from '@/lib/yahooMarketSession'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -57,19 +78,61 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
-type DashboardSection = 'tickers' | 'news' | 'custom' | 'users'
-type TickerSortMode = 'subscribers' | 'name' | 'ticker' | 'saved'
+type DashboardSection = 'tickers' | 'news' | 'custom' | 'users' | 'settings'
+type TickerSortMode =
+  | 'subscribers'
+  | 'movement'
+  | 'movement_pos_to_neg'
+  | 'movement_neg_to_pos'
+  | 'name'
+  | 'ticker'
+  | 'saved'
+/**
+ * Sidebar list mode:
+ * - users   = subscriber-monitored stocks (never mixed with Extreme)
+ * - extreme = Yahoo big % movers today (view only — never add to Users)
+ * - pinned  = Extreme picks one-click bookmarked (no dialog / no Users add)
+ */
+type StocksListTab = 'users' | 'extreme' | 'pinned'
+/** Extreme sub-tabs: gainers first, then losers (by abs % size). */
+type ExtremeDirectionTab = 'positive' | 'negative'
 type NotificationApp = 'nineam' | 'trigger'
+/** Top app switcher: Home hub (default) · Trigger · 9AM */
+type AppSwitcherTab = 'hub' | NotificationApp
+
+/** Extreme → Pinned: one-click bookmark, separate from Users/subscribers. */
+type ExtremePinnedItem = {
+  ticker: string
+  company_name: string
+  pinned_at: string
+  /** Snapshot % when pinned (optional display) */
+  change_percent?: number | null
+  currency?: string | null
+  saved_events?: PriceMovementEvent[]
+  saved_event_count?: number
+  last_saved_at?: string | null
+  has_saved_movements?: boolean
+  monitor_scope?: 'pinned'
+}
 type MovementAlertTarget = {
   ticker: string
   event: PriceMovementEvent | null
+  /**
+   * Extreme / Pinned: show every app device (not only ticker subscribers).
+   * Default selection is empty so you Select all / pick manually before send.
+   */
+  allRecipients?: boolean
 }
 
 type AssetClass = 'equity' | 'commodity' | 'forex' | 'crypto' | 'index' | string
@@ -130,10 +193,21 @@ type NewsArticle = {
 type EnabledDevice = {
   device_id: string | null
   expo_push_token: string
+  /** Currently enabled stock tickers (alertable). */
   tickers: string[]
+  enabled_tickers?: string[]
+  /** Tickers this device stopped / disabled. */
+  disabled_tickers?: string[]
+  /** True when ≥1 ticker still enabled for push. */
+  enabled?: boolean
+  /** on = all active, partial = some stopped, off = fully stopped. */
+  subscription_status?: 'on' | 'partial' | 'off'
+  enabled_count?: number
+  disabled_count?: number
   /** True when this token subscribed to crypto (pro access signal). */
   pro_crypto?: boolean
   crypto_tickers?: string[]
+  app_key?: string
 }
 
 type MovementSource = {
@@ -368,6 +442,310 @@ function formatChange(change?: string | null) {
   }
 }
 
+function formatLivePercent(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return null
+  const sign = value > 0 ? '+' : ''
+  return `${sign}${value.toFixed(2)}%`
+}
+
+function formatMarketCap(value?: number | null, currency = 'USD') {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null
+  const abs = Math.abs(value)
+  const prefix = currency === 'USD' ? '$' : `${currency} `
+  if (abs >= 1e12) return `${prefix}${(value / 1e12).toFixed(2)}T`
+  if (abs >= 1e9) return `${prefix}${(value / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${prefix}${(value / 1e6).toFixed(2)}M`
+  if (abs >= 1e3) return `${prefix}${(value / 1e3).toFixed(1)}K`
+  return `${prefix}${Math.round(value).toLocaleString()}`
+}
+
+function formatEmployeeCount(value?: number | null) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null
+  return value.toLocaleString()
+}
+
+function currentUsTradingSession() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date())
+  const read = (type: 'weekday' | 'hour' | 'minute') =>
+    parts.find((part) => part.type === type)?.value || ''
+  const weekday = read('weekday')
+  if (weekday === 'Sat' || weekday === 'Sun') return 'closed' as const
+  const minutes = Number(read('hour')) * 60 + Number(read('minute'))
+  if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) return 'premarket' as const
+  if (minutes >= 9 * 60 + 30 && minutes < 16 * 60) return 'regular' as const
+  if (minutes >= 16 * 60 && minutes < 20 * 60) return 'after-hours' as const
+  return 'closed' as const
+}
+
+function formatMarketTimestamp(value: string | null | undefined, timeZone: string) {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date)
+}
+
+/**
+ * Yahoo marketState → session key.
+ * PREPRE overnight uses postMarket* (no overnightMarket* fields).
+ * Missing state → closed (do not invent pre/post from the clock for pricing).
+ */
+type YahooMarketSession = Exclude<YahooSessionKey, 'unknown'>
+
+function yahooMarketSession(yahoo?: YahooLiveQuote | null): YahooMarketSession {
+  const active = resolveYahooActiveSession(yahoo)
+  if (active && active.sessionKey !== 'unknown') return active.sessionKey
+  // No Yahoo marketState yet — keep closed; UI may still show At close prices
+  return 'closed'
+}
+
+/**
+ * Active price/label as Yahoo pairs marketState → fields.
+ * PREPRE → Overnight via postMarket*; POST → After-hours via postMarket*.
+ */
+function currentMarketQuoteValues(
+  yahoo?: YahooLiveQuote | null,
+) {
+  const active = resolveYahooActiveSession(yahoo)
+  if (active && active.price != null) {
+    return {
+      price: active.price,
+      percent: active.changePercent,
+      timestamp: active.time,
+      session: active.labelLong,
+      sessionKey: active.sessionKey as YahooMarketSession,
+      isLive: active.isExtendedOrLive,
+      provider: 'Yahoo' as const,
+    }
+  }
+
+  // State known but session bucket empty → fall through to regular close
+  const state = normalizeYahooMarketState(yahoo?.marketState)
+  if (yahoo?.regularMarketPrice != null) {
+    const sessionKey: YahooMarketSession =
+      state === 'PRE'
+        ? 'premarket'
+        : state === 'PREPRE'
+          ? 'overnight'
+          : state === 'POST' || state === 'POSTPOST'
+            ? 'after-hours'
+            : state === 'REGULAR'
+              ? 'regular'
+              : 'closed'
+    return {
+      price: yahoo.regularMarketPrice,
+      percent: yahoo.regularMarketChangePercent ?? null,
+      timestamp: yahoo.regularMarketTime ?? null,
+      session:
+        sessionKey === 'closed' || !state
+          ? 'At close'
+          : 'Regular · at close',
+      sessionKey,
+      isLive: false,
+      provider: 'Yahoo' as const,
+    }
+  }
+
+  return {
+    price: null,
+    percent: null,
+    timestamp: null,
+    session: 'Market closed',
+    sessionKey: 'closed' as const,
+    isLive: false,
+    provider: null,
+  }
+}
+
+function yahooQuoteUrl(ticker: string) {
+  return `https://finance.yahoo.com/quote/${encodeURIComponent(ticker.toUpperCase())}`
+}
+
+
+function formatProviderPrice(value?: number | null, currency = 'USD') {
+  if (value == null || !Number.isFinite(value)) return null
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: value < 1 ? 4 : 2,
+      maximumFractionDigits: value < 1 ? 4 : 2,
+    }).format(value)
+  } catch {
+    return `${value.toFixed(value < 1 ? 4 : 2)} ${currency}`.trim()
+  }
+}
+
+type MarketDataPillItem = {
+  label: string
+  price: number | null
+  percent: number | null
+  source: 'Yahoo'
+  href: string
+  sourceRefreshSeconds: number
+  lastRefreshAt?: string | null
+  nextRefreshAt?: string | null
+  updatedAt?: string | null
+  priceTimeLabel?: string | null
+  priceTimestamp?: string | null
+  stale?: boolean
+  note?: string | null
+  statusOnly?: boolean
+}
+
+function MarketDataPill({
+  items,
+  lastCheckedAt,
+  currency = 'USD',
+  stacked = false,
+}: {
+  items: MarketDataPillItem[]
+  lastCheckedAt: number | null
+  currency?: string
+  stacked?: boolean
+}) {
+  const [tooltipClock, setTooltipClock] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setTooltipClock(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  return (
+    <div
+      className={cn(
+        'flex overflow-hidden rounded-xl border border-border/70 bg-card shadow-sm',
+        stacked
+          ? 'min-w-[min(100%,13.5rem)] flex-col divide-y divide-border/70'
+          : 'flex-wrap items-stretch divide-x divide-border/70',
+      )}
+    >
+      {items.map((item) => {
+        const price = formatProviderPrice(item.price, currency)
+        const percent = formatLivePercent(item.percent)
+        const lastSourceRefreshAt = item.lastRefreshAt
+          ? Date.parse(item.lastRefreshAt)
+          : lastCheckedAt
+        const explicitNextRefreshAt = item.nextRefreshAt
+          ? Date.parse(item.nextRefreshAt)
+          : null
+        const nextSourceRefreshAt = explicitNextRefreshAt ||
+          (lastSourceRefreshAt
+            ? lastSourceRefreshAt + item.sourceRefreshSeconds * 1_000
+            : null)
+        const secondsToNext = nextSourceRefreshAt
+          ? Math.max(0, Math.ceil((nextSourceRefreshAt - tooltipClock) / 1_000))
+          : null
+        const fetchedTimeLabel = lastSourceRefreshAt
+          ? formatMarketTimestamp(
+              new Date(lastSourceRefreshAt).toISOString(),
+              'America/New_York',
+            )
+          : null
+        const isLiveSession =
+          /pre-market|after-hours|overnight|regular session/i.test(item.label) &&
+          !item.statusOnly
+        return (
+          <Tooltip key={`${item.label}-${item.source}`}>
+            <TooltipTrigger asChild>
+              <a
+                href={item.href}
+                target="_blank"
+                rel="noreferrer"
+                className={cn(
+                  'inline-flex min-w-0 flex-col items-start justify-center px-3 py-2 text-xs transition-colors hover:bg-muted/60',
+                  stacked ? 'w-full' : 'min-w-[8.5rem]',
+                  isLiveSession && 'bg-sky-500/[0.06]',
+                )}
+                aria-label={`Open ${item.source} source`}
+              >
+                <span className="inline-flex items-center gap-1.5 text-[10px] font-medium leading-none text-muted-foreground">
+                  {isLiveSession ? (
+                    <span className="relative flex size-1.5">
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-sky-400 opacity-60" />
+                      <span className="relative inline-flex size-1.5 rounded-full bg-sky-500" />
+                    </span>
+                  ) : null}
+                  {item.label}
+                </span>
+                <span className="mt-1.5 inline-flex items-baseline gap-1.5">
+                  {!item.statusOnly ? (
+                    <>
+                      <span className="font-mono text-[15px] font-semibold leading-none tracking-tight tabular-nums text-foreground">
+                        {price || '—'}
+                      </span>
+                      {percent ? (
+                        <span
+                          className={cn(
+                            'font-mono text-[13px] font-semibold leading-none tabular-nums',
+                            (item.percent ?? 0) < 0
+                              ? 'text-red-600 dark:text-red-400'
+                              : (item.percent ?? 0) > 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-muted-foreground',
+                          )}
+                        >
+                          {percent}
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <span className="text-[13px] font-medium text-muted-foreground">Closed</span>
+                  )}
+                </span>
+              </a>
+            </TooltipTrigger>
+            <TooltipContent
+              side="bottom"
+              sideOffset={8}
+              collisionPadding={12}
+              className="w-64 max-w-[calc(100vw-1.5rem)] flex-col items-stretch gap-0 overflow-hidden p-0 text-xs"
+            >
+              <div className="border-b border-background/15 px-3 py-2">
+                <p className="text-xs font-semibold">{item.label}</p>
+                <p className="mt-0.5 text-[10px] opacity-65">Yahoo Finance live quote</p>
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1.5 px-3 py-2.5 leading-snug">
+                <span className="opacity-65">Price as of</span>
+                <span className="text-right font-medium tabular-nums">
+                  {item.priceTimeLabel ? `${item.priceTimeLabel} ET` : 'Unavailable'}
+                </span>
+                <span className="opacity-65">Last fetched</span>
+                <span className="text-right font-medium tabular-nums">
+                  {fetchedTimeLabel ? `${fetchedTimeLabel} ET` : 'Waiting…'}
+                </span>
+                <span className="opacity-65">Next refresh</span>
+                <span className="text-right font-medium tabular-nums">
+                  {nextSourceRefreshAt ? `${secondsToNext}s` : 'Waiting…'}
+                </span>
+              </div>
+              {item.note ? (
+                <p className="border-t border-background/15 bg-amber-400/10 px-3.5 py-2 text-[11px] leading-snug text-amber-200">
+                  {item.note}
+                </p>
+              ) : null}
+              {item.stale ? (
+                <p className="border-t border-background/15 bg-amber-400/10 px-3.5 py-2 text-[11px] leading-snug text-amber-200">
+                  This is an older reported trade, not a reliable current-session price.
+                </p>
+              ) : null}
+            </TooltipContent>
+          </Tooltip>
+        )
+      })}
+    </div>
+  )
+}
+
 /** Absolute percent magnitude from strings like "+4.2%", "4%", "-5.1". */
 function absPercentFromChange(change?: string | null): number | null {
   if (change == null) return null
@@ -454,6 +832,174 @@ function getPremarketReason(event: PriceMovementEvent) {
     null
   if (Array.isArray(value)) return value.map((item) => item.trim()).filter(Boolean).join(' ')
   return value?.trim() || ''
+}
+
+/**
+ * Reason is narrative only. Session move % already shows on Close / Pre-market
+ * badges — strip residual leading "6.03%" / "6.03% at Close" from scrape text.
+ * Leave Gemini-structured reasons alone.
+ */
+function stripRedundantMovePercentFromReason(
+  summary: string,
+  event?: Pick<
+    PriceMovementEvent,
+    | 'price_change'
+    | 'momentum'
+    | 'premarket_change'
+    | 'pre_market_change'
+    | 'premarket_price_change'
+    | 'after_hours_change'
+    | 'gemini_formating'
+    | 'summary'
+  > | null,
+) {
+  const raw = String(summary || '')
+  if (!raw.trim()) return ''
+
+  // Gemini structured output — keep real newlines so Likely / Secondary stay
+  // on separate lines (do NOT collapse \n into spaces).
+  const isGeminiStructured =
+    Boolean(event?.gemini_formating) ||
+    /likely\s*driver\s*:/i.test(raw) ||
+    /secondary\s*driver\s*:/i.test(raw) ||
+    /move\s*classification\s*:/i.test(raw)
+
+  if (isGeminiStructured) {
+    return raw
+      .replace(/\r\n/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  }
+
+  let text = raw.replace(/\s+/g, ' ').trim()
+  if (!text) return text
+  // Headline-only Gemini line ($TICKER …) without labels — still intentional copy.
+  if (/^\$[A-Z]/.test(text)) {
+    return text
+  }
+
+  const normalizePct = (value?: string | null) => {
+    if (value == null || value === '') return null
+    const match = String(value)
+      .replace(/,/g, '')
+      .replace(/^−/, '-')
+      .match(/[+\-]?\d+(?:\.\d+)?/)
+    if (!match) return null
+    return match[0].replace(/^\+/, '').replace(/^-/, '')
+  }
+
+  const known = new Set(
+    [
+      event?.price_change,
+      event?.momentum,
+      event?.premarket_change,
+      event?.pre_market_change,
+      event?.premarket_price_change,
+      event?.after_hours_change,
+      event ? getPremarketChange(event as PriceMovementEvent) : null,
+    ]
+      .map((v) => normalizePct(v == null ? null : String(v)))
+      .filter(Boolean) as string[],
+  )
+
+  let guard = 0
+  while (guard < 6) {
+    guard += 1
+    const lead = text.match(
+      /^([+\-−]?\d+(?:\.\d+)?)%\s*(?:(?:at\s*)?close|after[\s-]?hours?|(?:in\s+)?pre[\s-]?market)?\s*[:·–—,|\-]*\s*/i,
+    )
+    if (!lead) break
+    const n = normalizePct(lead[1])
+    const hasSessionLabel = /(?:close|after|pre)/i.test(lead[0])
+    if (n && (known.has(n) || hasSessionLabel)) {
+      text = text.slice(lead[0].length).trim()
+      continue
+    }
+    if (n && known.size === 0 && hasSessionLabel) {
+      text = text.slice(lead[0].length).trim()
+      continue
+    }
+    // Bare leading % that equals the event move.
+    if (n && known.has(n)) {
+      text = text.slice(lead[0].length).trim()
+      continue
+    }
+    break
+  }
+
+  const onlyPct = text.match(/^([+\-−]?\d+(?:\.\d+)?)%\s*$/)
+  if (onlyPct) {
+    const n = normalizePct(onlyPct[1])
+    if (n && (known.has(n) || known.size === 0)) return ''
+  }
+
+  return text
+}
+
+/** Peel scrape chrome that often pollutes legacy Reason text in the DB. */
+function cleanLegacyScrapeReason(summary: string, event?: PriceMovementEvent | null) {
+  let text = stripRedundantMovePercentFromReason(summary, event)
+  if (!text) return text
+  // Leave Gemini structured copy alone (multi-line labels preserved above).
+  if (
+    event?.gemini_formating ||
+    /likely\s*driver\s*:/i.test(text) ||
+    /secondary\s*driver\s*:/i.test(text) ||
+    /move\s*classification\s*:/i.test(text)
+  ) {
+    return text
+  }
+  // Single-line cashtag headline without structure
+  if (/^\$[A-Z]/.test(text) && !text.includes('\n')) {
+    return text
+  }
+  for (let i = 0; i < 6; i += 1) {
+    const before = text
+    text = text
+      .replace(/^\d{4}-\d{2}-\d{2}\b[\s,·|:—-]*/i, '')
+      .replace(
+        /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,?\s*\d{4})?\b[\s,·|:—-]*/i,
+        '',
+      )
+      .replace(/^\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:ET|EST|EDT)?\b[\s,·|:—-]*/i, '')
+      .replace(/^\$[\d,]+(?:\.\d+)?\b[\s,·|:—-]*/i, '')
+      .replace(/^[+\-−]?\d+(?:\.\d+)?%\b[\s,·|:—-]*/i, '')
+      .replace(/^\d+\s+sources?\b[\s,·|:—-]*/i, '')
+      .replace(/\[[^\]]*\]\(https?:\/\/[^)\s]+\)/gi, ' ')
+      .replace(/https?:\/\/[^\s)\]>"']+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s,·|:—-]+|[\s,·|:—-]+$/g, '')
+      .trim()
+    if (text === before) break
+  }
+  // Drop trailing standalone publisher chips if they match extracted sources.
+  for (const source of event?.sources || []) {
+    const domain = String(source?.domain || '').replace(/^www\./i, '').trim()
+    const title = String(source?.title || '').trim()
+    if (domain) {
+      const re = new RegExp(
+        `(?:^|[\\s·|,;—-])(?:https?:\\/\\/)?(?:www\\.)?${domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s·|,;—-])`,
+        'gi',
+      )
+      text = text.replace(re, ' ').replace(/\s+/g, ' ').trim()
+    }
+    if (title && title.length >= 3 && title.length <= 40) {
+      const re = new RegExp(
+        `(?:^|[\\s·|,;—-])${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s·|,;—-])`,
+        'gi',
+      )
+      text = text.replace(re, ' ').replace(/\s+/g, ' ').trim()
+    }
+  }
+  return text.replace(/^[\s,·|:—-]+|[\s,·|:—-]+$/g, '').trim()
+}
+
+/** Display value for the Reason textarea (scrape-clean; Gemini untouched). */
+function reasonDisplayText(event: PriceMovementEvent, draft?: string | null) {
+  // Once the user edits, show their draft as-is (don't rewrite under them).
+  if (draft != null) return String(draft)
+  return cleanLegacyScrapeReason(String(event.summary || ''), event)
 }
 
 function formatDigestMomentum(raw?: string | null) {
@@ -589,37 +1135,51 @@ function measureWrappedText(
   maxWidth: number,
   maxLines: number,
 ): string[] {
-  const words = String(text || '')
-    .split(/\s+/)
-    .filter(Boolean)
+  // Honor hard newlines first (Gemini Likely / Secondary on separate lines),
+  // then word-wrap each paragraph.
+  const paragraphs = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
   const out: string[] = []
-  let line = ''
-  for (const word of words) {
-    const test = line ? `${line} ${word}` : word
-    if (ctx.measureText(test).width > maxWidth && line) {
-      out.push(line)
-      line = word
-      if (out.length >= maxLines) {
-        // Ellipsize the last committed line if more content remains
-        let last = out[out.length - 1]
-        while (last.length > 1 && ctx.measureText(`${last}…`).width > maxWidth) {
-          last = last.slice(0, -1)
+
+  const ellipsize = (s: string) => {
+    let last = s
+    while (last.length > 1 && ctx.measureText(`${last}…`).width > maxWidth) {
+      last = last.slice(0, -1)
+    }
+    return `${last}…`
+  }
+
+  for (let p = 0; p < paragraphs.length; p += 1) {
+    if (out.length >= maxLines) break
+    const para = paragraphs[p]
+    // Blank line between sections (e.g. after Likely driver)
+    if (!para.trim()) {
+      if (out.length > 0 && out[out.length - 1] !== '') {
+        out.push('')
+      }
+      continue
+    }
+    const words = para.split(/\s+/).filter(Boolean)
+    let line = ''
+    for (const word of words) {
+      const test = line ? `${line} ${word}` : word
+      if (ctx.measureText(test).width > maxWidth && line) {
+        out.push(line)
+        line = word
+        if (out.length >= maxLines) {
+          out[out.length - 1] = ellipsize(out[out.length - 1])
+          return out
         }
-        out[out.length - 1] = `${last}…`
+      } else {
+        line = test
+      }
+    }
+    if (line) {
+      if (out.length >= maxLines) {
+        out[out.length - 1] = ellipsize(out[out.length - 1])
         return out
       }
-    } else {
-      line = test
-    }
-  }
-  if (line) {
-    if (out.length >= maxLines) {
-      let last = out[out.length - 1]
-      while (last.length > 1 && ctx.measureText(`${last}…`).width > maxWidth) {
-        last = last.slice(0, -1)
-      }
-      out[out.length - 1] = `${last}…`
-    } else {
       out.push(line)
     }
   }
@@ -645,17 +1205,524 @@ function wrapCanvasText(
   return cy
 }
 
+/** One bar for the share-card line chart (regular session only). */
+type ShareChartBar = { t: number; close: number }
+
+/** Session cache so slider re-renders do not re-hit Yahoo every frame. */
+const shareChartSeriesCache = new Map<string, ShareChartBar[]>()
+
+function etPartsFromMs(ms: number): {
+  dateKey: string
+  hour: number
+  minute: number
+  minutesFromMidnight: number
+} {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date(ms))
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || '0'
+  let hour = Number(get('hour'))
+  if (hour === 24) hour = 0
+  const minute = Number(get('minute'))
+  const month = get('month')
+  const day = get('day')
+  const year = get('year')
+  return {
+    dateKey: `${year}-${month}-${day}`,
+    hour,
+    minute,
+    minutesFromMidnight: hour * 60 + minute,
+  }
+}
+
 /**
- * Build a simple mini sparkline path (synthetic, direction-aware).
- * Not real OHLC — visual only for the share card.
+ * Parse session heading timestamp → minutes from midnight ET.
+ * Accepts: "Today · 3:33 PM", "3:33PM", "15:33", "9:46 AM ET", event.time_label, etc.
  */
+function parseShareStampCutoffMinutes(
+  event: Pick<PriceMovementEvent, 'time_label'> | null | undefined,
+  stampText?: string | null,
+): number | null {
+  const candidates = [stampText, event?.time_label]
+  for (const raw of candidates) {
+    const s = String(raw || '').trim()
+    if (!s) continue
+    // 12h: 3:33 PM / 3:33PM / 12:04 am
+    const m12 = s.match(/(\d{1,2}):(\d{2})\s*([AaPp][Mm])/)
+    if (m12) {
+      let h = Number(m12[1])
+      const min = Number(m12[2])
+      if (!Number.isFinite(h) || !Number.isFinite(min)) continue
+      const ap = m12[3].toUpperCase()
+      if (ap === 'PM' && h < 12) h += 12
+      if (ap === 'AM' && h === 12) h = 0
+      return Math.min(24 * 60 - 1, Math.max(0, h * 60 + min))
+    }
+    // 24h: 15:33
+    const m24 = s.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/)
+    if (m24) {
+      const h = Number(m24[1])
+      const min = Number(m24[2])
+      if (!Number.isFinite(h) || !Number.isFinite(min)) continue
+      return h * 60 + min
+    }
+  }
+  return null
+}
+
+/** How many trading sessions to plot on the share chart (ending on the event day). */
+type ShareChartSessionDays = 1 | 2 | 3 | 5
+
+/** Yahoo bar size for share-card chart pricing. */
+type ShareChartInterval = '1m' | '2m' | '5m' | '15m' | '30m' | '60m' | '1h'
+
+const SHARE_CHART_INTERVALS: Array<{ id: ShareChartInterval; label: string }> = [
+  { id: '1m', label: '1m' },
+  { id: '2m', label: '2m' },
+  { id: '5m', label: '5m' },
+  { id: '15m', label: '15m' },
+  { id: '30m', label: '30m' },
+  { id: '60m', label: '1h' },
+  { id: '1h', label: '1h·alt' },
+]
+
+function clampShareChartSessionDays(raw: unknown): ShareChartSessionDays {
+  const n = Math.round(Number(raw))
+  if (n === 1 || n === 2 || n === 3 || n === 5) return n
+  return 2
+}
+
+function clampShareChartInterval(raw: unknown): ShareChartInterval {
+  const s = String(raw || '')
+  if (
+    s === '1m' ||
+    s === '2m' ||
+    s === '5m' ||
+    s === '15m' ||
+    s === '30m' ||
+    s === '60m' ||
+    s === '1h'
+  ) {
+    return s
+  }
+  return '1m'
+}
+
+/**
+ * Day label under multi-day charts:
+ * - today-long / today-short = Today + calendar dates
+ * - date-long / date-short = always calendar dates
+ * - relative / relative-short = Today · Yesterday · Back / 2d back…
+ */
+type ShareChartDayLabelMode =
+  | 'today-short'
+  | 'today-long'
+  | 'date-short'
+  | 'date-long'
+  | 'relative'
+  | 'relative-short'
+
+function clampShareChartDayLabelMode(raw: unknown): ShareChartDayLabelMode {
+  const s = String(raw || '')
+  if (
+    s === 'today-short' ||
+    s === 'today-long' ||
+    s === 'date-short' ||
+    s === 'date-long' ||
+    s === 'relative' ||
+    s === 'relative-short'
+  ) {
+    return s
+  }
+  return 'today-long'
+}
+
+function formatShareChartCalendarDay(
+  dateKey: string,
+  longMonth: boolean,
+): string {
+  const m = String(dateKey).match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!m) return dateKey
+  const day = Number(m[3])
+  const month = Number(m[2])
+  const monthsShort = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ]
+  const monthsLong = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ]
+  const months = longMonth ? monthsLong : monthsShort
+  return `${day} ${months[Math.max(0, month - 1)] || ''}`
+}
+
+/**
+ * @param daysFromEnd 0 = last (event) session on the chart, 1 = previous, …
+ */
+function formatShareChartDayLabel(
+  dateKey: string,
+  todayKey: string,
+  mode: ShareChartDayLabelMode = 'today-long',
+  daysFromEnd = 0,
+): string {
+  // Relative: Today · Yesterday · Back · 2 back · …
+  if (mode === 'relative' || mode === 'relative-short') {
+    const n = Math.max(0, Math.round(Number(daysFromEnd) || 0))
+    const short = mode === 'relative-short'
+    if (n === 0) return 'Today'
+    if (n === 1) return short ? 'Yday' : 'Yesterday'
+    if (n === 2) return 'Back'
+    return short ? `${n} back` : `${n} days back`
+  }
+
+  const useTodayWord = mode === 'today-short' || mode === 'today-long'
+  const longMonth = mode === 'today-long' || mode === 'date-long'
+  if (useTodayWord && dateKey === todayKey) return 'Today'
+  return formatShareChartCalendarDay(dateKey, longMonth)
+}
+
+/**
+ * Zoom the chart from the left: end stays at the event stamp / last bar,
+ * start moves forward by `startPct` of session-compressed span (0–90).
+ */
+function trimShareChartSeriesByStartPct(
+  series: ShareChartBar[],
+  startPctRaw: unknown,
+): ShareChartBar[] {
+  if (!series || series.length < 2) return series || []
+  const startPct = Math.min(90, Math.max(0, Math.round(Number(startPctRaw) || 0)))
+  if (startPct <= 0) return series
+  const timeline = buildShareSessionTimeline(series)
+  const cut = timeline.p0 + (timeline.span * startPct) / 100
+  const trimmed = series.filter((b) => timeline.posAt(b.t) >= cut - 1e-6)
+  if (trimmed.length >= 2) return trimmed
+  // Keep last two bars so the line still draws
+  return series.slice(-2)
+}
+
+/**
+ * Real Yahoo intraday closes for the share card.
+ * Plots N trading sessions (1 / 2 / 3 / 5), ending on the event day:
+ *  - Earlier days: full regular hours 9:30–16:00 ET
+ *  - Last day: 9:30 → stamp time (or 16:00)
+ * Continuous chronological line; x-axis compresses overnight gaps.
+ */
+async function loadShareRegularSessionSeries(
+  ticker: string,
+  eventDate?: string | null,
+  opts?: {
+    /** Session heading stamp, e.g. “Today · 3:33 PM” */
+    stampText?: string | null
+    timeLabel?: string | null
+    /** Trading days to include (1, 2, 3, or 5). Default 2. */
+    sessionDays?: ShareChartSessionDays
+    /** Bar size for Yahoo pricing series. */
+    interval?: ShareChartInterval
+  },
+): Promise<ShareChartBar[]> {
+  const symbol = String(ticker || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9.^_=\-]/g, '')
+  if (!symbol) return []
+
+  const dayKey = String(eventDate || '').slice(0, 10) || etDateKey()
+  const sessionDays = clampShareChartSessionDays(opts?.sessionDays ?? 2)
+  const interval = clampShareChartInterval(opts?.interval ?? '1m')
+  const cutoffFromStamp = parseShareStampCutoffMinutes(
+    { time_label: opts?.timeLabel ?? null },
+    opts?.stampText,
+  )
+  const todayKey = etDateKey()
+  const isToday = dayKey === todayKey
+  const REG_OPEN = 9 * 60 + 30 // 9:30 ET
+  const REG_CLOSE = 16 * 60 // 16:00 ET
+
+  // End of chart window on the event day: stamp time → else now (today) → else regular close
+  let cutoffMinutes: number
+  if (cutoffFromStamp != null) {
+    cutoffMinutes = cutoffFromStamp
+  } else if (isToday) {
+    const nowEt = etPartsFromMs(Date.now())
+    cutoffMinutes = nowEt.minutesFromMidnight
+  } else {
+    cutoffMinutes = REG_CLOSE
+  }
+  // Keep within regular session bounds
+  cutoffMinutes = Math.min(REG_CLOSE, Math.max(REG_OPEN, cutoffMinutes))
+
+  // v2: server now allows 1m/2m on 5d (old cache stored sparse 15m under 1m keys)
+  const cacheKey = `v2|${symbol}|${dayKey}|to-${cutoffMinutes}|${sessionDays}d|${interval}`
+  if (shareChartSeriesCache.has(cacheKey)) {
+    return shareChartSeriesCache.get(cacheKey) || []
+  }
+
+  // 5d lookback covers multi-session views; interval is user-selectable.
+  const range = '5d'
+
+  try {
+    const body = await fetchYahooChart(symbol, range, interval)
+    const chart = body?.chart as {
+      quotes?: Array<Record<string, unknown>>
+      meta?: Record<string, unknown>
+      chart?: { result?: Array<{ meta?: Record<string, unknown> }> }
+    } | null
+    const quotes = Array.isArray(chart?.quotes) ? chart.quotes : []
+
+    const parseClose = (row: Record<string, unknown>): number | null => {
+      const closeRaw = row.close ?? row.adjclose
+      let close: number
+      if (typeof closeRaw === 'number') close = closeRaw
+      else if (closeRaw && typeof closeRaw === 'object' && 'raw' in (closeRaw as object)) {
+        close = Number((closeRaw as { raw: unknown }).raw)
+      } else close = Number(closeRaw)
+      return Number.isFinite(close) ? close : null
+    }
+
+    // Group regular-session bars by ET calendar day
+    const byDay = new Map<string, ShareChartBar[]>()
+    for (const row of quotes) {
+      const rawDate = row.date
+      if (!rawDate) continue
+      const t = new Date(String(rawDate)).getTime()
+      if (!Number.isFinite(t)) continue
+      const close = parseClose(row)
+      if (close == null) continue
+
+      const et = etPartsFromMs(t)
+      if (et.minutesFromMidnight < REG_OPEN) continue
+      if (et.minutesFromMidnight > REG_CLOSE) continue
+
+      const list = byDay.get(et.dateKey) || []
+      list.push({ t, close })
+      byDay.set(et.dateKey, list)
+    }
+
+    // Sort bars within each day + de-dupe timestamps
+    for (const [key, list] of byDay) {
+      list.sort((a, b) => a.t - b.t)
+      const deduped: ShareChartBar[] = []
+      for (const b of list) {
+        if (deduped.length && deduped[deduped.length - 1].t === b.t) {
+          deduped[deduped.length - 1] = b
+        } else {
+          deduped.push(b)
+        }
+      }
+      byDay.set(key, deduped)
+    }
+
+    // Trading days ending on / before event day
+    const allDays = [...byDay.keys()].filter((d) => d <= dayKey).sort()
+    let selectedDays = allDays.slice(-sessionDays)
+    if (selectedDays.length === 0 && dayKey) selectedDays = [dayKey]
+
+    const merged: ShareChartBar[] = []
+    const lastDay = selectedDays[selectedDays.length - 1] || dayKey
+
+    for (const d of selectedDays) {
+      const dayBars = byDay.get(d) || []
+      for (const b of dayBars) {
+        const et = etPartsFromMs(b.t)
+        if (et.minutesFromMidnight < REG_OPEN) continue
+        if (d === lastDay || d === dayKey) {
+          // Event / last day: only through stamp cutoff
+          if (et.minutesFromMidnight > cutoffMinutes) continue
+        } else {
+          // Full prior sessions
+          if (et.minutesFromMidnight > REG_CLOSE) continue
+        }
+        merged.push(b)
+      }
+    }
+
+    merged.sort((a, b) => a.t - b.t)
+    const out: ShareChartBar[] = []
+    for (const b of merged) {
+      if (out.length && out[out.length - 1].t === b.t) {
+        out[out.length - 1] = b
+      } else {
+        out.push(b)
+      }
+    }
+
+    shareChartSeriesCache.set(cacheKey, out)
+    return out
+  } catch (err) {
+    console.warn('[share] Yahoo chart fetch failed', symbol, err)
+    shareChartSeriesCache.set(cacheKey, [])
+    return []
+  }
+}
+
+/** Regular session length in minutes (9:30–16:00 ET). */
+const SHARE_SESSION_MINS = 16 * 60 - (9 * 60 + 30) // 390
+
+/**
+ * Map wall-clock timestamps onto continuous *market* time so overnight gaps
+ * don't stretch the chart into a long flat diagonal (which kills waviness).
+ * Day0 9:30 → 0, Day0 16:00 → 390, Day1 9:30 → 390, Day1 16:00 → 780, …
+ */
+function buildShareSessionTimeline(series: ShareChartBar[]): {
+  posAt: (t: number) => number
+  p0: number
+  p1: number
+  span: number
+  days: string[]
+} {
+  const REG_OPEN = 9 * 60 + 30
+  const REG_CLOSE = 16 * 60
+  const days: string[] = []
+  for (const b of series) {
+    const d = etPartsFromMs(b.t).dateKey
+    if (!days.includes(d)) days.push(d)
+  }
+  days.sort()
+  const posAt = (t: number) => {
+    const et = etPartsFromMs(t)
+    let dayIdx = days.indexOf(et.dateKey)
+    if (dayIdx < 0) {
+      if (!days.length) return 0
+      dayIdx = et.dateKey < days[0] ? 0 : days.length - 1
+    }
+    const m =
+      Math.min(REG_CLOSE, Math.max(REG_OPEN, et.minutesFromMidnight)) - REG_OPEN
+    return dayIdx * SHARE_SESSION_MINS + m
+  }
+  const positions = series.map((b) => posAt(b.t))
+  const p0 = Math.min(...positions)
+  const p1 = Math.max(...positions)
+  return { posAt, p0, p1, span: Math.max(1e-6, p1 - p0), days }
+}
+
+/** Map real closes into canvas points — x uses session-compressed time (no overnight stretch). */
+function buildChartPointsFromSeries(
+  width: number,
+  height: number,
+  series: ShareChartBar[],
+): Array<{ x: number; y: number; t: number; close: number }> {
+  if (!series.length || width <= 0 || height <= 0) return []
+  const padY = Math.max(4, height * 0.08)
+  const plotH = Math.max(8, height - padY * 2)
+  let min = Infinity
+  let max = -Infinity
+  for (const b of series) {
+    if (b.close < min) min = b.close
+    if (b.close > max) max = b.close
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return []
+  if (max <= min) {
+    max = min + 1
+    min = min - 1
+  }
+  // Slight vertical pad so peaks aren't clipped
+  const range = max - min
+  min -= range * 0.06
+  max += range * 0.06
+
+  const timeline = buildShareSessionTimeline(series)
+
+  // Keep almost every bar — 1m multi-day can be ~2k points; canvas handles it.
+  // Downsample only past 2500 so 1m still looks dense (not a 15m-looking polyline).
+  const maxPts = 2500
+  const step = series.length > maxPts ? Math.ceil(series.length / maxPts) : 1
+  const sampled: ShareChartBar[] = []
+  for (let i = 0; i < series.length; i += step) sampled.push(series[i])
+  const last = series[series.length - 1]
+  if (sampled[sampled.length - 1]?.t !== last.t) sampled.push(last)
+
+  return sampled.map((b) => {
+    const pos = timeline.posAt(b.t)
+    const x = ((pos - timeline.p0) / timeline.span) * width
+    const y = padY + (1 - (b.close - min) / (max - min)) * plotH
+    return { x, y, t: b.t, close: b.close }
+  })
+}
+
+/** Compact $ label for chart price markers. */
+function formatShareChartPrice(n: number): string {
+  if (!Number.isFinite(n)) return ''
+  const abs = Math.abs(n)
+  if (abs >= 10000) return `$${Math.round(n).toLocaleString('en-US')}`
+  if (abs >= 1000) return `$${n.toFixed(1)}`
+  if (abs >= 100) return `$${n.toFixed(2)}`
+  if (abs >= 1) return `$${n.toFixed(2)}`
+  return `$${n.toFixed(3)}`
+}
+
+/** % change from series open (first close). */
+function formatShareChartPercent(close: number, firstClose: number): string {
+  if (!Number.isFinite(close) || !Number.isFinite(firstClose) || firstClose === 0) return ''
+  const pct = ((close - firstClose) / Math.abs(firstClose)) * 100
+  const abs = Math.abs(pct)
+  const body = abs >= 10 ? pct.toFixed(1) : pct.toFixed(2)
+  if (pct > 0.005) return `+${body}%`
+  if (pct < -0.005) return `${body}%` // already has minus
+  return `0%`
+}
+
+/** Split custom chart label textarea (one label per line). */
+function splitShareChartCustomLines(raw: string | undefined | null): string[] {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+type ShareChartPointLabelMode = 'off' | 'price' | 'percent' | 'both'
+
+/**
+ * Pick `count` evenly spaced indices along a series (includes start + end).
+ * count clamped 3…8.
+ */
+function pickEvenSeriesIndices(length: number, count: number): number[] {
+  if (length <= 0) return []
+  if (length === 1) return [0]
+  const n = Math.min(8, Math.max(3, Math.round(count)))
+  if (n >= length) {
+    return Array.from({ length }, (_, i) => i)
+  }
+  const out: number[] = []
+  for (let i = 0; i < n; i += 1) {
+    out.push(Math.round((i / (n - 1)) * (length - 1)))
+  }
+  // Dedupe if rounding collided
+  return [...new Set(out)].sort((a, b) => a - b)
+}
+
+/** Fallback synthetic path when Yahoo is offline. */
 function buildMiniChartPoints(
   width: number,
   height: number,
   isDown: boolean,
   seed: string,
 ): Array<{ x: number; y: number }> {
-  // Deterministic wobble from ticker string
   let h = 0
   for (let i = 0; i < seed.length; i += 1) h = (h * 31 + seed.charCodeAt(i)) >>> 0
   const rand = () => {
@@ -668,11 +1735,9 @@ function buildMiniChartPoints(
   let v = 0.45 + rand() * 0.15
   for (let i = 0; i < n; i += 1) {
     const t = i / (n - 1)
-    // Drift up or down overall
     const drift = isDown ? -0.35 * t : 0.35 * t
     const noise = (rand() - 0.5) * 0.18
     v = Math.max(0.08, Math.min(0.92, v + noise + drift * 0.08))
-    // Final push toward end direction
     if (i > n * 0.7) {
       v += isDown ? -0.04 : 0.04
       v = Math.max(0.06, Math.min(0.94, v))
@@ -728,11 +1793,26 @@ function loadImageFromUrl(url: string): Promise<HTMLImageElement | null> {
   if (!url || typeof Image === 'undefined') return Promise.resolve(null)
   return new Promise((resolve) => {
     const img = new Image()
-    // data: URLs don't need CORS; proxy is same-origin
-    if (!url.startsWith('data:')) {
-      /* same-origin proxy or data url */
+    // data: URLs don't need CORS; remote may need anonymous (can fail — ok)
+    if (!url.startsWith('data:') && !url.startsWith('blob:')) {
+      try {
+        img.crossOrigin = 'anonymous'
+      } catch {
+        /* ignore */
+      }
     }
-    img.onload = () => resolve(img)
+    img.decoding = 'async'
+    img.onload = () => {
+      // Ensure naturalWidth is ready for canvas cover-fit draws
+      if (typeof img.decode === 'function') {
+        void img
+          .decode()
+          .then(() => resolve(img))
+          .catch(() => resolve(img))
+      } else {
+        resolve(img)
+      }
+    }
     img.onerror = () => resolve(null)
     img.src = url
   })
@@ -752,19 +1832,144 @@ async function loadShareLogo(
   return loadImageFromUrl(`${url}?v=2`)
 }
 
-/** Resize pasted image → compact data URL for localStorage. */
+/** Resize pasted image → compact data URL for localStorage / share card. */
 async function blobToLogoDataUrl(blob: Blob, maxPx = 160): Promise<string> {
-  const bitmap = await createImageBitmap(blob)
-  const scale = Math.min(1, maxPx / Math.max(bitmap.width, bitmap.height))
-  const w = Math.max(1, Math.round(bitmap.width * scale))
-  const h = Math.max(1, Math.round(bitmap.height * scale))
+  // Prefer createImageBitmap; fall back to <img> + canvas for picky clipboard types.
+  try {
+    if (typeof createImageBitmap === 'function') {
+      const bitmap = await createImageBitmap(blob)
+      const scale = Math.min(1, maxPx / Math.max(bitmap.width, bitmap.height))
+      const w = Math.max(1, Math.round(bitmap.width * scale))
+      const h = Math.max(1, Math.round(bitmap.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('Canvas unavailable')
+      ctx.drawImage(bitmap, 0, 0, w, h)
+      bitmap.close()
+      return canvas.toDataURL('image/png')
+    }
+  } catch {
+    /* fall through */
+  }
+  const objectUrl = URL.createObjectURL(blob)
+  try {
+    const img = await loadImageFromUrl(objectUrl)
+    if (!img) throw new Error('Could not decode image')
+    const scale = Math.min(1, maxPx / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
+    const w = Math.max(1, Math.round((img.naturalWidth || 1) * scale))
+    const h = Math.max(1, Math.round((img.naturalHeight || 1) * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('Canvas unavailable')
+    ctx.drawImage(img, 0, 0, w, h)
+    return canvas.toDataURL('image/png')
+  } finally {
+    try {
+      URL.revokeObjectURL(objectUrl)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Extract image blob or image URL from a paste event (Google Images, Finder, etc.). */
+function extractImageFromClipboard(data: DataTransfer | null): {
+  blob: Blob | null
+  url: string | null
+} {
+  if (!data) return { blob: null, url: null }
+
+  // 1) Real image items
+  const items = data.items ? Array.from(data.items) : []
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile()
+      if (file) return { blob: file, url: null }
+    }
+  }
+
+  // 2) File list (some browsers)
+  const files = data.files ? Array.from(data.files) : []
+  for (const file of files) {
+    if (file.type.startsWith('image/')) return { blob: file, url: null }
+  }
+
+  // 3) HTML with <img src="..."> (Google Images “copy image” sometimes)
+  const html = data.getData('text/html') || ''
+  if (html) {
+    const srcMatch =
+      html.match(/<img[^>]+src=["']([^"']+)["']/i) ||
+      html.match(/src=["'](data:image\/[^"']+)["']/i) ||
+      html.match(/src=["'](https?:\/\/[^"']+)["']/i)
+    if (srcMatch?.[1]) {
+      const src = srcMatch[1].replace(/&amp;/g, '&')
+      if (src.startsWith('data:image/') || /^https?:\/\//i.test(src)) {
+        return { blob: null, url: src }
+      }
+    }
+  }
+
+  // 4) Plain text URL or data URL
+  const text = (data.getData('text/plain') || data.getData('text') || '').trim()
+  if (text.startsWith('data:image/') || /^https?:\/\/.+\.(png|jpe?g|webp|gif|avif)(\?|$)/i.test(text)) {
+    return { blob: null, url: text }
+  }
+  if (/^https?:\/\//i.test(text) && /(?:ggpht|gstatic|googleusercontent|imgur|unsplash|cdn)/i.test(text)) {
+    return { blob: null, url: text }
+  }
+
+  return { blob: null, url: null }
+}
+
+async function dataUrlOrBlobFromPasteSource(source: {
+  blob: Blob | null
+  url: string | null
+}, maxPx = 900): Promise<string> {
+  if (source.blob) return blobToLogoDataUrl(source.blob, maxPx)
+  const url = source.url
+  if (!url) throw new Error('No image in clipboard')
+  if (url.startsWith('data:image/')) {
+    // Already a data URL — optionally re-encode via image load for consistency
+    const img = await loadImageFromUrl(url)
+    if (!img) return url
+    const scale = Math.min(1, maxPx / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
+    const w = Math.max(1, Math.round((img.naturalWidth || 1) * scale))
+    const h = Math.max(1, Math.round((img.naturalHeight || 1) * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return url
+    ctx.drawImage(img, 0, 0, w, h)
+    return canvas.toDataURL('image/png')
+  }
+  // Remote URL: try fetch, then Image element
+  try {
+    const res = await fetch(url, { mode: 'cors' })
+    if (res.ok) {
+      const blob = await res.blob()
+      if (blob.type.startsWith('image/') || blob.size > 0) {
+        return blobToLogoDataUrl(blob, maxPx)
+      }
+    }
+  } catch {
+    /* CORS — fall through */
+  }
+  const img = await loadImageFromUrl(url)
+  if (!img) throw new Error('Could not load image URL (CORS). Copy the image itself, not the link.')
+  const scale = Math.min(1, maxPx / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
+  const w = Math.max(1, Math.round((img.naturalWidth || 1) * scale))
+  const h = Math.max(1, Math.round((img.naturalHeight || 1) * scale))
   const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Canvas unavailable')
-  ctx.drawImage(bitmap, 0, 0, w, h)
-  bitmap.close()
+  ctx.drawImage(img, 0, 0, w, h)
   return canvas.toDataURL('image/png')
 }
 
@@ -887,11 +2092,893 @@ function drawCircularLogo(
   ctx.stroke()
 }
 
-/** Positive % / up-chart — dark green that reads clean on brand yellow (not washed emerald). */
-const SHARE_UP_GREEN = '#15803d'
+/** Logo load fail → circular monogram (AppFont-Bold · ~0.36 × logo size). */
+function drawLogoMonogram(
+  ctx: CanvasRenderingContext2D,
+  letter: string,
+  cx: number,
+  cy: number,
+  diameter: number,
+) {
+  const r = diameter / 2
+  const ch = String(letter || '?').trim().charAt(0).toUpperCase() || '?'
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.closePath()
+  ctx.fillStyle = 'rgba(17,17,17,0.08)'
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)'
+  ctx.lineWidth = 2
+  ctx.stroke()
+  const fontPx = Math.max(12, Math.round(diameter * 0.36))
+  ctx.font = shareFont(700, fontPx) // Bold ≈ AppFont-Bold
+  ctx.fillStyle = SHARE_INK
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(ch, cx, cy + 1)
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'alphabetic'
+  ctx.restore()
+}
+
+/** Clamp bipolar photo axis (−100 … +100). */
+function clampShareBgAxis(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(100, Math.max(-100, Math.round(n)))
+}
+
+/**
+ * Full-card photo backdrop (user-pasted image).
+ * Cover-fit + optional blur, then bipolar Black / White axes (−100 … +100).
+ *
+ * Black:  −100 = lift shadows (less black) · 0 = neutral · +100 = heavy black
+ * White:  −100 = crush highlights · 0 = neutral · +100 = bright / white wash
+ * blurPx: 0 = crisp/sharp · higher = soft / faded glass look
+ */
+function drawShareBlurredPhotoBackground(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  w: number,
+  h: number,
+  {
+    blurPx = 0,
+    imageOpacity = 1,
+    /** −100 … +100 black axis */
+    blackAxis = 0,
+    /** −100 … +100 white axis */
+    whiteAxis = 0,
+  }: {
+    blurPx?: number
+    /** 0–1 opacity of the background image itself */
+    imageOpacity?: number
+    blackAxis?: number
+    whiteAxis?: number
+  } = {},
+) {
+  if (w <= 0 || h <= 0) return
+  const iw = img.naturalWidth || img.width
+  const ih = img.naturalHeight || img.height
+  if (!iw || !ih) return
+
+  const blur = Math.max(0, Math.min(80, blurPx))
+  const imgA = Math.min(1, Math.max(0, imageOpacity))
+  const black = clampShareBgAxis(blackAxis, 0)
+  const white = clampShareBgAxis(whiteAxis, 0)
+  // Oversample so blur doesn’t reveal empty edges (no pad when crisp)
+  const pad = blur > 0 ? Math.ceil(blur * 2.5) : 0
+  const scale = Math.max((w + pad * 2) / iw, (h + pad * 2) / ih)
+  const dw = iw * scale
+  const dh = ih * scale
+  const dx = (w - dw) / 2
+  const dy = (h - dh) / 2
+
+  ctx.save()
+  ctx.beginPath()
+  ctx.rect(0, 0, w, h)
+  ctx.clip()
+
+  // Image brightness nudged slightly by axes so −/+ feels natural
+  // black+ darkens · black− lightens · white+ brightens · white− dims
+  const brightMul =
+    1 -
+    (black > 0 ? black / 100 : 0) * 0.22 +
+    (black < 0 ? Math.abs(black) / 100 : 0) * 0.18 +
+    (white > 0 ? white / 100 : 0) * 0.2 -
+    (white < 0 ? Math.abs(white) / 100 : 0) * 0.16
+  const brightness = Math.min(1.45, Math.max(0.55, brightMul))
+  // Crisp (low blur): full/punchy color · heavy blur: slight desat for “glass”
+  const saturate =
+    blur <= 2 ? 1.06 : blur < 18 ? 1.0 : 0.92
+  const contrast = blur <= 2 ? 1.04 : 1.0
+
+  if (imgA > 0.01) {
+    ctx.globalAlpha = imgA
+    if ('filter' in ctx) {
+      const parts = [
+        blur > 0 ? `blur(${blur}px)` : '',
+        `brightness(${brightness.toFixed(3)})`,
+        `saturate(${saturate.toFixed(3)})`,
+        contrast !== 1 ? `contrast(${contrast.toFixed(3)})` : '',
+      ].filter(Boolean)
+      ctx.filter = parts.join(' ')
+    }
+    // Prefer high-quality scaling for sharp exports
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(img, dx, dy, dw, dh)
+    ctx.filter = 'none'
+    ctx.globalAlpha = 1
+  }
+
+  // —— Black axis overlays ——
+  if (black > 0) {
+    const t = black / 100
+    // Solid soft-black veil
+    ctx.fillStyle = `rgba(12,12,14,${(0.88 * t).toFixed(3)})`
+    ctx.fillRect(0, 0, w, h)
+    // Edge vignette for depth (scales with +black)
+    const cx = w * 0.5
+    const cy = h * 0.42
+    const rMax = Math.hypot(w, h) * 0.62
+    const rad = ctx.createRadialGradient(cx, cy, rMax * 0.15, cx, cy, rMax)
+    rad.addColorStop(0, `rgba(0,0,0,${(0.06 * t).toFixed(3)})`)
+    rad.addColorStop(0.55, `rgba(0,0,0,${(0.28 * t).toFixed(3)})`)
+    rad.addColorStop(1, `rgba(0,0,0,${(0.55 * t).toFixed(3)})`)
+    ctx.fillStyle = rad
+    ctx.fillRect(0, 0, w, h)
+  } else if (black < 0) {
+    // Lift blacks / open shadows — soft light veil
+    const t = Math.abs(black) / 100
+    ctx.fillStyle = `rgba(255,255,255,${(0.28 * t).toFixed(3)})`
+    ctx.fillRect(0, 0, w, h)
+  }
+
+  // —— White axis overlays ——
+  if (white > 0) {
+    const t = white / 100
+    // Bright / white wash
+    ctx.fillStyle = `rgba(255,255,255,${(0.42 * t).toFixed(3)})`
+    ctx.fillRect(0, 0, w, h)
+  } else if (white < 0) {
+    // Crush highlights — pull whites down toward grey/black
+    const t = Math.abs(white) / 100
+    ctx.fillStyle = `rgba(0,0,0,${(0.38 * t).toFixed(3)})`
+    ctx.fillRect(0, 0, w, h)
+  }
+
+  ctx.restore()
+}
+
+/**
+ * Hero photo in place of the chart slot: cover-fit, optional radius, border,
+ * and an inset frosted edge so it sits cleanly on the card.
+ */
+function drawShareHeroPhoto(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  {
+    radius = 28,
+    borderWidth = 3,
+    borderColor = 'rgba(255,255,255,0.55)',
+    frost = 0.45,
+  }: {
+    radius?: number
+    borderWidth?: number
+    borderColor?: string
+    /** 0–1 strength of inset frosted rim */
+    frost?: number
+  } = {},
+) {
+  if (w <= 0 || h <= 0) return
+  const iw = img.naturalWidth || img.width
+  const ih = img.naturalHeight || img.height
+  if (!iw || !ih) return
+  const r = Math.max(0, Math.min(radius, w / 2, h / 2))
+  const bw = Math.max(0, borderWidth)
+  const frostA = Math.min(1, Math.max(0, frost))
+
+  const scale = Math.max(w / iw, h / ih)
+  const dw = iw * scale
+  const dh = ih * scale
+  const dx = x + (w - dw) / 2
+  const dy = y + (h - dh) / 2
+
+  // Soft drop shadow under the photo frame
+  ctx.save()
+  ctx.shadowColor = 'rgba(0,0,0,0.18)'
+  ctx.shadowBlur = 28
+  ctx.shadowOffsetY = 10
+  roundRect(ctx, x, y, w, h, r)
+  ctx.fillStyle = '#000'
+  ctx.fill()
+  ctx.restore()
+
+  // Photo
+  ctx.save()
+  roundRect(ctx, x, y, w, h, r)
+  ctx.clip()
+  ctx.drawImage(img, dx, dy, dw, dh)
+
+  // Inset frosted rim (light edge + soft dark inner fade)
+  if (frostA > 0.01) {
+    const rim = Math.max(10, Math.min(w, h) * 0.08)
+    const g = ctx.createLinearGradient(x, y, x, y + rim)
+    g.addColorStop(0, `rgba(255,255,255,${0.35 * frostA})`)
+    g.addColorStop(1, 'rgba(255,255,255,0)')
+    ctx.fillStyle = g
+    ctx.fillRect(x, y, w, rim)
+
+    const g2 = ctx.createLinearGradient(x, y + h - rim, x, y + h)
+    g2.addColorStop(0, 'rgba(0,0,0,0)')
+    g2.addColorStop(1, `rgba(0,0,0,${0.22 * frostA})`)
+    ctx.fillStyle = g2
+    ctx.fillRect(x, y + h - rim, w, rim)
+
+    // Side vignette for “integrated” feel
+    const gx = ctx.createLinearGradient(x, y, x + rim, y)
+    gx.addColorStop(0, `rgba(0,0,0,${0.12 * frostA})`)
+    gx.addColorStop(1, 'rgba(0,0,0,0)')
+    ctx.fillStyle = gx
+    ctx.fillRect(x, y, rim, h)
+    const gx2 = ctx.createLinearGradient(x + w - rim, y, x + w, y)
+    gx2.addColorStop(0, 'rgba(0,0,0,0)')
+    gx2.addColorStop(1, `rgba(0,0,0,${0.12 * frostA})`)
+    ctx.fillStyle = gx2
+    ctx.fillRect(x + w - rim, y, rim, h)
+  }
+  ctx.restore()
+
+  // Border
+  if (bw > 0) {
+    ctx.save()
+    roundRect(ctx, x + bw / 2, y + bw / 2, w - bw, h - bw, Math.max(0, r - bw / 2))
+    ctx.strokeStyle = borderColor
+    ctx.lineWidth = bw
+    ctx.stroke()
+    // Second hairline for frosted glass edge
+    roundRect(ctx, x + bw + 0.5, y + bw + 0.5, w - (bw + 0.5) * 2, h - (bw + 0.5) * 2, Math.max(0, r - bw - 1))
+    ctx.strokeStyle = `rgba(255,255,255,${0.22 * frostA})`
+    ctx.lineWidth = 1
+    ctx.stroke()
+    ctx.restore()
+  }
+}
+
+/** Design system greens/reds (mobile share card) — default middle shades. */
+const SHARE_UP_GREEN = '#228B22'
 const SHARE_DOWN_RED = '#DC2626'
+const SHARE_INK = '#111111'
+const SHARE_INK_MUTED = 'rgba(17,17,17,0.62)'
+const SHARE_INK_SOFT = 'rgba(17,17,17,0.82)'
+const SHARE_BRAND_LIGHT = 'rgba(255,255,255,0.92)'
+
+type ShareMoveShadeFamily = 'green' | 'red' | 'white'
+
+/** Positive move shades (chart line + %) — greens + white variety. Ids 0–4 keep legacy prefs. */
+const SHARE_UP_GREEN_SHADES: Array<{
+  id: number
+  label: string
+  hex: string
+  family: ShareMoveShadeFamily
+}> = [
+  // —— Greens (0–4 legacy) ——
+  { id: 0, label: 'Forest', hex: '#14532D', family: 'green' },
+  { id: 1, label: 'Deep', hex: '#166534', family: 'green' },
+  { id: 2, label: 'Classic', hex: '#228B22', family: 'green' }, // default design token
+  { id: 3, label: 'Bright', hex: '#16A34A', family: 'green' },
+  { id: 4, label: 'Lime', hex: '#4ADE80', family: 'green' },
+  // —— More greens ——
+  { id: 5, label: 'Pine', hex: '#052E16', family: 'green' },
+  { id: 6, label: 'Hunter', hex: '#1B4332', family: 'green' },
+  { id: 7, label: 'Emerald', hex: '#059669', family: 'green' },
+  { id: 8, label: 'Teal', hex: '#0D9488', family: 'green' },
+  { id: 9, label: 'Mint', hex: '#34D399', family: 'green' },
+  { id: 10, label: 'Spring', hex: '#22C55E', family: 'green' },
+  { id: 11, label: 'Neon', hex: '#A3E635', family: 'green' },
+  { id: 12, label: 'Olive', hex: '#65A30D', family: 'green' },
+  { id: 13, label: 'Jade', hex: '#10B981', family: 'green' },
+  // —— White / light (for dark cards) ——
+  { id: 14, label: 'White', hex: '#FFFFFF', family: 'white' },
+  { id: 15, label: 'Snow', hex: '#FAFAFA', family: 'white' },
+  { id: 16, label: 'Off-white', hex: '#F8FAFC', family: 'white' },
+  { id: 17, label: 'Ivory', hex: '#FFFBEB', family: 'white' },
+  { id: 18, label: 'Cream', hex: '#FEF3C7', family: 'white' },
+  { id: 19, label: 'Soft mint', hex: '#ECFDF5', family: 'white' },
+]
+
+/** Negative move shades (chart line + %) — reds + white variety. Ids 0–4 keep legacy prefs. */
+const SHARE_DOWN_RED_SHADES: Array<{
+  id: number
+  label: string
+  hex: string
+  family: ShareMoveShadeFamily
+}> = [
+  // —— Reds (0–4 legacy) ——
+  { id: 0, label: 'Burgundy', hex: '#7F1D1D', family: 'red' },
+  { id: 1, label: 'Crimson', hex: '#991B1B', family: 'red' },
+  { id: 2, label: 'Classic', hex: '#DC2626', family: 'red' }, // default design token
+  { id: 3, label: 'Coral', hex: '#F43F5E', family: 'red' },
+  { id: 4, label: 'Rose', hex: '#FB7185', family: 'red' },
+  // —— More reds ——
+  { id: 5, label: 'Wine', hex: '#4C0519', family: 'red' },
+  { id: 6, label: 'Maroon', hex: '#9F1239', family: 'red' },
+  { id: 7, label: 'Scarlet', hex: '#EF4444', family: 'red' },
+  { id: 8, label: 'Fire', hex: '#F97316', family: 'red' },
+  { id: 9, label: 'Tomato', hex: '#E11D48', family: 'red' },
+  { id: 10, label: 'Pink', hex: '#EC4899', family: 'red' },
+  { id: 11, label: 'Blush', hex: '#FDA4AF', family: 'red' },
+  { id: 12, label: 'Brick', hex: '#B91C1C', family: 'red' },
+  { id: 13, label: 'Ruby', hex: '#BE123C', family: 'red' },
+  // —— White / light (for dark cards) ——
+  { id: 14, label: 'White', hex: '#FFFFFF', family: 'white' },
+  { id: 15, label: 'Snow', hex: '#FAFAFA', family: 'white' },
+  { id: 16, label: 'Off-white', hex: '#F8FAFC', family: 'white' },
+  { id: 17, label: 'Ivory', hex: '#FFFBEB', family: 'white' },
+  { id: 18, label: 'Cream', hex: '#FEF3C7', family: 'white' },
+  { id: 19, label: 'Soft rose', hex: '#FFF1F2', family: 'white' },
+]
+
+type ShareMoveShadeId = number
+
+function clampShareMoveShade(
+  raw: unknown,
+  fallback: number = 2,
+  maxId: number = 30,
+): ShareMoveShadeId {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  const r = Math.round(n)
+  if (r < 0 || r > maxId) return fallback
+  return r
+}
+
+function shareUpColorHex(shade?: number | null): string {
+  const maxId = Math.max(...SHARE_UP_GREEN_SHADES.map((s) => s.id), 4)
+  const id = clampShareMoveShade(shade, 2, maxId)
+  return SHARE_UP_GREEN_SHADES.find((s) => s.id === id)?.hex || SHARE_UP_GREEN
+}
+
+function shareDownColorHex(shade?: number | null): string {
+  const maxId = Math.max(...SHARE_DOWN_RED_SHADES.map((s) => s.id), 4)
+  const id = clampShareMoveShade(shade, 2, maxId)
+  return SHARE_DOWN_RED_SHADES.find((s) => s.id === id)?.hex || SHARE_DOWN_RED
+}
+
+/** Resolve % / chart color from direction + user shade prefs. */
+function shareMoveAccentHex(
+  isDown: boolean,
+  isUp: boolean,
+  shades?: { upColorShade?: number; downColorShade?: number } | null,
+  fallbackInk = SHARE_INK,
+): string {
+  if (isDown) return shareDownColorHex(shades?.downColorShade)
+  if (isUp) return shareUpColorHex(shades?.upColorShade)
+  return fallbackInk
+}
+
+/**
+ * Stamp ink palette — families with multiple shades (red / black / gold / blue / green / purple).
+ * Legacy ids `red` · `black` · `gold` · `auto` still resolve.
+ */
+type ShareNewsStampInkFamily =
+  | 'red'
+  | 'black'
+  | 'gold'
+  | 'blue'
+  | 'green'
+  | 'purple'
+  | 'auto'
+
+const SHARE_NEWS_STAMP_INK_PRESETS: Array<{
+  id: string
+  label: string
+  hex: string
+  family: ShareNewsStampInkFamily
+}> = [
+  // —— Red ——
+  { id: 'red', label: 'Classic', hex: '#C41E3A', family: 'red' }, // legacy default
+  { id: 'red-wine', label: 'Wine', hex: '#7F1D1D', family: 'red' },
+  { id: 'red-crimson', label: 'Crimson', hex: '#DC2626', family: 'red' },
+  { id: 'red-scarlet', label: 'Scarlet', hex: '#EF4444', family: 'red' },
+  { id: 'red-coral', label: 'Coral', hex: '#F43F5E', family: 'red' },
+  { id: 'red-rose', label: 'Rose', hex: '#FB7185', family: 'red' },
+  // —— Black / grey ——
+  { id: 'black', label: 'Classic', hex: '#1A1A1A', family: 'black' }, // legacy
+  { id: 'black-ink', label: 'Ink', hex: '#0A0A0A', family: 'black' },
+  { id: 'black-charcoal', label: 'Charcoal', hex: '#27272A', family: 'black' },
+  { id: 'black-slate', label: 'Slate', hex: '#334155', family: 'black' },
+  { id: 'black-graphite', label: 'Graphite', hex: '#4B5563', family: 'black' },
+  // —— Gold / warm ——
+  { id: 'gold', label: 'Classic', hex: '#B8860B', family: 'gold' }, // legacy
+  { id: 'gold-amber', label: 'Amber', hex: '#D97706', family: 'gold' },
+  { id: 'gold-bronze', label: 'Bronze', hex: '#92400E', family: 'gold' },
+  { id: 'gold-honey', label: 'Honey', hex: '#EAB308', family: 'gold' },
+  { id: 'gold-sand', label: 'Sand', hex: '#CA8A04', family: 'gold' },
+  // —— Blue ——
+  { id: 'blue-navy', label: 'Navy', hex: '#1E3A8A', family: 'blue' },
+  { id: 'blue-royal', label: 'Royal', hex: '#2563EB', family: 'blue' },
+  { id: 'blue-classic', label: 'Classic', hex: '#3B82F6', family: 'blue' },
+  { id: 'blue-sky', label: 'Sky', hex: '#0EA5E9', family: 'blue' },
+  { id: 'blue-steel', label: 'Steel', hex: '#475569', family: 'blue' },
+  // —— Green ——
+  { id: 'green-forest', label: 'Forest', hex: '#14532D', family: 'green' },
+  { id: 'green-classic', label: 'Classic', hex: '#228B22', family: 'green' },
+  { id: 'green-emerald', label: 'Emerald', hex: '#059669', family: 'green' },
+  { id: 'green-teal', label: 'Teal', hex: '#0D9488', family: 'green' },
+  { id: 'green-lime', label: 'Lime', hex: '#65A30D', family: 'green' },
+  // —— Purple ——
+  { id: 'purple-plum', label: 'Plum', hex: '#581C87', family: 'purple' },
+  { id: 'purple-violet', label: 'Violet', hex: '#7C3AED', family: 'purple' },
+  { id: 'purple-classic', label: 'Classic', hex: '#A855F7', family: 'purple' },
+  { id: 'purple-lilac', label: 'Lilac', hex: '#C084FC', family: 'purple' },
+  { id: 'purple-magenta', label: 'Magenta', hex: '#C026D3', family: 'purple' },
+  // —— Auto (resolved at draw time) ——
+  { id: 'auto', label: 'Auto', hex: '#888888', family: 'auto' },
+]
+
+const SHARE_NEWS_STAMP_INK_FAMILIES: Array<{ id: ShareNewsStampInkFamily; label: string }> = [
+  { id: 'red', label: 'Red' },
+  { id: 'black', label: 'Black' },
+  { id: 'gold', label: 'Gold' },
+  { id: 'blue', label: 'Blue' },
+  { id: 'green', label: 'Green' },
+  { id: 'purple', label: 'Purple' },
+  { id: 'auto', label: 'Auto' },
+]
+
+/** Legacy map kept for defaults / auto. */
+const SHARE_NEWS_STAMP_COLORS = {
+  red: '#C41E3A',
+  black: '#1A1A1A',
+  gold: '#B8860B',
+} as const
+
+function resolveShareNewsStampInkHex(
+  colorId: string | undefined,
+  isDown: boolean,
+): string {
+  const id = colorId || 'red'
+  if (id === 'auto') {
+    return isDown ? SHARE_NEWS_STAMP_COLORS.red : SHARE_NEWS_STAMP_COLORS.gold
+  }
+  const found = SHARE_NEWS_STAMP_INK_PRESETS.find((p) => p.id === id)
+  return found?.hex || SHARE_NEWS_STAMP_COLORS.red
+}
+
+type ShareNewsStampKind = 'breaking' | 'exploding' | 'surge' | 'crash' | 'alert'
+
+function resolveShareNewsStampKind(
+  kind: 'auto' | ShareNewsStampKind | undefined,
+  isDown: boolean,
+  absPct: number | null,
+): ShareNewsStampKind {
+  if (kind && kind !== 'auto') return kind
+  if (absPct != null && absPct >= 25) return isDown ? 'crash' : 'exploding'
+  if (absPct != null && absPct >= 15) return isDown ? 'crash' : 'surge'
+  if (isDown) return 'crash'
+  return 'breaking'
+}
+
+function shareNewsStampCopy(kind: ShareNewsStampKind): {
+  center: string[]
+  ring: string
+} {
+  switch (kind) {
+    case 'exploding':
+      return { center: ['EXPLODING'], ring: 'HUGE MOVE' }
+    case 'surge':
+      return { center: ['SURGING'], ring: 'MARKET MOVE' }
+    case 'crash':
+      return { center: ['CRASHING'], ring: 'MARKET MOVE' }
+    case 'alert':
+      return { center: ['ALERT'], ring: 'TRIGGER ALERT' }
+    case 'breaking':
+    default:
+      return { center: ['BREAKING', 'NEWS'], ring: 'FLASH ALERT' }
+  }
+}
+
+function shouldDrawShareNewsStamp(
+  mode: 'off' | 'auto' | 'on' | undefined,
+  sessionLineTone: string | undefined,
+  sessionLine: string,
+  absPct: number | null,
+): boolean {
+  const m = mode || 'auto'
+  if (m === 'off') return false
+  if (m === 'on') return true
+  // auto: big moves, breaking tone, or session line already says breaking
+  if ((sessionLineTone || 'classic') === 'breaking') return true
+  if (absPct != null && absPct >= 10) return true
+  if (/breaking|🚨|exploding|market alert/i.test(sessionLine || '')) return true
+  return false
+}
+
+/** Density 0–100 → multiplier for stamp dots (sparse → dense). */
+function stampDensityMult(density?: number): number {
+  const d = Number.isFinite(Number(density)) ? Number(density) : 55
+  // 0 → ~0.35×, 55 → 1×, 100 → ~1.85×
+  return 0.35 + (Math.min(100, Math.max(0, d)) / 100) * 1.5
+}
+
+/** Draw a dotted circumference (rubber-stamp ring). densityMult scales count. */
+function strokeDottedCircle(
+  ctx: CanvasRenderingContext2D,
+  radius: number,
+  dotRadius: number,
+  count: number,
+  densityMult = 1,
+) {
+  const n = Math.max(8, Math.round(count * densityMult))
+  const dr = Math.max(0.7, dotRadius)
+  for (let i = 0; i < n; i += 1) {
+    const a = (i / n) * Math.PI * 2
+    // Slight radius jitter = inked “thappa” grain
+    const jitter = 1 + (Math.sin(i * 12.9898) * 0.012)
+    ctx.beginPath()
+    ctx.arc(Math.cos(a) * radius * jitter, Math.sin(a) * radius * jitter, dr, 0, Math.PI * 2)
+    ctx.fill()
+  }
+}
+
+/** Grunge stroke along a rect — alpha is relative to baseOpacity (full-stamp fade). */
+function strokeGrungeRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  lineW: number,
+  densityMult: number,
+  baseOpacity = 1,
+) {
+  const segs = Math.max(40, Math.round((w + h) * 0.35 * densityMult))
+  const path = [
+    { x, y },
+    { x: x + w, y },
+    { x: x + w, y: y + h },
+    { x, y: y + h },
+  ]
+  ctx.lineWidth = lineW
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  for (let s = 0; s < 4; s += 1) {
+    const a = path[s]
+    const b = path[(s + 1) % 4]
+    for (let i = 0; i < segs / 4; i += 1) {
+      const t0 = i / (segs / 4)
+      const t1 = Math.min(1, (i + 0.7) / (segs / 4))
+      // Skip some segments for broken ink
+      if (Math.sin(i * 7.1 + s * 3) > 0.72) continue
+      const alpha = 0.55 + 0.45 * Math.abs(Math.sin(i * 3.3 + s))
+      ctx.globalAlpha = baseOpacity * alpha
+      ctx.beginPath()
+      ctx.moveTo(a.x + (b.x - a.x) * t0, a.y + (b.y - a.y) * t0)
+      ctx.lineTo(a.x + (b.x - a.x) * t1, a.y + (b.y - a.y) * t1)
+      ctx.stroke()
+    }
+  }
+  ctx.globalAlpha = baseOpacity
+}
+
+/** Grunge circular stroke (ink breaks) — alpha relative to baseOpacity. */
+function strokeGrungeCircle(
+  ctx: CanvasRenderingContext2D,
+  radius: number,
+  lineW: number,
+  densityMult: number,
+  baseOpacity = 1,
+) {
+  const segs = Math.max(48, Math.round(radius * 1.4 * densityMult))
+  ctx.lineWidth = lineW
+  ctx.lineCap = 'round'
+  for (let i = 0; i < segs; i += 1) {
+    if (Math.sin(i * 5.7) > 0.78) continue
+    const t0 = (i / segs) * Math.PI * 2
+    const t1 = ((i + 0.65) / segs) * Math.PI * 2
+    const j = 1 + Math.sin(i * 9.1) * 0.008
+    ctx.globalAlpha = baseOpacity * (0.5 + 0.5 * Math.abs(Math.cos(i * 2.1)))
+    ctx.beginPath()
+    ctx.arc(0, 0, radius * j, t0, t1)
+    ctx.stroke()
+  }
+  ctx.globalAlpha = baseOpacity
+}
+
+/**
+ * News stamp — two switchable looks:
+ *  - circle: double ring + top/bottom arc text + center banner (CERTIFIED seal ref)
+ *  - rect: rectangular grunge stamp (CERTIFIED box ref)
+ *
+ * Drawn at full ink on an offscreen canvas, then composited with a single
+ * globalAlpha so fade/opacity applies to the ENTIRE stamp (rings + text + grain).
+ */
+function drawShareNewsStamp(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  diameter: number,
+  opts: {
+    centerLines: string[]
+    ringText: string
+    color: string
+    rotationDeg?: number
+    opacity?: number
+    /** circle = seal · rect = rectangular CERTIFIED box */
+    style?: 'circle' | 'rect'
+    /** 0–100 dotted / grain density */
+    density?: number
+  },
+) {
+  const fontStack =
+    '"Google Sans Flex", "Google Sans", "Inter", "SF Pro Display", "Segoe UI", system-ui, sans-serif'
+  const stampStyle = opts.style === 'rect' ? 'rect' : 'circle'
+  const r = Math.max(40, diameter / 2)
+  const color = opts.color || SHARE_NEWS_STAMP_COLORS.red
+  const opacity = Math.min(1, Math.max(0.05, (opts.opacity ?? 88) / 100))
+  const rot = ((opts.rotationDeg ?? -14) * Math.PI) / 180
+  const dens = stampDensityMult(opts.density)
+
+  const lines = (opts.centerLines || ['BREAKING'])
+    .map((l) =>
+      String(l || '')
+        .toUpperCase()
+        .trim(),
+    )
+    .filter(Boolean)
+  if (!lines.length) return
+
+  // Offscreen: full-opacity stamp; main canvas only fades the whole layer
+  const pad = Math.ceil(diameter * 0.2)
+  const offSize = Math.ceil(diameter + pad * 2)
+  const off = document.createElement('canvas')
+  off.width = offSize
+  off.height = offSize
+  const octx = off.getContext('2d')
+  if (!octx) return
+
+  octx.save()
+  octx.translate(offSize / 2, offSize / 2)
+  octx.rotate(rot)
+  octx.strokeStyle = color
+  octx.fillStyle = color
+  octx.lineCap = 'round'
+  octx.lineJoin = 'round'
+  octx.globalAlpha = 1
+
+  if (stampStyle === 'rect') {
+    // —— Rectangular CERTIFIED-style stamp ——
+    const text = lines.join(' ')
+    const fontSize = Math.max(18, Math.round(r * 0.28))
+    octx.font = `800 ${fontSize}px ${fontStack}`
+    const tw = octx.measureText(text).width
+    const padX = fontSize * 0.55
+    const padY = fontSize * 0.45
+    const boxW = Math.max(r * 1.55, tw + padX * 2)
+    const boxH = Math.max(fontSize + padY * 2, r * 0.55)
+    const bx = -boxW / 2
+    const by = -boxH / 2
+
+    strokeGrungeRect(octx, bx, by, boxW, boxH, Math.max(2.5, r * 0.035), dens, 1)
+    strokeGrungeRect(
+      octx,
+      bx + r * 0.04,
+      by + r * 0.04,
+      boxW - r * 0.08,
+      boxH - r * 0.08,
+      Math.max(1.5, r * 0.02),
+      dens * 0.85,
+      1,
+    )
+    const speckles = Math.round(80 * dens)
+    for (let i = 0; i < speckles; i += 1) {
+      const px = bx + (Math.sin(i * 12.3) * 0.5 + 0.5) * boxW
+      const py = by + (Math.cos(i * 9.7) * 0.5 + 0.5) * boxH
+      if (Math.sin(i * 3.1) > 0.3) continue
+      octx.globalAlpha = 0.15 + 0.35 * Math.abs(Math.sin(i))
+      octx.beginPath()
+      octx.arc(px, py, 0.6 + (i % 3) * 0.3, 0, Math.PI * 2)
+      octx.fill()
+    }
+    octx.globalAlpha = 1
+    octx.fillStyle = color
+    octx.textAlign = 'center'
+    octx.textBaseline = 'middle'
+    octx.font = `800 ${fontSize}px ${fontStack}`
+    octx.fillText(text, 0, 1)
+    octx.restore()
+
+    ctx.save()
+    ctx.globalAlpha = opacity
+    ctx.drawImage(off, cx - offSize / 2, cy - offSize / 2)
+    ctx.restore()
+    return
+  }
+
+  // —— Circular seal ——
+  strokeGrungeCircle(octx, r, Math.max(3, r * 0.045), dens, 1)
+  strokeGrungeCircle(octx, r * 0.88, Math.max(2, r * 0.028), dens * 0.9, 1)
+
+  octx.globalAlpha = 1
+  octx.fillStyle = color
+  const outerDotR = Math.max(1.2, r * 0.022)
+  strokeDottedCircle(octx, r * 0.965, outerDotR, Math.round(r * 0.95), dens)
+  strokeDottedCircle(octx, r * 0.84, Math.max(1, r * 0.014), Math.round(r * 0.8), dens)
+
+  const rArc = r * 0.72
+  const ring = String(opts.ringText || 'TRIGGER ALERT')
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+  const topArc = ring ? `• ${ring} •` : ''
+  const botArc = topArc ? topArc.split('').reverse().join('') : ''
+
+  const drawArcLabel = (
+    text: string,
+    radius: number,
+    startAngle: number,
+    endAngle: number,
+    flip: boolean,
+  ) => {
+    const chars = text.split('')
+    if (!chars.length) return
+    const fontSize = Math.max(10, Math.round(r * 0.1))
+    octx.font = `700 ${fontSize}px ${fontStack}`
+    octx.textAlign = 'center'
+    octx.textBaseline = 'middle'
+    octx.fillStyle = color
+    octx.globalAlpha = 1
+    let total = 0
+    const widths = chars.map((ch) => {
+      const w = octx.measureText(ch).width
+      total += w
+      return w
+    })
+    const arcLen = Math.abs(endAngle - startAngle) * radius
+    const scale = total > 0 ? Math.min(1.15, (arcLen * 0.92) / total) : 1
+    let angle = startAngle
+    const dir = endAngle >= startAngle ? 1 : -1
+    for (let i = 0; i < chars.length; i += 1) {
+      const ch = chars[i]
+      const w = widths[i] * scale
+      const half = w / 2 / radius
+      angle += dir * half
+      const x = Math.cos(angle) * radius
+      const y = Math.sin(angle) * radius
+      octx.save()
+      octx.translate(x, y)
+      octx.rotate(angle + (flip ? -Math.PI / 2 : Math.PI / 2))
+      octx.fillText(ch, 0, 0)
+      octx.restore()
+      angle += dir * half
+    }
+  }
+
+  if (topArc) {
+    drawArcLabel(topArc, rArc, -Math.PI * 0.78, -Math.PI * 0.22, false)
+    drawArcLabel(botArc, rArc, Math.PI * 0.78, Math.PI * 0.22, true)
+  }
+
+  const starY1 = -r * 0.22
+  const starY2 = r * 0.22
+  const starCount = Math.max(3, Math.round(3 + dens * 2))
+  octx.fillStyle = color
+  octx.globalAlpha = 0.9
+  octx.font = `${Math.max(8, Math.round(r * 0.08))}px ${fontStack}`
+  octx.textAlign = 'center'
+  octx.textBaseline = 'middle'
+  const starSpan = r * 0.42
+  for (let i = 0; i < starCount; i += 1) {
+    const t = starCount === 1 ? 0.5 : i / (starCount - 1)
+    const sx = -starSpan / 2 + t * starSpan
+    octx.fillText('★', sx, starY1)
+    octx.fillText('★', sx, starY2)
+  }
+
+  const text = lines.join(lines.length > 1 ? ' ' : '')
+  const centerFont = Math.max(14, Math.round(r * (lines.length > 1 ? 0.16 : 0.2)))
+  octx.font = `800 ${centerFont}px ${fontStack}`
+  const tw = octx.measureText(text).width
+  const banW = Math.min(r * 1.55, Math.max(r * 0.95, tw + centerFont * 0.7))
+  const banH = centerFont * 1.45
+  const banX = -banW / 2
+  const banY = -banH / 2
+  octx.globalAlpha = 1
+  octx.strokeStyle = color
+  strokeGrungeRect(octx, banX, banY, banW, banH, Math.max(2, r * 0.028), dens * 0.9, 1)
+  octx.globalAlpha = 0.08
+  octx.fillStyle = color
+  roundRect(octx, banX, banY, banW, banH, banH * 0.15)
+  octx.fill()
+  octx.globalAlpha = 1
+  octx.fillStyle = color
+  octx.textAlign = 'center'
+  octx.textBaseline = 'middle'
+  octx.font = `800 ${centerFont}px ${fontStack}`
+  octx.fillText(text, 0, 1)
+  octx.restore()
+
+  // Single fade for entire stamp layer (behind content when drawn early)
+  ctx.save()
+  ctx.globalAlpha = opacity
+  ctx.drawImage(off, cx - offSize / 2, cy - offSize / 2)
+  ctx.restore()
+}
+
+/** Resolve stamp center + ring copy: custom fields win, else kind preset. */
+function resolveShareNewsStampCopy(
+  style: {
+    newsStampKind?: 'auto' | ShareNewsStampKind
+    newsStampCenterText?: string
+    newsStampRingText?: string
+  },
+  isDown: boolean,
+  absPct: number | null,
+): { center: string[]; ring: string } {
+  const kind = resolveShareNewsStampKind(style.newsStampKind, isDown, absPct)
+  const preset = shareNewsStampCopy(kind)
+  const customCenter = String(style.newsStampCenterText ?? '').trim()
+  const customRing = String(style.newsStampRingText ?? '').trim()
+  const center = customCenter
+    ? customCenter
+        .split(/\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .slice(0, 4)
+    : preset.center
+  const ring = customRing || preset.ring
+  return { center: center.length ? center : preset.center, ring }
+}
 
 /** Mini sparkline only — no panel background, no grid, no border. */
+/** Time labels under the share chart (market session). */
+type ShareChartSession = 'regular' | 'premarket' | 'after-hours'
+
+function inferShareChartSession(
+  event: PriceMovementEvent,
+  sessionLine = '',
+): ShareChartSession {
+  const blob = `${sessionLine} ${event.summary || ''} ${event.time_label || ''}`.toLowerCase()
+  if (
+    /\bpre[-\s]?market\b/.test(blob) ||
+    /\bpremarket\b/.test(blob) ||
+    /\bbefore\s+the\s+open\b/.test(blob)
+  ) {
+    return 'premarket'
+  }
+  if (
+    /\bafter[-\s]?hours?\b/.test(blob) ||
+    /\bpost[-\s]?market\b/.test(blob) ||
+    /\bafter\s+the\s+close\b/.test(blob)
+  ) {
+    return 'after-hours'
+  }
+  return 'regular'
+}
+
+/** Labels evenly spaced under the chart axis. */
+function shareChartTimeLabels(session: ShareChartSession): string[] {
+  if (session === 'premarket') {
+    return ['4 AM', '5 AM', '6 AM', '7 AM', '8 AM', '9 AM']
+  }
+  if (session === 'after-hours') {
+    return ['4 PM', '5 PM', '6 PM', '7 PM', '8 PM']
+  }
+  // Regular session 9:30 → 4:00
+  return ['9:30', '11 AM', '12:30', '2 PM', '4 PM']
+}
+
+/**
+ * Share-card chart: real Yahoo regular-session line when `series` is provided,
+ * otherwise synthetic fallback. Time axis uses real bar timestamps when possible.
+ * `height` = full block (plot + optional time axis + optional day labels).
+ */
 function drawMiniChart(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -901,17 +2988,111 @@ function drawMiniChart(
   isDown: boolean,
   seed: string,
   cardBgHex = '#F5B800',
+  options?: {
+    showTimeAxis?: boolean
+    /** Calendar day labels under the axis (Today · 5 Aug). */
+    showDayLabels?: boolean
+    session?: ShareChartSession
+    axisTextColor?: string
+    /** Real regular-session closes from Yahoo (preferred). */
+    series?: ShareChartBar[] | null
+    /** elapsed = 0m / 15m · timestamp = 9:30 AM wall clock */
+    axisMode?: 'elapsed' | 'timestamp'
+    /** IANA zone for timestamp mode */
+    axisTimezone?: ShareChartTimezone
+    /** Max x-axis labels (3–10), including start + end */
+    maxAxisLabels?: number
+    /** Override stroke/fill accent (green/red shade from layout). */
+    lineColor?: string
+    /** Point markers on the line: price · % · both · off */
+    pointLabelMode?: ShareChartPointLabelMode
+    /** @deprecated use pointLabelMode */
+    showPriceLabels?: boolean
+    /** How many points (3–8), including first + last. */
+    priceLabelCount?: number
+    /** Price / % label fill (defaults to axis text). */
+    priceLabelColor?: string
+    /** Custom point labels (one per line) — top / primary when both. */
+    pointLabelsCustom?: string[]
+    /** Custom sub labels under points when mode is both (one per line). */
+    pointSubLabelsCustom?: string[]
+    /** Override time-axis labels (one per line / index). */
+    axisLabelsCustom?: string[]
+    /** Time-axis label font size (canvas px). */
+    axisFontSize?: number
+    /** Point price/% label font size (canvas px). */
+    pointFontSize?: number
+    /** Day-label font size (canvas px). */
+    dayLabelFontSize?: number
+    /** Extra px between time ticks row and day labels row. */
+    timeDayGap?: number
+    /** Today · 5 Aug · 6 August formatting. */
+    dayLabelMode?: ShareChartDayLabelMode
+    /** Stroke width of the price line (canvas px). */
+    lineWidth?: number
+  },
 ) {
-  const pts = buildMiniChartPoints(width, height, isDown, seed)
+  const showTimeAxis = options?.showTimeAxis !== false
+  const showDayLabels = options?.showDayLabels === true
+  const timeDayGap = Math.min(
+    100,
+    Math.max(0, Math.round(Number(options?.timeDayGap) || 14)),
+  )
+  // Budget under plot: pad + time row + optional gap + day row
+  const timeAxisH = showTimeAxis ? 28 : 0
+  const dayAxisH = showDayLabels ? 22 + (showTimeAxis ? timeDayGap : 4) : 0
+  const axisH = timeAxisH + dayAxisH
+  const plotH = Math.max(40, height - axisH)
+  const dayLabelMode = clampShareChartDayLabelMode(options?.dayLabelMode)
+  const series = options?.series && options.series.length >= 2 ? options.series : null
+  const axisMode = options?.axisMode === 'timestamp' ? 'timestamp' : 'elapsed'
+  const axisTz: ShareChartTimezone =
+    options?.axisTimezone &&
+    SHARE_CHART_TIMEZONES.some((z) => z.id === options.axisTimezone)
+      ? options.axisTimezone
+      : 'America/New_York'
+  // User setting: 3…10 labels (was hard-capped at 8 — that broke higher counts)
+  const MAX_LABELS = Math.min(
+    10,
+    Math.max(3, Math.round(Number(options?.maxAxisLabels) || 5)),
+  )
+  const pointLabelMode: ShareChartPointLabelMode =
+    options?.pointLabelMode === 'price' ||
+    options?.pointLabelMode === 'percent' ||
+    options?.pointLabelMode === 'both' ||
+    options?.pointLabelMode === 'off'
+      ? options.pointLabelMode
+      : options?.showPriceLabels === true
+        ? 'price'
+        : 'off'
+  const showPointLabels = pointLabelMode !== 'off'
+  const priceLabelCount = Math.min(
+    8,
+    Math.max(3, Math.round(Number(options?.priceLabelCount) || 4)),
+  )
+  const customPointLabels = options?.pointLabelsCustom || []
+  const customPointSubs = options?.pointSubLabelsCustom || []
+  const customAxisLabels = options?.axisLabelsCustom || []
+
+  let pts: Array<{ x: number; y: number; t?: number; close?: number }>
+  let lineIsDown = isDown
+  if (series) {
+    pts = buildChartPointsFromSeries(width, plotH, series)
+    const first = series[0].close
+    const lastClose = series[series.length - 1].close
+    lineIsDown = lastClose < first
+  } else {
+    pts = buildMiniChartPoints(width, plotH, isDown, seed)
+  }
   if (!pts.length) return
 
-  // Stronger colors so the line reads on card bg
-  const lineColor = isDown ? SHARE_DOWN_RED : SHARE_UP_GREEN
-  const fillTop = isDown ? 'rgba(220,38,38,0.28)' : 'rgba(21,128,61,0.30)'
+  const lineColor =
+    options?.lineColor || (lineIsDown ? SHARE_DOWN_RED : SHARE_UP_GREEN)
+  const fillTop = hexToRgba(lineColor, lineIsDown ? 0.28 : 0.3)
   const fillBot = hexToRgba(cardBgHex, 0)
 
-  // Soft area under the sparkline (no solid panel behind chart)
-  const area = ctx.createLinearGradient(0, y, 0, y + height)
+  // Area under the line
+  const area = ctx.createLinearGradient(0, y, 0, y + plotH)
   area.addColorStop(0, fillTop)
   area.addColorStop(1, fillBot)
   ctx.beginPath()
@@ -919,80 +3100,587 @@ function drawMiniChart(
   for (let i = 1; i < pts.length; i += 1) {
     ctx.lineTo(x + pts[i].x, y + pts[i].y)
   }
-  ctx.lineTo(x + pts[pts.length - 1].x, y + height)
-  ctx.lineTo(x + pts[0].x, y + height)
+  ctx.lineTo(x + pts[pts.length - 1].x, y + plotH)
+  ctx.lineTo(x + pts[0].x, y + plotH)
   ctx.closePath()
   ctx.fillStyle = area
   ctx.fill()
 
-  // Main sparkline — thicker for share card
+  // Main line — user-controlled thickness (auto fallback by density)
   ctx.beginPath()
   ctx.moveTo(x + pts[0].x, y + pts[0].y)
   for (let i = 1; i < pts.length; i += 1) {
     ctx.lineTo(x + pts[i].x, y + pts[i].y)
   }
   ctx.strokeStyle = lineColor
-  ctx.lineWidth = 9
-  ctx.lineJoin = 'round'
+  const dense = Boolean(series && series.length >= 120)
+  const veryDense = Boolean(series && series.length >= 300)
+  const rawLineW = Number(options?.lineWidth)
+  const autoLineW = veryDense ? 3.2 : dense ? 4.2 : 6.5
+  const lineW =
+    Number.isFinite(rawLineW) && rawLineW > 0
+      ? Math.min(24, Math.max(1, rawLineW))
+      : autoLineW
+  ctx.lineWidth = lineW
+  // miter keeps sharp micro-moves on dense series; thick lines prefer round
+  ctx.lineJoin = veryDense && lineW <= 5 ? 'miter' : 'round'
   ctx.lineCap = 'round'
+  ctx.miterLimit = 2
   ctx.stroke()
 
-  // End dot — ring matches card so it pops on any bg
+  // End dot scales with stroke so it stays proportional
   const last = pts[pts.length - 1]
+  const endDotR = Math.min(16, Math.max(5, lineW * 1.55 + 2))
   ctx.beginPath()
-  ctx.arc(x + last.x, y + last.y, 12, 0, Math.PI * 2)
+  ctx.arc(x + last.x, y + last.y, endDotR, 0, Math.PI * 2)
   ctx.fillStyle = lineColor
   ctx.fill()
   ctx.strokeStyle = cardBgHex
-  ctx.lineWidth = 3
+  ctx.lineWidth = Math.min(4, Math.max(1.5, lineW * 0.45))
   ctx.stroke()
+
+  // Point markers: price · % · both (real series only)
+  if (showPointLabels && series && pts.some((p) => p.close != null)) {
+    const idxs = pickEvenSeriesIndices(pts.length, priceLabelCount)
+    const firstClose = series[0].close
+    const rawPointFs = Number(options?.pointFontSize)
+    const fontSize = Math.max(
+      10,
+      Math.round(
+        Number.isFinite(rawPointFs) && rawPointFs > 0
+          ? rawPointFs
+          : Math.max(13, plotH * 0.08),
+      ),
+    )
+    const fontStack =
+      '"Google Sans Flex", "Google Sans", "Inter", "SF Pro Display", system-ui, sans-serif'
+    ctx.font = `600 ${fontSize}px ${fontStack}`
+    ctx.textBaseline = 'middle'
+    const labelColor = options?.priceLabelColor || options?.axisTextColor || SHARE_INK
+    const dual = pointLabelMode === 'both'
+    for (let k = 0; k < idxs.length; k += 1) {
+      const p = pts[idxs[k]]
+      if (!p || p.close == null || !Number.isFinite(p.close)) continue
+      const autoPrice = formatShareChartPrice(p.close)
+      const autoPct = formatShareChartPercent(p.close, firstClose)
+      let topText = ''
+      let botText = ''
+      if (customPointLabels[k]) {
+        topText = customPointLabels[k]
+        if (dual) {
+          botText = customPointSubs[k] || autoPrice
+        }
+      } else if (pointLabelMode === 'price') {
+        topText = autoPrice
+      } else if (pointLabelMode === 'percent') {
+        topText = autoPct
+      } else if (dual) {
+        topText = autoPct
+        botText = autoPrice
+      }
+      if (!topText && !botText) continue
+      const px = x + p.x
+      const py = y + p.y
+      // Small anchor dot (end already has a big one)
+      if (k < idxs.length - 1 || idxs[k] !== pts.length - 1) {
+        ctx.beginPath()
+        ctx.arc(px, py, 5, 0, Math.PI * 2)
+        ctx.fillStyle = lineColor
+        ctx.fill()
+        ctx.strokeStyle = cardBgHex
+        ctx.lineWidth = 2
+        ctx.stroke()
+      }
+      const measureMain = topText || botText
+      ctx.font = `600 ${fontSize}px ${fontStack}`
+      const tw = ctx.measureText(measureMain).width
+      let lx = px
+      let align: CanvasTextAlign = 'center'
+      if (px - tw / 2 < x + 4) {
+        lx = x + 4
+        align = 'left'
+      } else if (px + tw / 2 > x + width - 4) {
+        lx = x + width - 4
+        align = 'right'
+      }
+      const drawHaloText = (text: string, ty: number, size = fontSize) => {
+        if (!text) return
+        ctx.font = `600 ${size}px ${fontStack}`
+        ctx.textAlign = align
+        ctx.save()
+        ctx.shadowColor = hexToRgba(cardBgHex, 0.95)
+        ctx.shadowBlur = 6
+        ctx.shadowOffsetX = 0
+        ctx.shadowOffsetY = 0
+        ctx.fillStyle = labelColor
+        ctx.fillText(text, lx, ty)
+        ctx.restore()
+      }
+      if (dual && topText && botText) {
+        const topY = Math.max(y + fontSize * 0.6, py - fontSize - 6)
+        const botY = Math.min(y + plotH - fontSize * 0.4, py + fontSize + 8)
+        drawHaloText(topText, topY, fontSize)
+        drawHaloText(botText, botY, Math.max(12, Math.round(fontSize * 0.9)))
+      } else {
+        const single = topText || botText
+        const above = py - fontSize - 10
+        const below = py + fontSize + 8
+        const ty = above >= y + 4 ? above : Math.min(y + plotH - 4, below)
+        drawHaloText(single, ty, fontSize)
+      }
+    }
+    ctx.textAlign = 'left'
+  }
+
+  if (!showTimeAxis && !showDayLabels) return
+
+  // Floating labels under the plot (time ticks, then optional day labels)
+  const axisY = y + plotH + 6
+  // Day row sits below time row + user-controlled gap
+  const dayLabelY = showTimeAxis
+    ? y + plotH + timeAxisH + timeDayGap
+    : y + plotH + 6
+
+  type AxisTick = { tFrac: number; label: string }
+  const ticks: AxisTick[] = []
+
+  const formatElapsedLabel = (elapsedMin: number): string => {
+    const m = Math.max(0, Math.round(elapsedMin))
+    if (m === 0) return '0m'
+    if (m < 60) return `${m}m`
+    const h = Math.floor(m / 60)
+    const rem = m % 60
+    if (rem === 0) return `${h}h`
+    return `${h}h ${rem}m`
+  }
+
+  // Chart axis: clock only — no ET/IST/UK suffix (zone only on session stamp below)
+  const formatTimestampLabel = (ms: number): string =>
+    new Date(ms).toLocaleTimeString('en-US', {
+      timeZone: axisTz,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    })
+
+  // Day labels need the session timeline even when time ticks are off
+  let dayTimeline: ReturnType<typeof buildShareSessionTimeline> | null = null
+  if (series && series.length >= 2 && showDayLabels) {
+    dayTimeline = buildShareSessionTimeline(series)
+  }
+
+  if (series && series.length >= 2 && showTimeAxis) {
+    // Axis uses the same session-compressed timeline as the line (no overnight stretch)
+    const timeline = buildShareSessionTimeline(series)
+    const endMin = Math.max(1, Math.round(timeline.span))
+
+    /**
+     * Label count is the user setting (3–10). Evenly sample along *market* minutes
+     * so labels line up with the wavy session-compressed plot.
+     */
+    const NICE_STEPS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 390, 480, 780]
+    const preferredMin = endMin <= 75 ? 15 : endMin <= 200 ? 30 : endMin <= 450 ? 60 : 120
+
+    const buildElapsedMarks = (step: number): number[] => {
+      const marks: number[] = [0]
+      if (endMin <= 0) return marks
+      let cursor = step
+      const endGuard = Math.max(step * 0.3, 1.5)
+      while (cursor < endMin - endGuard) {
+        marks.push(Math.round(cursor))
+        cursor += step
+      }
+      const last = Math.round(endMin)
+      if (last - marks[marks.length - 1] >= 1) marks.push(last)
+      else marks[marks.length - 1] = last
+      return marks
+    }
+
+    type Cand = { step: number; marks: number[] }
+    const cands: Cand[] = NICE_STEPS.map((step) => ({
+      step,
+      marks: buildElapsedMarks(step),
+    })).filter((c) => c.marks.length >= 2 && c.marks.length <= MAX_LABELS)
+
+    let best: Cand | null = null
+    for (const c of cands) {
+      if (!best) {
+        best = c
+        continue
+      }
+      if (c.marks.length > best.marks.length) best = c
+      else if (
+        c.marks.length === best.marks.length &&
+        Math.abs(c.step - preferredMin) < Math.abs(best.step - preferredMin)
+      ) {
+        best = c
+      }
+    }
+
+    let elapsedMarks =
+      best?.marks ??
+      Array.from({ length: MAX_LABELS }, (_, i) =>
+        Math.round((i / Math.max(1, MAX_LABELS - 1)) * endMin),
+      )
+
+    if (elapsedMarks.length < MAX_LABELS && endMin > 0) {
+      elapsedMarks = Array.from({ length: MAX_LABELS }, (_, i) =>
+        Math.round((i / (MAX_LABELS - 1)) * endMin),
+      )
+      elapsedMarks = elapsedMarks.filter((v, i, arr) => i === 0 || v !== arr[i - 1])
+      if (elapsedMarks[elapsedMarks.length - 1] !== endMin) {
+        elapsedMarks.push(endMin)
+      }
+    }
+
+    if (elapsedMarks.length > MAX_LABELS) {
+      const kept: number[] = [elapsedMarks[0]]
+      for (let i = 1; i <= MAX_LABELS - 2; i += 1) {
+        const j = Math.round((i * (elapsedMarks.length - 1)) / (MAX_LABELS - 1))
+        const v = elapsedMarks[j]
+        if (v !== kept[kept.length - 1]) kept.push(v)
+      }
+      const lastM = elapsedMarks[elapsedMarks.length - 1]
+      if (kept[kept.length - 1] !== lastM) kept.push(lastM)
+      elapsedMarks = kept
+    }
+
+    // Map session-minute offset → nearest series bar timestamp (for absolute labels)
+    const nearestBarT = (sessOffset: number): number => {
+      const target = timeline.p0 + sessOffset
+      let bestT = series[0].t
+      let bestD = Infinity
+      for (const b of series) {
+        const d = Math.abs(timeline.posAt(b.t) - target)
+        if (d < bestD) {
+          bestD = d
+          bestT = b.t
+        }
+      }
+      return bestT
+    }
+
+    for (const elapsed of elapsedMarks) {
+      const tFrac = Math.min(1, Math.max(0, elapsed / endMin))
+      if (axisMode === 'elapsed') {
+        ticks.push({ tFrac, label: formatElapsedLabel(elapsed) })
+      } else {
+        ticks.push({
+          tFrac,
+          label: formatTimestampLabel(nearestBarT(elapsed)),
+        })
+      }
+    }
+    for (let i = ticks.length - 1; i > 0; i -= 1) {
+      if (ticks[i].label === ticks[i - 1].label) ticks.splice(i, 1)
+    }
+  } else if (showTimeAxis) {
+    const labels =
+      axisMode === 'timestamp'
+        ? shareChartTimeLabels(options?.session || 'regular').slice(0, 6)
+        : ['0m', '15m', '30m', '45m', '1h']
+    labels.forEach((label, i) => {
+      ticks.push({ tFrac: labels.length <= 1 ? 0 : i / (labels.length - 1), label })
+    })
+  }
+
+  // User overrides for time-axis text (one label per line in settings)
+  if (showTimeAxis && customAxisLabels.length > 0 && ticks.length > 0) {
+    for (let i = 0; i < ticks.length; i += 1) {
+      if (customAxisLabels[i]) ticks[i].label = customAxisLabels[i]
+    }
+  }
+
+  ctx.fillStyle = options?.axisTextColor || 'rgba(17,17,17,0.62)'
+  const rawAxisFs = Number(options?.axisFontSize)
+  const axisFs = Math.max(
+    10,
+    Math.round(Number.isFinite(rawAxisFs) && rawAxisFs > 0 ? rawAxisFs : 18),
+  )
+  if (showTimeAxis) {
+    ctx.font = shareFont(500, axisFs)
+    ctx.textBaseline = 'top'
+    for (let i = 0; i < ticks.length; i += 1) {
+      const tFrac = Math.min(1, Math.max(0, ticks[i].tFrac))
+      const tx = x + tFrac * width
+      const label = ticks[i].label
+      const tw = ctx.measureText(label).width
+      let lx = tx - tw / 2
+      if (i === 0) lx = tx
+      if (i === ticks.length - 1) lx = tx - tw
+      ctx.fillText(label, lx, axisY)
+    }
+  }
+
+  // Calendar day labels (Today · 5 Aug) — centered under each session block
+  if (showDayLabels && dayTimeline && dayTimeline.days.length > 0) {
+    const todayKey = etDateKey()
+    const dayFs = Math.max(
+      10,
+      Math.round(
+        Number.isFinite(Number(options?.dayLabelFontSize)) &&
+          Number(options?.dayLabelFontSize) > 0
+          ? Number(options?.dayLabelFontSize)
+          : Math.max(12, axisFs - 2),
+      ),
+    )
+    ctx.font = shareFont(600, dayFs)
+    ctx.textBaseline = 'top'
+    ctx.fillStyle = options?.axisTextColor || 'rgba(17,17,17,0.62)'
+    const REG_OPEN = 9 * 60 + 30
+    for (let di = 0; di < dayTimeline.days.length; di += 1) {
+      const dayKey = dayTimeline.days[di]
+      // Mid of that day's market block in session-time space
+      const dayMidAbs = di * SHARE_SESSION_MINS + SHARE_SESSION_MINS / 2
+      // Clamp to visible span for partial last day
+      const dayStartAbs = di * SHARE_SESSION_MINS
+      const dayEndAbs = (di + 1) * SHARE_SESSION_MINS
+      const visStart = Math.max(dayTimeline.p0, dayStartAbs)
+      const visEnd = Math.min(dayTimeline.p1, dayEndAbs)
+      if (visEnd <= visStart) continue
+      const mid = (visStart + visEnd) / 2
+      const tFrac = Math.min(1, Math.max(0, (mid - dayTimeline.p0) / dayTimeline.span))
+      const daysFromEnd = dayTimeline.days.length - 1 - di
+      const label = formatShareChartDayLabel(
+        dayKey,
+        todayKey,
+        dayLabelMode,
+        daysFromEnd,
+      )
+      const tw = ctx.measureText(label).width
+      let lx = x + tFrac * width - tw / 2
+      lx = Math.min(x + width - tw, Math.max(x, lx))
+      ctx.fillText(label, lx, dayLabelY)
+    }
+    void REG_OPEN
+  }
+  ctx.textBaseline = 'alphabetic'
 }
 
-type ShareCardColorId =
-  | 'yellow'
-  | 'white'
-  | 'black'
-  | 'cream'
-  | 'navy'
-  | 'orange'
-  | 'slate'
 
-type ShareTextColorId = 'black' | 'grey' | 'white'
+/** Card fill id — many family shades; unknown legacy ids fall back via presets map. */
+type ShareCardColorId = string
+
+/** Body / price text id — black/grey/white families + extras. */
+type ShareTextColorId = string
+
+type ShareCardColorFamily =
+  | 'yellow'
+  | 'orange'
+  | 'red'
+  | 'pink'
+  | 'green'
+  | 'blue'
+  | 'purple'
+  | 'brown'
+  | 'grey'
+  | 'black'
+  | 'white'
 
 const SHARE_CARD_COLOR_PRESETS: Array<{
   id: ShareCardColorId
   label: string
   bg: string
+  family: ShareCardColorFamily
   /** Suggested body text when this card color is picked */
   defaultText: ShareTextColorId
 }> = [
-  { id: 'yellow', label: 'Yellow', bg: '#F5B800', defaultText: 'black' },
-  { id: 'cream', label: 'Cream', bg: '#FFF4D6', defaultText: 'black' },
-  { id: 'white', label: 'White', bg: '#FFFFFF', defaultText: 'black' },
-  { id: 'orange', label: 'Orange', bg: '#F97316', defaultText: 'black' },
-  { id: 'slate', label: 'Slate', bg: '#334155', defaultText: 'white' },
-  { id: 'navy', label: 'Navy', bg: '#0F172A', defaultText: 'white' },
-  { id: 'black', label: 'Black', bg: '#111111', defaultText: 'white' },
+  // —— Yellow (classic share-card family) ——
+  // #F5B800 = original mobile / Yahoo-style share card yellow (default)
+  { id: 'yellow', label: 'Original', bg: '#F5B800', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-pale', label: 'Pale', bg: '#FFF8E1', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-cream', label: 'Cream', bg: '#FFF4D6', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-butter', label: 'Butter', bg: '#FFE566', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-bright', label: 'Bright', bg: '#FFC107', family: 'yellow', defaultText: 'black' },
+  { id: 'gold', label: 'Gold', bg: '#EAB308', family: 'yellow', defaultText: 'black' },
+  { id: 'amber', label: 'Amber', bg: '#F59E0B', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-deep', label: 'Deep', bg: '#D97706', family: 'yellow', defaultText: 'black' },
+  { id: 'yellow-bronze', label: 'Bronze', bg: '#B45309', family: 'yellow', defaultText: 'white' },
+
+  // —— Orange ——
+  { id: 'orange-peach', label: 'Peach', bg: '#FFEDD5', family: 'orange', defaultText: 'black' },
+  { id: 'orange-soft', label: 'Soft', bg: '#FDBA74', family: 'orange', defaultText: 'black' },
+  { id: 'orange', label: 'Classic', bg: '#F97316', family: 'orange', defaultText: 'black' },
+  { id: 'orange-vivid', label: 'Vivid', bg: '#EA580C', family: 'orange', defaultText: 'white' },
+  { id: 'orange-deep', label: 'Deep', bg: '#C2410C', family: 'orange', defaultText: 'white' },
+  { id: 'orange-rust', label: 'Rust', bg: '#9A3412', family: 'orange', defaultText: 'white' },
+
+  // —— Red ——
+  { id: 'red-blush', label: 'Blush', bg: '#FEE2E2', family: 'red', defaultText: 'black' },
+  { id: 'coral', label: 'Coral', bg: '#FB7185', family: 'red', defaultText: 'black' },
+  { id: 'rose', label: 'Rose', bg: '#F43F5E', family: 'red', defaultText: 'white' },
+  { id: 'red', label: 'Classic', bg: '#EF4444', family: 'red', defaultText: 'white' },
+  { id: 'red-crimson', label: 'Crimson', bg: '#DC2626', family: 'red', defaultText: 'white' },
+  { id: 'red-deep', label: 'Deep', bg: '#B91C1C', family: 'red', defaultText: 'white' },
+  { id: 'red-wine', label: 'Wine', bg: '#7F1D1D', family: 'red', defaultText: 'white' },
+
+  // —— Pink / magenta ——
+  { id: 'pink-blush', label: 'Blush', bg: '#FCE7F3', family: 'pink', defaultText: 'black' },
+  { id: 'pink-soft', label: 'Soft', bg: '#F9A8D4', family: 'pink', defaultText: 'black' },
+  { id: 'pink', label: 'Classic', bg: '#EC4899', family: 'pink', defaultText: 'white' },
+  { id: 'pink-hot', label: 'Hot', bg: '#DB2777', family: 'pink', defaultText: 'white' },
+  { id: 'pink-fuchsia', label: 'Fuchsia', bg: '#C026D3', family: 'pink', defaultText: 'white' },
+  { id: 'pink-deep', label: 'Deep', bg: '#9D174D', family: 'pink', defaultText: 'white' },
+
+  // —— Green ——
+  { id: 'green-mint', label: 'Mint', bg: '#D1FAE5', family: 'green', defaultText: 'black' },
+  { id: 'mint', label: 'Soft mint', bg: '#6EE7B7', family: 'green', defaultText: 'black' },
+  { id: 'green-lime', label: 'Lime', bg: '#84CC16', family: 'green', defaultText: 'black' },
+  { id: 'green', label: 'Classic', bg: '#22C55E', family: 'green', defaultText: 'black' },
+  { id: 'green-emerald', label: 'Emerald', bg: '#059669', family: 'green', defaultText: 'white' },
+  { id: 'green-teal', label: 'Teal', bg: '#0D9488', family: 'green', defaultText: 'white' },
+  { id: 'forest', label: 'Forest', bg: '#14532D', family: 'green', defaultText: 'white' },
+  { id: 'green-pine', label: 'Pine', bg: '#052E16', family: 'green', defaultText: 'white' },
+
+  // —— Blue ——
+  { id: 'blue-ice', label: 'Ice', bg: '#E0F2FE', family: 'blue', defaultText: 'black' },
+  { id: 'sky', label: 'Sky', bg: '#38BDF8', family: 'blue', defaultText: 'black' },
+  { id: 'blue-soft', label: 'Soft', bg: '#60A5FA', family: 'blue', defaultText: 'black' },
+  { id: 'blue', label: 'Classic', bg: '#3B82F6', family: 'blue', defaultText: 'white' },
+  { id: 'blue-royal', label: 'Royal', bg: '#2563EB', family: 'blue', defaultText: 'white' },
+  { id: 'indigo', label: 'Indigo', bg: '#6366F1', family: 'blue', defaultText: 'white' },
+  { id: 'blue-navy', label: 'Navy blue', bg: '#1E3A8A', family: 'blue', defaultText: 'white' },
+  { id: 'navy', label: 'Navy', bg: '#0F172A', family: 'blue', defaultText: 'white' },
+
+  // —— Purple / violet ——
+  { id: 'purple-lilac', label: 'Lilac', bg: '#F3E8FF', family: 'purple', defaultText: 'black' },
+  { id: 'purple-soft', label: 'Soft', bg: '#C4B5FD', family: 'purple', defaultText: 'black' },
+  { id: 'violet', label: 'Violet', bg: '#8B5CF6', family: 'purple', defaultText: 'white' },
+  { id: 'purple', label: 'Classic', bg: '#A855F7', family: 'purple', defaultText: 'white' },
+  { id: 'purple-deep', label: 'Deep', bg: '#7C3AED', family: 'purple', defaultText: 'white' },
+  { id: 'purple-plum', label: 'Plum', bg: '#581C87', family: 'purple', defaultText: 'white' },
+
+  // —— Brown / sand / warm neutrals ——
+  { id: 'sand', label: 'Sand', bg: '#F5E6C8', family: 'brown', defaultText: 'black' },
+  { id: 'brown-tan', label: 'Tan', bg: '#D6B88C', family: 'brown', defaultText: 'black' },
+  { id: 'brown-khaki', label: 'Khaki', bg: '#C4A574', family: 'brown', defaultText: 'black' },
+  { id: 'brown', label: 'Classic', bg: '#A16207', family: 'brown', defaultText: 'white' },
+  { id: 'brown-coffee', label: 'Coffee', bg: '#78350F', family: 'brown', defaultText: 'white' },
+  { id: 'brown-espresso', label: 'Espresso', bg: '#451A03', family: 'brown', defaultText: 'white' },
+
+  // —— Grey ——
+  { id: 'grey-cloud', label: 'Cloud', bg: '#F3F4F6', family: 'grey', defaultText: 'black' },
+  { id: 'grey-silver', label: 'Silver', bg: '#D1D5DB', family: 'grey', defaultText: 'black' },
+  { id: 'grey', label: 'Classic', bg: '#9CA3AF', family: 'grey', defaultText: 'black' },
+  { id: 'slate', label: 'Slate', bg: '#334155', family: 'grey', defaultText: 'white' },
+  { id: 'charcoal', label: 'Charcoal', bg: '#1E293B', family: 'grey', defaultText: 'white' },
+  { id: 'grey-graphite', label: 'Graphite', bg: '#111827', family: 'grey', defaultText: 'white' },
+
+  // —— Black (faded / soft first — best with digital photo backgrounds) ——
+  { id: 'black-faded', label: 'Faded', bg: '#1A1A1E', family: 'black', defaultText: 'white' },
+  { id: 'black-soft', label: 'Soft black', bg: '#27272A', family: 'black', defaultText: 'white' },
+  { id: 'black-smoke', label: 'Smoke', bg: '#16161A', family: 'black', defaultText: 'white' },
+  { id: 'black', label: 'Classic', bg: '#111111', family: 'black', defaultText: 'white' },
+  { id: 'black-ink', label: 'Ink', bg: '#0A0A0A', family: 'black', defaultText: 'white' },
+  { id: 'black-void', label: 'Void', bg: '#000000', family: 'black', defaultText: 'white' },
+
+  // —— White / paper ——
+  { id: 'white', label: 'White', bg: '#FFFFFF', family: 'white', defaultText: 'black' },
+  { id: 'white-snow', label: 'Snow', bg: '#FAFAFA', family: 'white', defaultText: 'black' },
+  { id: 'cream', label: 'Paper cream', bg: '#FFFBF0', family: 'white', defaultText: 'black' },
+  { id: 'white-ivory', label: 'Ivory', bg: '#FFFFF0', family: 'white', defaultText: 'black' },
+  { id: 'white-linen', label: 'Linen', bg: '#FAF7F2', family: 'white', defaultText: 'black' },
+]
+
+const SHARE_CARD_COLOR_FAMILIES: Array<{ id: ShareCardColorFamily; label: string }> = [
+  { id: 'yellow', label: 'Yellow' },
+  { id: 'orange', label: 'Orange' },
+  { id: 'red', label: 'Red' },
+  { id: 'pink', label: 'Pink' },
+  { id: 'green', label: 'Green' },
+  { id: 'blue', label: 'Blue' },
+  { id: 'purple', label: 'Purple' },
+  { id: 'brown', label: 'Brown' },
+  { id: 'grey', label: 'Grey' },
+  { id: 'black', label: 'Black' },
+  { id: 'white', label: 'White' },
+]
+
+/** Text / price ink — families with multiple shades. */
+const SHARE_TEXT_COLOR_PRESETS: Array<{
+  id: ShareTextColorId
+  label: string
+  hex: string
+  muted: string
+  soft: string
+  family: 'black' | 'grey' | 'white' | 'warm' | 'cool'
+}> = [
+  // Black family
+  { id: 'black', label: 'Black', hex: '#111111', muted: 'rgba(17,17,17,0.62)', soft: 'rgba(17,17,17,0.82)', family: 'black' },
+  { id: 'ink', label: 'Ink', hex: '#0A0A0A', muted: 'rgba(10,10,10,0.62)', soft: 'rgba(10,10,10,0.85)', family: 'black' },
+  { id: 'charcoal-text', label: 'Charcoal', hex: '#1F2937', muted: 'rgba(31,41,55,0.65)', soft: 'rgba(31,41,55,0.88)', family: 'black' },
+  { id: 'near-black', label: 'Near black', hex: '#171717', muted: 'rgba(23,23,23,0.62)', soft: 'rgba(23,23,23,0.84)', family: 'black' },
+
+  // Grey family
+  { id: 'grey-dark', label: 'Dark grey', hex: '#374151', muted: 'rgba(55,65,81,0.7)', soft: 'rgba(55,65,81,0.9)', family: 'grey' },
+  { id: 'grey', label: 'Grey', hex: '#6B7280', muted: 'rgba(107,114,128,0.85)', soft: 'rgba(107,114,128,0.95)', family: 'grey' },
+  { id: 'grey-mid', label: 'Mid grey', hex: '#9CA3AF', muted: 'rgba(156,163,175,0.85)', soft: 'rgba(156,163,175,0.95)', family: 'grey' },
+  { id: 'grey-light', label: 'Light grey', hex: '#D1D5DB', muted: 'rgba(209,213,219,0.8)', soft: 'rgba(209,213,219,0.95)', family: 'grey' },
+  { id: 'slate-text', label: 'Slate', hex: '#475569', muted: 'rgba(71,85,105,0.72)', soft: 'rgba(71,85,105,0.9)', family: 'grey' },
+
+  // White family
+  { id: 'white', label: 'White', hex: '#FFFFFF', muted: 'rgba(255,255,255,0.72)', soft: 'rgba(255,255,255,0.88)', family: 'white' },
+  { id: 'off-white', label: 'Off-white', hex: '#F8FAFC', muted: 'rgba(248,250,252,0.72)', soft: 'rgba(248,250,252,0.9)', family: 'white' },
+  { id: 'snow', label: 'Snow', hex: '#FAFAFA', muted: 'rgba(250,250,250,0.7)', soft: 'rgba(250,250,250,0.88)', family: 'white' },
+  { id: 'ivory-text', label: 'Ivory', hex: '#FFFBEB', muted: 'rgba(255,251,235,0.72)', soft: 'rgba(255,251,235,0.9)', family: 'white' },
+
+  // Warm inks (on light cards)
+  { id: 'brown-text', label: 'Brown', hex: '#78350F', muted: 'rgba(120,53,15,0.7)', soft: 'rgba(120,53,15,0.88)', family: 'warm' },
+  { id: 'coffee-text', label: 'Coffee', hex: '#451A03', muted: 'rgba(69,26,3,0.68)', soft: 'rgba(69,26,3,0.88)', family: 'warm' },
+  { id: 'maroon-text', label: 'Maroon', hex: '#7F1D1D', muted: 'rgba(127,29,29,0.7)', soft: 'rgba(127,29,29,0.88)', family: 'warm' },
+
+  // Cool inks
+  { id: 'navy-text', label: 'Navy', hex: '#0F172A', muted: 'rgba(15,23,42,0.65)', soft: 'rgba(15,23,42,0.88)', family: 'cool' },
+  { id: 'indigo-text', label: 'Indigo', hex: '#312E81', muted: 'rgba(49,46,129,0.7)', soft: 'rgba(49,46,129,0.9)', family: 'cool' },
+  { id: 'teal-text', label: 'Teal', hex: '#134E4A', muted: 'rgba(19,78,74,0.7)', soft: 'rgba(19,78,74,0.9)', family: 'cool' },
+]
+
+const SHARE_TEXT_COLOR_FAMILIES: Array<{
+  id: 'black' | 'grey' | 'white' | 'warm' | 'cool'
+  label: string
+}> = [
+  { id: 'black', label: 'Black' },
+  { id: 'grey', label: 'Grey' },
+  { id: 'white', label: 'White' },
+  { id: 'warm', label: 'Warm' },
+  { id: 'cool', label: 'Cool' },
 ]
 
 function shareCardBgHex(id: ShareCardColorId | undefined): string {
   const found = SHARE_CARD_COLOR_PRESETS.find((p) => p.id === id)
-  return found?.bg || SHARE_CARD_COLOR_PRESETS[0].bg
+  return found?.bg || SHARE_CARD_COLOR_PRESETS.find((p) => p.id === 'yellow')?.bg || '#F5B800'
+}
+
+function shareCardPreset(id: ShareCardColorId | undefined) {
+  return (
+    SHARE_CARD_COLOR_PRESETS.find((p) => p.id === id) ||
+    SHARE_CARD_COLOR_PRESETS.find((p) => p.id === 'yellow') ||
+    SHARE_CARD_COLOR_PRESETS[0]
+  )
+}
+
+function shareTextPreset(color: ShareTextColorId | undefined) {
+  return (
+    SHARE_TEXT_COLOR_PRESETS.find((p) => p.id === color) ||
+    SHARE_TEXT_COLOR_PRESETS.find((p) => p.id === 'black') ||
+    SHARE_TEXT_COLOR_PRESETS[0]
+  )
 }
 
 function shareTextFillColor(color: ShareTextColorId | undefined): string {
-  if (color === 'white') return '#FFFFFF'
-  if (color === 'grey') return '#6B7280'
-  return '#111111'
+  return shareTextPreset(color).hex
 }
 
 function shareTextMutedColor(color: ShareTextColorId | undefined): string {
-  if (color === 'white') return 'rgba(255, 255, 255, 0.72)'
-  if (color === 'grey') return 'rgba(107, 114, 128, 0.85)'
-  return 'rgba(17, 17, 17, 0.62)'
+  return shareTextPreset(color).muted
 }
 
-function hexToRgba(hex: string, alpha: number): string {
+function shareTextSoftColor(color: ShareTextColorId | undefined): string {
+  return shareTextPreset(color).soft
+}
+
+/** Parse #RGB / #RRGGBB → [r,g,b] or null. */
+function parseHexRgb(hex: string): [number, number, number] | null {
   const raw = String(hex || '').replace('#', '').trim()
   const full =
     raw.length === 3
@@ -1001,14 +3689,76 @@ function hexToRgba(hex: string, alpha: number): string {
           .map((c) => c + c)
           .join('')
       : raw
-  if (full.length !== 6) return `rgba(0,0,0,${alpha})`
+  if (full.length !== 6) return null
   const n = parseInt(full, 16)
-  if (!Number.isFinite(n)) return `rgba(0,0,0,${alpha})`
-  const r = (n >> 16) & 255
-  const g = (n >> 8) & 255
-  const b = n & 255
-  return `rgba(${r},${g},${b},${alpha})`
+  if (!Number.isFinite(n)) return null
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
 }
+
+function rgbToHex(r: number, g: number, b: number): string {
+  const c = (n: number) =>
+    Math.min(255, Math.max(0, Math.round(n)))
+      .toString(16)
+      .padStart(2, '0')
+  return `#${c(r)}${c(g)}${c(b)}`
+}
+
+/** Lift a hex toward white by `amount` (0–1). */
+function lightenHex(hex: string, amount: number): string {
+  const rgb = parseHexRgb(hex)
+  if (!rgb) return hex
+  const a = Math.min(1, Math.max(0, amount))
+  return rgbToHex(
+    rgb[0] + (255 - rgb[0]) * a,
+    rgb[1] + (255 - rgb[1]) * a,
+    rgb[2] + (255 - rgb[2]) * a,
+  )
+}
+
+/** Push a hex toward black by `amount` (0–1). */
+function darkenHex(hex: string, amount: number): string {
+  const rgb = parseHexRgb(hex)
+  if (!rgb) return hex
+  const a = Math.min(1, Math.max(0, amount))
+  return rgbToHex(rgb[0] * (1 - a), rgb[1] * (1 - a), rgb[2] * (1 - a))
+}
+
+/**
+ * Soften pure void / ink blacks into a faded charcoal for digital-bg overlays.
+ * Keeps a little color so the veil isn’t a flat pure-black plate.
+ */
+function softenBlackCardHex(hex: string): string {
+  const rgb = parseHexRgb(hex)
+  if (!rgb) return '#141418'
+  const [r, g, b] = rgb
+  // Already soft enough
+  if (r + g + b > 60) return hex
+  // Lift pure blacks toward a warm-neutral faded black
+  return rgbToHex(Math.max(r, 18), Math.max(g, 18), Math.max(b, 22))
+}
+
+/** Relative luminance — true when bg needs light text / light chrome. */
+function isDarkHex(hex: string): boolean {
+  const rgb = parseHexRgb(hex)
+  if (!rgb) return false
+  const [r, g, b] = rgb
+  // sRGB relative luminance
+  const lin = (c: number) => {
+    const s = c / 255
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+  }
+  const L = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+  return L < 0.42
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const rgb = parseHexRgb(hex)
+  if (!rgb) return `rgba(0,0,0,${alpha})`
+  return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`
+}
+
+/** Named faces for share-card type (maps to CSS / Google Sans Flex weights). */
+type ShareFontWeight = 'light' | 'regular' | 'medium' | 'semibold' | 'bold' | 'extrabold'
 
 /** Live-editable share-card layout (tweet preview sliders). */
 type ShareCardStyle = {
@@ -1028,6 +3778,16 @@ type ShareCardStyle = {
   cardColor: ShareCardColorId
   /** Title, reason, brand, stamp body text */
   textColor: ShareTextColorId
+  /**
+   * Green shade for positive % + chart line (0–4).
+   * Forest · Deep · Classic · Bright · Lime
+   */
+  upColorShade: ShareMoveShadeId
+  /**
+   * Red shade for negative % + chart line (0–4).
+   * Burgundy · Crimson · Classic · Coral · Rose
+   */
+  downColorShade: ShareMoveShadeId
   /** Left/right content padding (px at 1080 width) */
   imagePadding: number
   /** Top padding above logo / title band */
@@ -1036,42 +3796,598 @@ type ShareCardStyle = {
   footerPadding: number
   stampFontSize: number
   reasonFontSize: number
-  /** Company name weight */
-  nameBold: boolean
-  /** Reason / likely-driver weight */
-  reasonBold: boolean
+  /**
+   * Font weights (Google Sans Flex): light 300 · regular 400 · medium 500 ·
+   * semibold 600 · bold 700 · extrabold 800
+   * Legacy nameBold / reasonBold / sessionBold / brandBold still migrate on load.
+   */
+  nameWeight: ShareFontWeight
+  reasonWeight: ShareFontWeight
+  sessionWeight: ShareFontWeight
+  brandWeight: ShareFontWeight
+  /** @deprecated use nameWeight */
+  nameBold?: boolean
+  /** @deprecated use reasonWeight */
+  reasonBold?: boolean
+  /** @deprecated use sessionWeight */
+  sessionBold?: boolean
+  /** @deprecated use brandWeight */
+  brandBold?: boolean
+  /** Session first-line font size (px @ 1080w; scales with canvas width). */
+  sessionFontSize: number
+  /** Space above the session line (after chart / before headline). */
+  sessionMarginTop: number
+  /** Space below session block (after stamp if any → before reason). */
+  sessionMarginBottom: number
+  /** Gap between session line and the “Today · time” stamp under it. */
+  sessionStampGap: number
+  /**
+   * Gap between the timestamp (under session) and the reason body.
+   * Only used when session headline is on and stamp sits under it.
+   */
+  stampReasonGap: number
+  /** Line-height multiplier for multi-line session text (1.0–1.6). */
+  sessionLineHeight: number
+  /** Space below reason body → before “Track at Trigger” footer. */
+  reasonMarginBottom: number
+  /** Extra space above the Track at Trigger row (added on top of reason gap). */
+  brandMarginTop: number
+  /** Space below Track at Trigger row before the card bottom edge. */
+  brandMarginBottom: number
+  /** “Track at Trigger” brand text size (px @ 1080w). */
+  brandFontSize: number
+  /**
+   * Vertical scale for “Track at Trigger” text (1 = natural font height).
+   * 0.6–2.0; stretches only height so width stays from brandFontSize.
+   */
+  brandHeightScale: number
+  /** Show / hide the “Track at Trigger” footer text. */
+  showBrand: boolean
+  /**
+   * Footer brand position on the card:
+   * - left = bottom-left
+   * - right = bottom-right (default)
+   * - center = bottom-center
+   */
+  brandPlacement: 'left' | 'right' | 'center'
   /** Show company name vs ticker symbol as the title */
   titleMode: 'company' | 'ticker'
   /**
-   * When true (default), date · timestamp is on the footer row (left of “Track at Trigger”).
-   * When false, date stamp sits under the share price (right, under %).
+   * Share price under the big % change (header right).
+   * On by default; turn off to drop $price from the image.
    */
-  dateInFooter: boolean
+  showSharePrice: boolean
+  /**
+   * First Gemini headline line (“… so far in regular trading” / “in pre-market…”):
+   * on by default; turn off to drop it from the image.
+   */
+  showSessionHeadline: boolean
+  /**
+   * Session first-line tone (magnitude-aware variants):
+   * classic · intensity · breaking · punchy
+   */
+  sessionLineTone: 'classic' | 'intensity' | 'breaking' | 'punchy'
+  /**
+   * “Track at Trigger” brand COLOR (not weight):
+   * - auto = follow body text color
+   * - dark / light = force black or white brand
+   */
+  brandTone: 'auto' | 'dark' | 'light'
+  /**
+   * Prefer a squarish card (compress vertical gaps when the layout would be very tall).
+   * On by default. Combined with aspectRatio target.
+   */
+  preferSquare: boolean
+  /**
+   * Canvas width in px (export size). Default 1920 (Full HD).
+   * Design tokens are authored @ 1080 and scale with width.
+   */
+  canvasWidth: number
+  /**
+   * Target height ÷ width.
+   * 1.0 = square · lower = wider · higher = taller.
+   * Used when preferSquare is on (layout pads/compresses toward this).
+   */
+  aspectRatio: number
+  /** Where the date + time is drawn when session headline is off. */
+  timestampPlacement: 'footer-left' | 'price-right'
+  /** Legacy preference retained only so older saved settings can be migrated. */
+  dateInFooter?: boolean
+  /** Hero photo (replaces chart slot; chart draws below). Height in px @ 1080w. */
+  photoHeight: number
+  /** Corner radius of the hero photo frame */
+  photoRadius: number
+  /** Outer border width on the photo */
+  photoBorderWidth: number
+  /** Horizontal inset of photo from content edges (extra padding L/R) */
+  photoMarginX: number
+  /** Space above the photo (after header → photo gap) */
+  photoMarginTop: number
+  /** Space between photo bottom and the line chart */
+  photoMarginBottom: number
+  /** 0–100 frosted inset rim strength */
+  photoFrost: number
+  /**
+   * How opaque the digital background image is (0 = invisible · 100 = full).
+   * Full-bleed under content.
+   */
+  bgImageOpacity: number
+  /**
+   * Background photo blur in px (0 = crisp / sharp · 80 = heavy soft fade).
+   * Lower = clearer image for social posts.
+   */
+  bgBlur: number
+  /**
+   * Black axis over the background image (−100 … +100).
+   * −100 = lift shadows / less black · 0 = neutral · +100 = heavy black veil.
+   * @deprecated use bgBlack (migrated on load)
+   */
+  bgBlackFade?: number
+  /** Black axis (−100 … +100) — see above. */
+  bgBlack: number
+  /**
+   * White axis over the background image (−100 … +100).
+   * −100 = crush highlights · 0 = neutral · +100 = white / bright wash.
+   */
+  bgWhite: number
+  /** @deprecated frame plate removed; kept for old prefs */
+  bgFrameEnabled?: boolean
+  /** @deprecated */
+  bgFrameMargin?: number
+  /** @deprecated */
+  bgFrameRadius?: number
+  /** @deprecated */
+  bgFrameFill?: number
+  /**
+   * How the pasted image is used on the card:
+   * - background: full-card digital backdrop only (default — no hero above/below header)
+   * - above-header / below-header / below-chart: framed hero slot (legacy)
+   */
+  photoPlacement: 'background' | 'above-header' | 'below-header' | 'below-chart'
+  /**
+   * How many trading sessions to show on the line chart (ending on event day).
+   * 1 = today only · 2 = yesterday+today · 3 · 5
+   */
+  chartSessionDays: ShareChartSessionDays
+  /** Yahoo bar interval for chart pricing (1m · 2m · 5m · …). */
+  chartInterval: ShareChartInterval
+  /** Price-line stroke width on the share chart (canvas px, 1–24). */
+  chartLineWidth: number
+  /**
+   * Plot area height for the line chart (design px @ 1080, before axis labels).
+   * Taller = more “zoomed” vertical moves / longer chart block.
+   */
+  chartPlotHeight: number
+  /**
+   * Trim chart from the left (0–90%). End is always event/stamp time.
+   * 0 = full selected session range · 50 = start halfway through · …
+   */
+  chartVisibleStartPct: number
+  /** Show time ticks under the chart (0m / 9:30 AM…). */
+  showChartTimeAxis: boolean
+  /**
+   * Show calendar day labels under the chart (Today · 5 Aug).
+   * Useful for multi-day session ranges.
+   */
+  showChartDayLabels: boolean
+  /** Extra space (px) between time ticks and day labels. */
+  chartTimeDayGap: number
+  /**
+   * Day label wording:
+   * today-long / today-short = Today + calendar dates
+   * date-long / date-short = always calendar dates
+   * relative / relative-short = Today · Yesterday · Back · …
+   */
+  chartDayLabelMode: ShareChartDayLabelMode
+  /**
+   * Chart x-axis labels:
+   * - elapsed = “0m · 15m · 1h …” from session open
+   * - timestamp = wall clock “9:30 AM · 10:00 AM …”
+   */
+  chartAxisMode: 'elapsed' | 'timestamp'
+  /** Timezone for timestamp-mode axis (and stamp display when absolute). */
+  chartAxisTimezone: ShareChartTimezone
+  /**
+   * How many x-axis labels under the chart (including start + end).
+   * Range 3–10; default 5.
+   */
+  chartAxisLabelCount: number
+  /**
+   * Markers on the line chart:
+   * off · price · percent · both (% above, price below)
+   */
+  chartPointLabelMode: ShareChartPointLabelMode
+  /** @deprecated use chartPointLabelMode */
+  showChartPriceLabels?: boolean
+  /**
+   * How many points on the chart (3–8), including first + last.
+   * Only used when chartPointLabelMode is not off.
+   */
+  chartPriceLabelCount: number
+  /**
+   * Custom time-axis labels under the chart (one per line).
+   * Empty = auto (elapsed / clock). Extra lines ignored; missing = keep auto for that slot.
+   */
+  chartAxisLabelsCustom: string
+  /**
+   * Custom labels on the line (one per line, top / primary).
+   * Empty = auto price or % from data.
+   */
+  chartPointLabelsCustom: string
+  /**
+   * When mode is both: custom bottom labels (prices), one per line.
+   * Empty = auto $ price under each %.
+   */
+  chartPointSubLabelsCustom: string
+  /** Font size for time-axis labels under the chart (px @ 1080w). */
+  chartAxisFontSize: number
+  /** Font size for price / % labels on the line (px @ 1080w). */
+  chartPointFontSize: number
+  /** App Store + Play icons next to “Track at Trigger”. */
+  showStoreBadges: boolean
+  /** circle = both store icons · badge = App Store badge only */
+  storeBadgeStyle: 'circle' | 'badge'
+  /** Store icon / badge height (px @ 1080w). */
+  storeIconSize: number
+  /**
+   * Horizontal scale for store icons / badge (1 = natural width from height × aspect).
+   * 0.5–2.0; lets width be tuned independently of height.
+   */
+  storeIconWidthScale: number
+  /**
+   * Rubber “thappa” stamp over the card (breaking / exploding feel).
+   * off · auto (≥10% or breaking tone) · on
+   */
+  newsStampMode: 'off' | 'auto' | 'on'
+  /** Stamp wording preset; auto picks from move direction + size. */
+  newsStampKind: 'auto' | 'breaking' | 'exploding' | 'surge' | 'crash' | 'alert'
+  /**
+   * Custom center lines (newline-separated). Empty = use kind preset.
+   * e.g. "BREAKING\nNEWS" or "EXPLODING"
+   */
+  newsStampCenterText: string
+  /** Custom ring arc text. Empty = use kind preset (e.g. FLASH ALERT). */
+  newsStampRingText: string
+  /** Ink color id (family shade, e.g. red-crimson · black-ink · gold · auto). */
+  newsStampColor: string
+  /**
+   * Stamp look:
+   * - circle = double-ring seal (top/bottom arc text + center banner)
+   * - rect = rectangular CERTIFIED-style box stamp
+   */
+  newsStampStyle: 'circle' | 'rect'
+  /** Horizontal position 0–100 (% of card width). 50 = center. */
+  newsStampX: number
+  /** Vertical position 0–100 (% of card height). 42 ≈ upper-mid. */
+  newsStampY: number
+  /** Dotted / grain density 0–100 (sparse → dense). */
+  newsStampDotDensity: number
+  /** Stamp diameter in px @ 1080w (size / scale). */
+  newsStampSize: number
+  /** Rotation in degrees (negative = classic rubber-stamp tilt). */
+  newsStampRotation: number
+  /** 0–100 overall opacity / fade. */
+  newsStampOpacity: number
 }
 
+/** Zones offered for absolute chart timestamps. */
+type ShareChartTimezone =
+  | 'America/New_York'
+  | 'Europe/London'
+  | 'Asia/Kolkata'
+  | 'UTC'
+
+const SHARE_CHART_TIMEZONES: Array<{
+  id: ShareChartTimezone
+  label: string
+  short: string
+}> = [
+  { id: 'America/New_York', label: 'US Eastern (ET)', short: 'ET' },
+  { id: 'Europe/London', label: 'UK (London)', short: 'UK' },
+  { id: 'Asia/Kolkata', label: 'India (IST)', short: 'IST' },
+  { id: 'UTC', label: 'UTC', short: 'UTC' },
+]
+
+/** Short zone label for stamps / axis: ET, EDT, EST, GMT, BST, IST, UTC. */
+function shareTimezoneAbbrev(
+  tz: ShareChartTimezone | undefined,
+  atMs: number = Date.now(),
+): string {
+  const zone =
+    tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz) ? tz : 'America/New_York'
+  if (zone === 'Asia/Kolkata') return 'IST'
+  if (zone === 'UTC') return 'UTC'
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone,
+      timeZoneName: 'short',
+    }).formatToParts(new Date(atMs))
+    const raw = parts.find((p) => p.type === 'timeZoneName')?.value || ''
+    if (zone === 'America/New_York') {
+      if (raw === 'EDT' || raw === 'EST') return raw
+      // Engines that emit GMT-4 / GMT-5
+      return 'ET'
+    }
+    if (zone === 'Europe/London') {
+      if (raw === 'BST' || raw === 'GMT') return raw
+      if (/GMT\+1/i.test(raw) || /UTC\+1/i.test(raw)) return 'BST'
+      return 'GMT'
+    }
+    if (raw && !/^GMT[+-]/i.test(raw) && !/^UTC[+-]/i.test(raw)) return raw
+  } catch {
+    /* fall through */
+  }
+  return SHARE_CHART_TIMEZONES.find((z) => z.id === zone)?.short || 'ET'
+}
+
+/** Append / replace trailing zone token so “3:33 PM” → “3:33 PM ET”. */
+function withTimezoneSuffix(text: string, abbrev: string): string {
+  const s = String(text || '').trim()
+  if (!s || !abbrev) return s
+  const stripped = s
+    .replace(
+      /\s+\b(ET|EST|EDT|GMT|BST|IST|UTC|UK|GMT[+-][\d:]+|UTC[+-][\d:]+)\b\s*$/i,
+      '',
+    )
+    .trim()
+  return `${stripped} ${abbrev}`
+}
+
+/**
+ * Parse event.time_label as US/Eastern wall time on event_date → UTC ms.
+ * Used to re-show the clock in another zone.
+ */
+function eventEasternWallTimeToUtcMs(
+  event: Pick<PriceMovementEvent, 'event_date' | 'time_label'>,
+): number | null {
+  const dateKey = String(event.event_date || '').slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return null
+  const mins = parseShareStampCutoffMinutes(event, event.time_label)
+  if (mins == null) return null
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  // Guess UTC then refine so America/New_York wall matches (handles EDT/EST).
+  let utc = Date.parse(
+    `${dateKey}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00.000Z`,
+  )
+  if (!Number.isFinite(utc)) return null
+  for (let i = 0; i < 4; i += 1) {
+    const et = etPartsFromMs(utc)
+    // etParts dateKey uses en-US month/day; normalize
+    const wantDate = dateKey
+    const gotDate = et.dateKey
+    // et.dateKey is YYYY-MM-DD from our helper
+    const deltaMin = (h * 60 + m) - et.minutesFromMidnight
+    // Also correct day slip
+    let dayDelta = 0
+    if (gotDate !== wantDate) {
+      const wantT = Date.parse(`${wantDate}T12:00:00Z`)
+      const gotT = Date.parse(`${gotDate}T12:00:00Z`)
+      dayDelta = Math.round((wantT - gotT) / 86400000) * 24 * 60
+    }
+    const adj = (deltaMin + dayDelta) * 60 * 1000
+    if (adj === 0) break
+    utc += adj
+  }
+  return utc
+}
+
+const SHARE_FONT_WEIGHT_OPTIONS: Array<{ id: ShareFontWeight; label: string; css: number }> = [
+  { id: 'light', label: 'Light', css: 300 },
+  { id: 'regular', label: 'Regular', css: 400 },
+  { id: 'medium', label: 'Medium', css: 500 },
+  { id: 'semibold', label: 'SemiBold', css: 600 },
+  { id: 'bold', label: 'Bold', css: 700 },
+  { id: 'extrabold', label: 'ExtraBold', css: 800 },
+]
+
+function shareFontWeightCss(w: ShareFontWeight | undefined, fallback: ShareFontWeight): number {
+  const id = w && SHARE_FONT_WEIGHT_OPTIONS.some((o) => o.id === w) ? w : fallback
+  return SHARE_FONT_WEIGHT_OPTIONS.find((o) => o.id === id)?.css ?? 400
+}
+
+function parseShareFontWeight(
+  value: unknown,
+  legacyBold: boolean | undefined,
+  whenTrue: ShareFontWeight,
+  whenFalse: ShareFontWeight,
+): ShareFontWeight {
+  if (typeof value === 'string' && SHARE_FONT_WEIGHT_OPTIONS.some((o) => o.id === value)) {
+    return value as ShareFontWeight
+  }
+  if (legacyBold === true) return whenTrue
+  if (legacyBold === false) return whenFalse
+  return whenFalse
+}
+
+/**
+ * Defaults mirror mobile share-card design tokens
+ * (Google Sans Flex / AppFont · 1080-wide canvas).
+ */
 const DEFAULT_SHARE_CARD_STYLE: ShareCardStyle = {
-  gapBeforeChart: 10,
-  gapAfterChart: 142,
-  logoSize: 106,
-  nameFontSize: 60,
-  pctFontSize: 90,
-  priceFontSize: 32,
+  gapBeforeChart: 8,
+  gapAfterChart: 40,
+  logoSize: 86,
+  nameFontSize: 56, // company ExtraBold
+  pctFontSize: 80, // % Bold
+  priceFontSize: 36, // price SemiBold
   priceFontWeight: 600,
   priceColor: 'black',
   cardColor: 'yellow',
   textColor: 'black',
-  imagePadding: 48,
-  headerPadding: 88,
-  footerPadding: 48,
-  stampFontSize: 30,
-  reasonFontSize: 60,
-  nameBold: true,
-  reasonBold: false,
+  upColorShade: 2,
+  downColorShade: 2,
+  imagePadding: 44,
+  headerPadding: 56,
+  footerPadding: 40,
+  stampFontSize: 34, // reasonWhen Medium
+  reasonFontSize: 40, // reasonDriver Regular
+  nameWeight: 'extrabold',
+  reasonWeight: 'regular',
+  sessionWeight: 'semibold',
+  brandWeight: 'medium',
+  sessionFontSize: 52, // reasonTitle SemiBold
+  sessionMarginTop: 8,
+  sessionMarginBottom: 28,
+  sessionStampGap: 14,
+  stampReasonGap: 28,
+  sessionLineHeight: 66 / 52, // 66 line-height @ 52 size
+  reasonMarginBottom: 56, // gap reason → Track at Trigger
+  brandMarginTop: 0,
+  brandMarginBottom: 40,
+  brandFontSize: 28, // footerBrand
+  brandHeightScale: 1,
+  showBrand: true,
+  brandPlacement: 'right',
   titleMode: 'company',
-  dateInFooter: true,
+  showSharePrice: true,
+  showSessionHeadline: true,
+  sessionLineTone: 'classic',
+  brandTone: 'auto',
+  preferSquare: true,
+  canvasWidth: 1920, // Full HD export width (design tokens scale from 1080)
+  aspectRatio: 1.05,
+  timestampPlacement: 'footer-left',
+  photoHeight: 360,
+  photoRadius: 28,
+  photoBorderWidth: 3,
+  photoMarginX: 0,
+  photoMarginTop: 0,
+  photoMarginBottom: 20,
+  photoFrost: 55,
+  bgImageOpacity: 100,
+  /** 0 = sharp social-ready image (default); raise only for soft glass look */
+  bgBlur: 0,
+  /** Neutral black axis so photo is not pre-faded */
+  bgBlack: 0,
+  bgWhite: 0,
+  photoPlacement: 'background',
+  chartSessionDays: 2,
+  chartInterval: '1m',
+  chartLineWidth: 4,
+  chartPlotHeight: 300,
+  chartVisibleStartPct: 0,
+  showChartTimeAxis: true,
+  showChartDayLabels: true,
+  chartTimeDayGap: 14,
+  chartDayLabelMode: 'today-long',
+  chartAxisMode: 'elapsed',
+  chartAxisTimezone: 'America/New_York',
+  chartAxisLabelCount: 5,
+  chartPointLabelMode: 'off',
+  chartPriceLabelCount: 4,
+  chartAxisLabelsCustom: '',
+  chartPointLabelsCustom: '',
+  chartPointSubLabelsCustom: '',
+  chartAxisFontSize: 18,
+  chartPointFontSize: 16,
+  showStoreBadges: true,
+  storeBadgeStyle: 'circle',
+  storeIconSize: 36,
+  storeIconWidthScale: 1,
+  newsStampMode: 'auto',
+  newsStampKind: 'auto',
+  newsStampCenterText: '',
+  newsStampRingText: '',
+  newsStampColor: 'red',
+  newsStampStyle: 'circle',
+  newsStampX: 50,
+  newsStampY: 42,
+  newsStampDotDensity: 55,
+  newsStampSize: 280,
+  newsStampRotation: -14,
+  newsStampOpacity: 88,
+}
+
+/**
+ * Typeface: local Google Sans Flex (public/fonts/GoogleSansFlex/*_36pt-*.ttf)
+ * — same family as the mobile AppFont / Google Sans Flex design system.
+ */
+const SHARE_FONT_FAMILY =
+  '"Google Sans Flex", "Google Sans", "Inter", "SF Pro Display", "Segoe UI", system-ui, sans-serif'
+
+/** Weight → static file under /fonts/GoogleSansFlex/ (36pt optical size). */
+const SHARE_GSF_FILES: Array<{ weight: number; file: string }> = [
+  { weight: 100, file: 'GoogleSansFlex_36pt-Thin.ttf' },
+  { weight: 200, file: 'GoogleSansFlex_36pt-ExtraLight.ttf' },
+  { weight: 300, file: 'GoogleSansFlex_36pt-Light.ttf' },
+  { weight: 400, file: 'GoogleSansFlex_36pt-Regular.ttf' },
+  { weight: 500, file: 'GoogleSansFlex_36pt-Medium.ttf' },
+  { weight: 600, file: 'GoogleSansFlex_36pt-SemiBold.ttf' },
+  { weight: 700, file: 'GoogleSansFlex_36pt-Bold.ttf' },
+  { weight: 800, file: 'GoogleSansFlex_36pt-ExtraBold.ttf' },
+  { weight: 900, file: 'GoogleSansFlex_36pt-Black.ttf' },
+]
+
+let shareFontsLoadPromise: Promise<void> | null = null
+
+async function ensureShareFontsLoaded(): Promise<void> {
+  if (typeof document === 'undefined') return
+  if (shareFontsLoadPromise) return shareFontsLoadPromise
+
+  shareFontsLoadPromise = (async () => {
+    try {
+      // Explicit FontFace load so canvas does not paint with a fallback mid-frame
+      if (typeof FontFace !== 'undefined') {
+        await Promise.all(
+          SHARE_GSF_FILES.map(async ({ weight, file }) => {
+            const face = new FontFace(
+              'Google Sans Flex',
+              `url(/fonts/GoogleSansFlex/${file})`,
+              { weight: String(weight), style: 'normal' },
+            )
+            const loaded = await face.load()
+            document.fonts.add(loaded)
+          }),
+        )
+      }
+      if (document.fonts?.load) {
+        await Promise.all([
+          document.fonts.load(`300 40px "Google Sans Flex"`),
+          document.fonts.load(`400 40px "Google Sans Flex"`),
+          document.fonts.load(`500 28px "Google Sans Flex"`),
+          document.fonts.load(`500 34px "Google Sans Flex"`),
+          document.fonts.load(`600 36px "Google Sans Flex"`),
+          document.fonts.load(`600 52px "Google Sans Flex"`),
+          document.fonts.load(`700 32px "Google Sans Flex"`),
+          document.fonts.load(`800 56px "Google Sans Flex"`),
+          document.fonts.load(`800 80px "Google Sans Flex"`),
+          document.fonts.load(`900 56px "Google Sans Flex"`),
+        ])
+        await document.fonts.ready
+      }
+    } catch (err) {
+      console.warn('[share] Google Sans Flex load failed; falling back', err)
+    }
+  })()
+
+  return shareFontsLoadPromise
+}
+
+function shareFont(weight: number, sizePx: number, extra = ''): string {
+  const w = Math.min(900, Math.max(100, Math.round(weight)))
+  const extras = extra ? ` ${extra}` : ''
+  return `${w}${extras} ${sizePx}px ${SHARE_FONT_FAMILY}`
+}
+
+/** Apply RN-style letterSpacing (px) on canvas when supported. */
+function setShareLetterSpacing(ctx: CanvasRenderingContext2D, px: number) {
+  try {
+    // Canvas letterSpacing is CSS length; RN tokens are px
+    ;(ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${px}px`
+  } catch {
+    /* older engines ignore */
+  }
+}
+
+function clearShareLetterSpacing(ctx: CanvasRenderingContext2D) {
+  setShareLetterSpacing(ctx, 0)
 }
 
 const SHARE_CARD_STYLE_PREF_KEY = 'share-card-style-v1'
+/** One-time bump of legacy 1080 exports → Full HD 1920. */
+const SHARE_CARD_FHD_MIGRATION_KEY = 'share-card-fhd-migrated-v1'
 
 function loadShareCardStyle(): ShareCardStyle {
   try {
@@ -1079,18 +4395,320 @@ function loadShareCardStyle(): ShareCardStyle {
     if (!raw) return { ...DEFAULT_SHARE_CARD_STYLE }
     const parsed = JSON.parse(raw) as Partial<ShareCardStyle>
     if (!parsed || typeof parsed !== 'object') return { ...DEFAULT_SHARE_CARD_STYLE }
-    const priceColor =
-      parsed.priceColor === 'white' || parsed.priceColor === 'grey'
-        ? parsed.priceColor
-        : 'black'
-    const textColor =
-      parsed.textColor === 'white' || parsed.textColor === 'grey'
-        ? parsed.textColor
-        : 'black'
+    const priceColor = SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === parsed.priceColor)
+      ? String(parsed.priceColor)
+      : DEFAULT_SHARE_CARD_STYLE.priceColor
+    const textColor = SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === parsed.textColor)
+      ? String(parsed.textColor)
+      : DEFAULT_SHARE_CARD_STYLE.textColor
     const cardColor = SHARE_CARD_COLOR_PRESETS.some((p) => p.id === parsed.cardColor)
-      ? (parsed.cardColor as ShareCardColorId)
-      : 'yellow'
+      ? String(parsed.cardColor)
+      : DEFAULT_SHARE_CARD_STYLE.cardColor
     const titleMode = parsed.titleMode === 'ticker' ? 'ticker' : 'company'
+    const brandTone =
+      parsed.brandTone === 'dark' || parsed.brandTone === 'light' ? parsed.brandTone : 'auto'
+    const showSessionHeadline =
+      parsed.showSessionHeadline === undefined ? true : Boolean(parsed.showSessionHeadline)
+    const showSharePrice =
+      parsed.showSharePrice === undefined ? true : Boolean(parsed.showSharePrice)
+    const showBrand = parsed.showBrand === undefined ? true : Boolean(parsed.showBrand)
+    const sessionLineTone: ShareSessionLineTone =
+      parsed.sessionLineTone === 'intensity' ||
+      parsed.sessionLineTone === 'breaking' ||
+      parsed.sessionLineTone === 'punchy' ||
+      parsed.sessionLineTone === 'classic'
+        ? parsed.sessionLineTone
+        : DEFAULT_SHARE_CARD_STYLE.sessionLineTone
+    const preferSquare =
+      parsed.preferSquare === undefined ? true : Boolean(parsed.preferSquare)
+    const nameWeight = parseShareFontWeight(
+      parsed.nameWeight,
+      parsed.nameBold,
+      'extrabold',
+      'extrabold',
+    )
+    const reasonWeight = parseShareFontWeight(
+      parsed.reasonWeight,
+      parsed.reasonBold,
+      'bold',
+      'regular',
+    )
+    const sessionWeight = parseShareFontWeight(
+      parsed.sessionWeight,
+      parsed.sessionBold,
+      'extrabold',
+      'semibold',
+    )
+    const brandWeight = parseShareFontWeight(
+      parsed.brandWeight,
+      parsed.brandBold,
+      'bold',
+      'medium',
+    )
+    const clampSessionPx = (raw: number, min: number, max: number, fallback: number) =>
+      Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.round(raw))) : fallback
+    const sessionFontSize = clampSessionPx(
+      Number(parsed.sessionFontSize),
+      18,
+      160,
+      DEFAULT_SHARE_CARD_STYLE.sessionFontSize,
+    )
+    const sessionMarginTop = clampSessionPx(
+      Number(parsed.sessionMarginTop),
+      0,
+      120,
+      DEFAULT_SHARE_CARD_STYLE.sessionMarginTop,
+    )
+    const sessionMarginBottom = clampSessionPx(
+      Number(parsed.sessionMarginBottom),
+      0,
+      160,
+      DEFAULT_SHARE_CARD_STYLE.sessionMarginBottom,
+    )
+    const sessionStampGap = clampSessionPx(
+      Number(parsed.sessionStampGap),
+      0,
+      80,
+      DEFAULT_SHARE_CARD_STYLE.sessionStampGap,
+    )
+    const stampReasonGap = clampSessionPx(
+      Number(parsed.stampReasonGap),
+      0,
+      160,
+      DEFAULT_SHARE_CARD_STYLE.stampReasonGap,
+    )
+    const reasonMarginBottom = clampSessionPx(
+      Number(parsed.reasonMarginBottom),
+      0,
+      200,
+      DEFAULT_SHARE_CARD_STYLE.reasonMarginBottom,
+    )
+    const brandMarginTop = clampSessionPx(
+      Number(parsed.brandMarginTop),
+      0,
+      120,
+      DEFAULT_SHARE_CARD_STYLE.brandMarginTop,
+    )
+    const brandMarginBottom = clampSessionPx(
+      Number(parsed.brandMarginBottom),
+      0,
+      160,
+      DEFAULT_SHARE_CARD_STYLE.brandMarginBottom,
+    )
+    const brandFontSize = clampSessionPx(
+      Number(parsed.brandFontSize),
+      14,
+      64,
+      DEFAULT_SHARE_CARD_STYLE.brandFontSize,
+    )
+    const rawBrandHScale = Number(parsed.brandHeightScale)
+    const brandHeightScale =
+      Number.isFinite(rawBrandHScale) && rawBrandHScale >= 0.5 && rawBrandHScale <= 2.5
+        ? Math.round(rawBrandHScale * 100) / 100
+        : DEFAULT_SHARE_CARD_STYLE.brandHeightScale
+    const brandPlacement =
+      parsed.brandPlacement === 'left' ||
+      parsed.brandPlacement === 'right' ||
+      parsed.brandPlacement === 'center'
+        ? parsed.brandPlacement
+        : DEFAULT_SHARE_CARD_STYLE.brandPlacement
+    const chartSessionDays = clampShareChartSessionDays(
+      parsed.chartSessionDays ?? DEFAULT_SHARE_CARD_STYLE.chartSessionDays,
+    )
+    const chartInterval = clampShareChartInterval(
+      parsed.chartInterval ?? DEFAULT_SHARE_CARD_STYLE.chartInterval,
+    )
+    const rawLineW = Number(parsed.chartLineWidth)
+    const chartLineWidth =
+      Number.isFinite(rawLineW) && rawLineW > 0
+        ? Math.min(24, Math.max(1, Math.round(rawLineW * 10) / 10))
+        : DEFAULT_SHARE_CARD_STYLE.chartLineWidth
+    const rawPlotH = Number(parsed.chartPlotHeight)
+    const chartPlotHeight =
+      Number.isFinite(rawPlotH) && rawPlotH > 0
+        ? Math.min(700, Math.max(140, Math.round(rawPlotH)))
+        : DEFAULT_SHARE_CARD_STYLE.chartPlotHeight
+    const rawStartPct = Number(parsed.chartVisibleStartPct)
+    const chartVisibleStartPct =
+      Number.isFinite(rawStartPct) && rawStartPct >= 0
+        ? Math.min(90, Math.max(0, Math.round(rawStartPct)))
+        : DEFAULT_SHARE_CARD_STYLE.chartVisibleStartPct
+    const showChartTimeAxis =
+      parsed.showChartTimeAxis === undefined
+        ? DEFAULT_SHARE_CARD_STYLE.showChartTimeAxis
+        : Boolean(parsed.showChartTimeAxis)
+    const showChartDayLabels =
+      parsed.showChartDayLabels === undefined
+        ? DEFAULT_SHARE_CARD_STYLE.showChartDayLabels
+        : Boolean(parsed.showChartDayLabels)
+    const rawTimeDayGap = Number(parsed.chartTimeDayGap)
+    const chartTimeDayGap =
+      Number.isFinite(rawTimeDayGap) && rawTimeDayGap >= 0
+        ? Math.min(100, Math.max(0, Math.round(rawTimeDayGap)))
+        : DEFAULT_SHARE_CARD_STYLE.chartTimeDayGap
+    const chartDayLabelMode = clampShareChartDayLabelMode(
+      parsed.chartDayLabelMode ?? DEFAULT_SHARE_CARD_STYLE.chartDayLabelMode,
+    )
+    const chartAxisMode =
+      parsed.chartAxisMode === 'timestamp' || parsed.chartAxisMode === 'elapsed'
+        ? parsed.chartAxisMode
+        : DEFAULT_SHARE_CARD_STYLE.chartAxisMode
+    const chartAxisTimezone = SHARE_CHART_TIMEZONES.some(
+      (z) => z.id === parsed.chartAxisTimezone,
+    )
+      ? (parsed.chartAxisTimezone as ShareChartTimezone)
+      : DEFAULT_SHARE_CARD_STYLE.chartAxisTimezone
+    const rawLabelCount = Number(parsed.chartAxisLabelCount)
+    const chartAxisLabelCount =
+      Number.isFinite(rawLabelCount) && rawLabelCount >= 3 && rawLabelCount <= 10
+        ? Math.round(rawLabelCount)
+        : DEFAULT_SHARE_CARD_STYLE.chartAxisLabelCount
+    let chartPointLabelMode: ShareChartPointLabelMode =
+      parsed.chartPointLabelMode === 'price' ||
+      parsed.chartPointLabelMode === 'percent' ||
+      parsed.chartPointLabelMode === 'both' ||
+      parsed.chartPointLabelMode === 'off'
+        ? parsed.chartPointLabelMode
+        : DEFAULT_SHARE_CARD_STYLE.chartPointLabelMode
+    // Migrate legacy boolean
+    if (
+      parsed.chartPointLabelMode === undefined &&
+      parsed.showChartPriceLabels !== undefined
+    ) {
+      chartPointLabelMode = parsed.showChartPriceLabels ? 'price' : 'off'
+    }
+    const rawPriceLabelCount = Number(parsed.chartPriceLabelCount)
+    const chartPriceLabelCount =
+      Number.isFinite(rawPriceLabelCount) &&
+      rawPriceLabelCount >= 3 &&
+      rawPriceLabelCount <= 8
+        ? Math.round(rawPriceLabelCount)
+        : DEFAULT_SHARE_CARD_STYLE.chartPriceLabelCount
+    const chartAxisLabelsCustom =
+      typeof parsed.chartAxisLabelsCustom === 'string'
+        ? parsed.chartAxisLabelsCustom.slice(0, 500)
+        : ''
+    const chartPointLabelsCustom =
+      typeof parsed.chartPointLabelsCustom === 'string'
+        ? parsed.chartPointLabelsCustom.slice(0, 500)
+        : ''
+    const chartPointSubLabelsCustom =
+      typeof parsed.chartPointSubLabelsCustom === 'string'
+        ? parsed.chartPointSubLabelsCustom.slice(0, 500)
+        : ''
+    const chartAxisFontSize = clampSessionPx(
+      Number(parsed.chartAxisFontSize),
+      10,
+      48,
+      DEFAULT_SHARE_CARD_STYLE.chartAxisFontSize,
+    )
+    const chartPointFontSize = clampSessionPx(
+      Number(parsed.chartPointFontSize),
+      10,
+      48,
+      DEFAULT_SHARE_CARD_STYLE.chartPointFontSize,
+    )
+    const showStoreBadges =
+      parsed.showStoreBadges === undefined ? true : Boolean(parsed.showStoreBadges)
+    const storeBadgeStyle =
+      parsed.storeBadgeStyle === 'badge' || parsed.storeBadgeStyle === 'circle'
+        ? parsed.storeBadgeStyle
+        : DEFAULT_SHARE_CARD_STYLE.storeBadgeStyle
+    const rawStoreSize = Number(parsed.storeIconSize)
+    const storeIconSize =
+      Number.isFinite(rawStoreSize) && rawStoreSize >= 16 && rawStoreSize <= 96
+        ? Math.round(rawStoreSize)
+        : DEFAULT_SHARE_CARD_STYLE.storeIconSize
+    const rawStoreWScale = Number(parsed.storeIconWidthScale)
+    const storeIconWidthScale =
+      Number.isFinite(rawStoreWScale) && rawStoreWScale >= 0.5 && rawStoreWScale <= 2.5
+        ? Math.round(rawStoreWScale * 100) / 100
+        : DEFAULT_SHARE_CARD_STYLE.storeIconWidthScale
+    const upColorShade = clampShareMoveShade(
+      parsed.upColorShade,
+      DEFAULT_SHARE_CARD_STYLE.upColorShade,
+    )
+    const downColorShade = clampShareMoveShade(
+      parsed.downColorShade,
+      DEFAULT_SHARE_CARD_STYLE.downColorShade,
+    )
+    const newsStampMode =
+      parsed.newsStampMode === 'off' ||
+      parsed.newsStampMode === 'on' ||
+      parsed.newsStampMode === 'auto'
+        ? parsed.newsStampMode
+        : DEFAULT_SHARE_CARD_STYLE.newsStampMode
+    const newsStampKind =
+      parsed.newsStampKind === 'auto' ||
+      parsed.newsStampKind === 'breaking' ||
+      parsed.newsStampKind === 'exploding' ||
+      parsed.newsStampKind === 'surge' ||
+      parsed.newsStampKind === 'crash' ||
+      parsed.newsStampKind === 'alert'
+        ? parsed.newsStampKind
+        : DEFAULT_SHARE_CARD_STYLE.newsStampKind
+    const newsStampColor = SHARE_NEWS_STAMP_INK_PRESETS.some(
+      (p) => p.id === parsed.newsStampColor,
+    )
+      ? String(parsed.newsStampColor)
+      : DEFAULT_SHARE_CARD_STYLE.newsStampColor
+    const newsStampCenterText =
+      typeof parsed.newsStampCenterText === 'string'
+        ? parsed.newsStampCenterText.slice(0, 120)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampCenterText
+    const newsStampRingText =
+      typeof parsed.newsStampRingText === 'string'
+        ? parsed.newsStampRingText.slice(0, 48)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampRingText
+    const rawStampSize = Number(parsed.newsStampSize)
+    const newsStampSize =
+      Number.isFinite(rawStampSize) && rawStampSize >= 100 && rawStampSize <= 1000
+        ? Math.round(rawStampSize)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampSize
+    const rawStampRot = Number(parsed.newsStampRotation)
+    const newsStampRotation =
+      Number.isFinite(rawStampRot) && rawStampRot >= -45 && rawStampRot <= 45
+        ? Math.round(rawStampRot)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampRotation
+    const rawStampOp = Number(parsed.newsStampOpacity)
+    const newsStampOpacity =
+      Number.isFinite(rawStampOp) && rawStampOp >= 8 && rawStampOp <= 100
+        ? Math.round(rawStampOp)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampOpacity
+    const newsStampStyle =
+      parsed.newsStampStyle === 'rect' || parsed.newsStampStyle === 'circle'
+        ? parsed.newsStampStyle
+        : DEFAULT_SHARE_CARD_STYLE.newsStampStyle
+    const rawStampX = Number(parsed.newsStampX)
+    const newsStampX =
+      Number.isFinite(rawStampX) && rawStampX >= 0 && rawStampX <= 100
+        ? Math.round(rawStampX)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampX
+    const rawStampY = Number(parsed.newsStampY)
+    const newsStampY =
+      Number.isFinite(rawStampY) && rawStampY >= 0 && rawStampY <= 100
+        ? Math.round(rawStampY)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampY
+    const rawDotDens = Number(parsed.newsStampDotDensity)
+    const newsStampDotDensity =
+      Number.isFinite(rawDotDens) && rawDotDens >= 0 && rawDotDens <= 100
+        ? Math.round(rawDotDens)
+        : DEFAULT_SHARE_CARD_STYLE.newsStampDotDensity
+    const rawSessionLh = Number(parsed.sessionLineHeight)
+    const sessionLineHeight =
+      Number.isFinite(rawSessionLh) && rawSessionLh >= 1 && rawSessionLh <= 1.8
+        ? Math.round(rawSessionLh * 100) / 100
+        : DEFAULT_SHARE_CARD_STYLE.sessionLineHeight
+    const rawCanvasW = Number(parsed.canvasWidth)
+    const canvasWidth =
+      Number.isFinite(rawCanvasW) && rawCanvasW >= 800
+        ? Math.min(3840, Math.round(rawCanvasW))
+        : DEFAULT_SHARE_CARD_STYLE.canvasWidth
+    const rawAspect = Number(parsed.aspectRatio)
+    const aspectRatio =
+      Number.isFinite(rawAspect) && rawAspect >= 0.75 && rawAspect <= 1.8
+        ? Math.round(rawAspect * 100) / 100
+        : DEFAULT_SHARE_CARD_STYLE.aspectRatio
     const imagePadding = Number(parsed.imagePadding)
     const sidePad =
       Number.isFinite(imagePadding) && imagePadding >= 16
@@ -1107,13 +4725,81 @@ function loadShareCardStyle(): ShareCardStyle {
       Number.isFinite(rawFooter) && rawFooter >= 0
         ? Math.min(200, Math.round(rawFooter))
         : sidePad
-    return {
+    const timestampPlacement =
+      parsed.timestampPlacement === 'price-right' ||
+      parsed.timestampPlacement === 'footer-left'
+        ? parsed.timestampPlacement
+        : parsed.dateInFooter === false
+          ? 'price-right'
+          : 'footer-left'
+    let result: ShareCardStyle = {
       ...DEFAULT_SHARE_CARD_STYLE,
       ...parsed,
       priceColor,
       textColor,
       cardColor,
       titleMode,
+      brandTone,
+      showSessionHeadline,
+      showSharePrice,
+      showBrand,
+      sessionLineTone,
+      preferSquare,
+      nameWeight,
+      reasonWeight,
+      sessionWeight,
+      brandWeight,
+      sessionFontSize,
+      sessionMarginTop,
+      sessionMarginBottom,
+      sessionStampGap,
+      stampReasonGap,
+      sessionLineHeight,
+      reasonMarginBottom,
+      brandMarginTop,
+      brandMarginBottom,
+      brandFontSize,
+      brandHeightScale,
+      brandPlacement,
+      chartSessionDays,
+      chartInterval,
+      chartLineWidth,
+      chartPlotHeight,
+      chartVisibleStartPct,
+      showChartTimeAxis,
+      showChartDayLabels,
+      chartTimeDayGap,
+      chartDayLabelMode,
+      chartAxisMode,
+      chartAxisTimezone,
+      chartAxisLabelCount,
+      chartPointLabelMode,
+      chartPriceLabelCount,
+      chartAxisLabelsCustom,
+      chartPointLabelsCustom,
+      chartPointSubLabelsCustom,
+      chartAxisFontSize,
+      chartPointFontSize,
+      showStoreBadges,
+      storeBadgeStyle,
+      storeIconSize,
+      storeIconWidthScale,
+      upColorShade,
+      downColorShade,
+      newsStampMode,
+      newsStampKind,
+      newsStampCenterText,
+      newsStampRingText,
+      newsStampColor,
+      newsStampStyle,
+      newsStampX,
+      newsStampY,
+      newsStampDotDensity,
+      newsStampSize,
+      newsStampRotation,
+      newsStampOpacity,
+      canvasWidth,
+      aspectRatio,
       // Booleans / numbers may come partial — re-assert critical fields
       gapBeforeChart: Number(parsed.gapBeforeChart) || DEFAULT_SHARE_CARD_STYLE.gapBeforeChart,
       gapAfterChart: Number(parsed.gapAfterChart) || DEFAULT_SHARE_CARD_STYLE.gapAfterChart,
@@ -1127,10 +4813,92 @@ function loadShareCardStyle(): ShareCardStyle {
       footerPadding,
       stampFontSize: Number(parsed.stampFontSize) || DEFAULT_SHARE_CARD_STYLE.stampFontSize,
       reasonFontSize: Number(parsed.reasonFontSize) || DEFAULT_SHARE_CARD_STYLE.reasonFontSize,
-      nameBold: parsed.nameBold !== undefined ? Boolean(parsed.nameBold) : true,
-      reasonBold: parsed.reasonBold !== undefined ? Boolean(parsed.reasonBold) : false,
-      dateInFooter: parsed.dateInFooter !== undefined ? Boolean(parsed.dateInFooter) : true,
+      timestampPlacement,
+      photoHeight: Math.min(
+        900,
+        Math.max(120, Number(parsed.photoHeight) || DEFAULT_SHARE_CARD_STYLE.photoHeight),
+      ),
+      photoRadius: Math.min(
+        120,
+        Math.max(0, Number(parsed.photoRadius) ?? DEFAULT_SHARE_CARD_STYLE.photoRadius),
+      ),
+      photoBorderWidth: Math.min(
+        16,
+        Math.max(0, Number(parsed.photoBorderWidth) ?? DEFAULT_SHARE_CARD_STYLE.photoBorderWidth),
+      ),
+      photoMarginX: Math.min(
+        80,
+        Math.max(0, Number(parsed.photoMarginX) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginX),
+      ),
+      photoMarginTop: Math.min(
+        120,
+        Math.max(0, Number(parsed.photoMarginTop) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginTop),
+      ),
+      photoMarginBottom: Math.min(
+        160,
+        Math.max(0, Number(parsed.photoMarginBottom) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginBottom),
+      ),
+      photoFrost: Math.min(
+        100,
+        Math.max(0, Number(parsed.photoFrost) ?? DEFAULT_SHARE_CARD_STYLE.photoFrost),
+      ),
+      bgImageOpacity: Math.min(
+        100,
+        Math.max(
+          0,
+          Number.isFinite(Number(parsed.bgImageOpacity))
+            ? Math.round(Number(parsed.bgImageOpacity))
+            : DEFAULT_SHARE_CARD_STYLE.bgImageOpacity,
+        ),
+      ),
+      bgBlur: Math.min(
+        80,
+        Math.max(
+          0,
+          Number.isFinite(Number(parsed.bgBlur))
+            ? Math.round(Number(parsed.bgBlur))
+            : DEFAULT_SHARE_CARD_STYLE.bgBlur,
+        ),
+      ),
+      // Bipolar axes −100…+100; migrate legacy 0–100 bgBlackFade → +bgBlack
+      bgBlack: (() => {
+        if (Number.isFinite(Number(parsed.bgBlack))) {
+          return clampShareBgAxis(parsed.bgBlack, DEFAULT_SHARE_CARD_STYLE.bgBlack)
+        }
+        if (Number.isFinite(Number(parsed.bgBlackFade))) {
+          return clampShareBgAxis(Number(parsed.bgBlackFade), DEFAULT_SHARE_CARD_STYLE.bgBlack)
+        }
+        return DEFAULT_SHARE_CARD_STYLE.bgBlack
+      })(),
+      bgWhite: clampShareBgAxis(
+        Number.isFinite(Number(parsed.bgWhite)) ? parsed.bgWhite : DEFAULT_SHARE_CARD_STYLE.bgWhite,
+        DEFAULT_SHARE_CARD_STYLE.bgWhite,
+      ),
+      photoPlacement:
+        parsed.photoPlacement === 'background' ||
+        parsed.photoPlacement === 'above-header' ||
+        parsed.photoPlacement === 'below-header' ||
+        parsed.photoPlacement === 'below-chart'
+          ? parsed.photoPlacement
+          : 'background',
     }
+    // One-time: old default was 1080px — lift to Full HD so Copy/Download are sharp
+    if (!readPref(SHARE_CARD_FHD_MIGRATION_KEY)) {
+      try {
+        writePref(SHARE_CARD_FHD_MIGRATION_KEY, '1')
+      } catch {
+        /* ignore */
+      }
+      if (result.canvasWidth > 0 && result.canvasWidth < 1920) {
+        result = { ...result, canvasWidth: 1920 }
+        try {
+          writePref(SHARE_CARD_STYLE_PREF_KEY, JSON.stringify(result))
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return result
   } catch {
     return { ...DEFAULT_SHARE_CARD_STYLE }
   }
@@ -1153,7 +4921,7 @@ const shareCompanyNameCache = new Map<string, string>()
 
 /**
  * Prefer a real company name for share-card title.
- * If DB only has ticker (or blank), pull shortName from Yahoo Finance quote.
+ * If DB only has ticker (or blank), pull shortName/longName from Yahoo Finance.
  */
 async function resolveShareCompanyName(
   ticker: string,
@@ -1161,10 +4929,23 @@ async function resolveShareCompanyName(
 ): Promise<string> {
   const symbol = String(ticker || '')
     .toUpperCase()
-    .replace(/[^A-Z0-9.-]/g, '')
+    .replace(/[^A-Z0-9.^_=\-]/g, '')
   const given = String(provided || '').trim()
   // Meaningful company name (not empty / not just the ticker)
-  if (given && given.toUpperCase() !== symbol) return given
+  if (given && given.toUpperCase() !== symbol) {
+    // Still warm the cache in background for later ticker toggles.
+    if (symbol && !shareCompanyNameCache.has(symbol)) {
+      void fetchYahooQuote(symbol)
+        .then((body) => {
+          const name = String(body?.quote?.shortName || body?.quote?.longName || '').trim()
+          if (name) shareCompanyNameCache.set(symbol, name)
+        })
+        .catch(() => {
+          /* ignore */
+        })
+    }
+    return given
+  }
 
   if (symbol && shareCompanyNameCache.has(symbol)) {
     return shareCompanyNameCache.get(symbol) || given || symbol
@@ -1174,7 +4955,8 @@ async function resolveShareCompanyName(
 
   try {
     const body = await fetchYahooQuote(symbol)
-    const name = String(body?.quote?.shortName || '').trim()
+    const q = body?.quote
+    const name = String(q?.shortName || q?.longName || '').trim()
     if (name) {
       shareCompanyNameCache.set(symbol, name)
       return name
@@ -1186,27 +4968,511 @@ async function resolveShareCompanyName(
   return given || symbol
 }
 
-/** “5 August · 9:46 AM ET” style stamp for share card. */
-function formatShareStampLabel(event: PriceMovementEvent): string {
-  let dayMonth = ''
+/** Calendar day key in America/New_York for share stamps. */
+function etDateKey(d: Date = new Date()): string {
   try {
-    const d = new Date(`${event.event_date}T12:00:00Z`)
-    if (!Number.isNaN(d.getTime())) {
-      dayMonth = d.toLocaleDateString('en-GB', {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d)
+  } catch {
+    return d.toISOString().slice(0, 10)
+  }
+}
+
+/**
+ * Share stamp under the session headline — FULLY converted to the selected zone.
+ * Market event times are US Eastern wall-clock; we convert then append ET/BST/IST/UTC.
+ * Examples: “Today · 3:33 PM ET” · “Today · 8:33 PM BST” · “Today · 1:03 AM IST”
+ */
+function formatShareStampLabel(
+  event: PriceMovementEvent,
+  tz: ShareChartTimezone = 'America/New_York',
+): string {
+  const eventDate = String(event.event_date || '').slice(0, 10)
+  const zone =
+    tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz) ? tz : 'America/New_York'
+
+  // Prefer true instant from ET wall time so clocks re-project into UK / IST / UTC
+  let utcMs = eventEasternWallTimeToUtcMs(event)
+  if (utcMs == null && eventDate === etDateKey()) {
+    // Today, no parseable time_label → “now”
+    utcMs = Date.now()
+  }
+
+  const at = utcMs ?? Date.now()
+  const abbrev = shareTimezoneAbbrev(zone, at)
+
+  const formatClock = (ms: number) =>
+    new Date(ms).toLocaleTimeString('en-US', {
+      timeZone: zone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    })
+
+  // Calendar day of the event in the *display* zone (after conversion)
+  let eventDayInZone = eventDate
+  let todayInZone = etDateKey()
+  try {
+    if (utcMs != null) {
+      eventDayInZone = new Intl.DateTimeFormat('en-CA', {
+        timeZone: zone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date(utcMs))
+    }
+    todayInZone = new Intl.DateTimeFormat('en-CA', {
+      timeZone: zone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date())
+  } catch {
+    /* keep defaults */
+  }
+
+  const isToday = eventDayInZone === todayInZone || eventDate === etDateKey()
+
+  if (isToday && utcMs != null) {
+    return withTimezoneSuffix(`Today · ${formatClock(utcMs)}`, abbrev)
+  }
+
+  // Older day — date in display zone + converted clock
+  try {
+    const datePart = new Date(utcMs ?? `${eventDate}T12:00:00Z`).toLocaleDateString(
+      'en-GB',
+      {
         day: 'numeric',
         month: 'long',
-        timeZone: 'UTC',
-      })
+        timeZone: zone,
+      },
+    )
+    if (utcMs != null) {
+      return withTimezoneSuffix(`${datePart} · ${formatClock(utcMs)}`, abbrev)
     }
+    return datePart
   } catch {
     /* fall through */
   }
-  if (!dayMonth) {
-    dayMonth = event.display_date || event.event_date || ''
+
+  if (event.display_date) return String(event.display_date).trim()
+  if (eventDate) return eventDate
+  return withTimezoneSuffix(formatClock(at), abbrev)
+}
+
+/**
+ * Gemini first headline line (… so far in regular trading / in pre-market…).
+ * Everything before “Likely driver:”.
+ */
+function extractShareSessionHeadline(summary: string): string {
+  const sections = parseGeminiTweetSections(summary || '')
+  if (sections.headline) return sections.headline.replace(/\s+/g, ' ').trim()
+  // No structured sections — first non-empty line if it isn't a driver label
+  const first = String(summary || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find(Boolean)
+  if (!first) return ''
+  if (/^likely\s*driver\s*:/i.test(first)) return ''
+  if (/^secondary\s*driver\s*:/i.test(first)) return ''
+  return first.replace(/\s+/g, ' ').trim()
+}
+
+/** |%| bands for session-line wording (thresholds: 5 / 10 / 15 / 25). */
+type ShareMoveBand = 'mild' | 'solid' | 'strong' | 'huge' | 'extreme'
+
+/** Session-line tone presets — classic = default “…so far in regular trading”. */
+type ShareSessionLineTone = 'classic' | 'intensity' | 'breaking' | 'punchy'
+
+type ShareSessionLineOption = {
+  id: string
+  /** Short chip label in the UI */
+  label: string
+  line: string
+}
+
+function parseShareMovePercent(moveText: string): {
+  abs: number
+  signed: number
+  isUp: boolean
+  isDown: boolean
+  display: string
+} | null {
+  const raw = String(moveText || '').trim()
+  if (!raw) return null
+  const m = raw.replace(/,/g, '').match(/([+\-−–])?\s*(\d+(?:\.\d+)?)\s*%?/)
+  if (!m) return null
+  const n = Number(m[2])
+  if (!Number.isFinite(n)) return null
+  const signChar = m[1] || ''
+  const neg =
+    signChar === '-' ||
+    signChar === '−' ||
+    signChar === '–' ||
+    /^[-−(]/.test(raw) ||
+    /\bdown\b/i.test(raw)
+  const pos = !neg && (signChar === '+' || /^\+/.test(raw) || /\bup\b/i.test(raw) || n > 0)
+  // If bare number without sign, treat as up when positive
+  const isDown = neg
+  const isUp = !isDown && (pos || n > 0)
+  const abs = Math.abs(n)
+  const signed = isDown ? -abs : abs
+  const display = isDown ? `-${formatSharePctNumber(abs)}%` : `+${formatSharePctNumber(abs)}%`
+  return { abs, signed, isUp, isDown, display }
+}
+
+function formatSharePctNumber(n: number): string {
+  if (!Number.isFinite(n)) return '0'
+  // Keep one decimal when needed (4.2), drop trailing .0
+  const t = Math.round(n * 10) / 10
+  return Number.isInteger(t) ? String(t) : t.toFixed(1)
+}
+
+function shareMoveBand(abs: number): ShareMoveBand {
+  if (abs >= 25) return 'extreme'
+  if (abs >= 15) return 'huge'
+  if (abs >= 10) return 'strong'
+  if (abs >= 5) return 'solid'
+  return 'mild'
+}
+
+function shareSessionPhrase(session: ShareChartSession): {
+  classic: string
+  short: string
+  today: string
+} {
+  if (session === 'premarket') {
+    return {
+      classic: 'in pre-market',
+      short: 'pre-market',
+      today: 'before the open',
+    }
   }
-  const time = String(event.time_label || '').trim()
-  if (dayMonth && time) return `${dayMonth} · ${time}`
-  return dayMonth || time
+  if (session === 'after-hours') {
+    return {
+      classic: 'after hours',
+      short: 'after-hours',
+      today: 'after the close',
+    }
+  }
+  return {
+    classic: 'so far in regular trading',
+    short: 'in regular trading',
+    today: 'so far today',
+  }
+}
+
+/**
+ * Magnitude-aware session lines.
+ * Default/classic keeps “…so far in regular trading” (or pre/AH).
+ * Other tones scale wording + emoji with 5% / 10% / 15% / 25% bands.
+ */
+function buildShareSessionLineOptions(args: {
+  ticker: string
+  moveText: string
+  session: ShareChartSession
+  /** Gemini / original headline when available */
+  geminiLine?: string
+}): ShareSessionLineOption[] {
+  const symbol = String(args.ticker || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9.^_=\-]/g, '') || 'TICKER'
+  const parsed = parseShareMovePercent(args.moveText)
+  const session = args.session
+  const phrases = shareSessionPhrase(session)
+  const gemini = String(args.geminiLine || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const options: ShareSessionLineOption[] = []
+  const push = (id: string, label: string, line: string) => {
+    const cleaned = line.replace(/\s+/g, ' ').trim()
+    if (!cleaned) return
+    if (options.some((o) => o.line === cleaned)) return
+    options.push({ id, label, line: cleaned })
+  }
+
+  // Always offer classic default
+  if (parsed) {
+    push(
+      'classic',
+      'Classic',
+      `$${symbol} ${parsed.display} ${phrases.classic}`,
+    )
+  } else if (gemini) {
+    push('classic', 'Classic', gemini)
+  } else {
+    push('classic', 'Classic', `$${symbol} ${phrases.classic}`)
+  }
+
+  if (gemini && (!parsed || gemini !== options[0]?.line)) {
+    push('gemini', 'From Gemini', gemini)
+  }
+
+  if (!parsed) return options
+
+  const { abs, display, isDown } = parsed
+  const band = shareMoveBand(abs)
+  const tick = `$${symbol}`
+  const up = !isDown
+
+  // --- Intensity (band verbs, light emoji) ---
+  if (band === 'mild') {
+    push(
+      'intensity',
+      'Intensity',
+      up
+        ? `${tick} ${display} ${phrases.classic}`
+        : `${tick} ${display} ${phrases.classic}`,
+    )
+    push(
+      'intensity-soft',
+      'Soft',
+      up
+        ? `${tick} edging ${display} ${phrases.today}`
+        : `${tick} slipping ${display} ${phrases.today}`,
+    )
+  } else if (band === 'solid') {
+    // ~5–10%
+    push(
+      'intensity',
+      'Intensity',
+      up
+        ? `${tick} climbing ${display} ${phrases.classic} 📈`
+        : `${tick} sliding ${display} ${phrases.classic} 📉`,
+    )
+    push(
+      'intensity-alt',
+      'Alt',
+      up
+        ? `📈 ${tick} up ${display} ${phrases.short}`
+        : `📉 ${tick} down ${display} ${phrases.short}`,
+    )
+  } else if (band === 'strong') {
+    // ~10–15%
+    push(
+      'intensity',
+      'Intensity',
+      up
+        ? `${tick} surging ${display} ${phrases.classic} 📈`
+        : `${tick} tumbling ${display} ${phrases.classic} 📉`,
+    )
+    push(
+      'intensity-alt',
+      'Hot move',
+      up
+        ? `🔥 ${tick} ripping ${display} ${phrases.today}`
+        : `❄️ ${tick} dumping ${display} ${phrases.today}`,
+    )
+  } else if (band === 'huge') {
+    // ~15–25%
+    push(
+      'intensity',
+      'Intensity',
+      up
+        ? `🚀 ${tick} soaring ${display} ${phrases.classic}`
+        : `🔻 ${tick} plunging ${display} ${phrases.classic}`,
+    )
+    push(
+      'intensity-alt',
+      'Huge',
+      up
+        ? `${tick} ${display} — massive move ${phrases.today} 🚀`
+        : `${tick} ${display} — heavy selloff ${phrases.today} 📉`,
+    )
+  } else {
+    // 25%+
+    push(
+      'intensity',
+      'Intensity',
+      up
+        ? `🚀 ${tick} exploding ${display} ${phrases.classic}`
+        : `💥 ${tick} crashing ${display} ${phrases.classic}`,
+    )
+    push(
+      'intensity-alt',
+      'Extreme',
+      up
+        ? `${tick} ${display} — historic spike ${phrases.today} 🚨`
+        : `${tick} ${display} — historic drop ${phrases.today} 🚨`,
+    )
+  }
+
+  // --- Breaking (news desk; kicks in harder from 10%+) ---
+  if (band === 'mild' || band === 'solid') {
+    push(
+      'breaking-soft',
+      'Watch',
+      up
+        ? `👀 ${tick} ${display} ${phrases.classic}`
+        : `👀 ${tick} ${display} ${phrases.classic}`,
+    )
+  } else if (band === 'strong') {
+    push(
+      'breaking',
+      'Breaking',
+      up
+        ? `🚨 BREAKING: ${tick} ${display} ${phrases.classic}`
+        : `🚨 BREAKING: ${tick} ${display} ${phrases.classic}`,
+    )
+    push(
+      'breaking-alt',
+      'Flash',
+      up
+        ? `BREAKING 📈 ${tick} jumps ${display} ${phrases.today}`
+        : `BREAKING 📉 ${tick} drops ${display} ${phrases.today}`,
+    )
+  } else {
+    push(
+      'breaking',
+      'Breaking',
+      up
+        ? `🚨 BREAKING: ${tick} ${display} ${phrases.classic}`
+        : `🚨 BREAKING: ${tick} ${display} ${phrases.classic}`,
+    )
+    push(
+      'breaking-alt',
+      'Alert',
+      up
+        ? `🚨 MARKET ALERT: ${tick} rockets ${display} ${phrases.today}`
+        : `🚨 MARKET ALERT: ${tick} collapses ${display} ${phrases.today}`,
+    )
+  }
+
+  // --- Punchy (short social) ---
+  if (band === 'mild') {
+    push('punchy', 'Punchy', `${tick} ${display} ${phrases.today}`)
+  } else if (band === 'solid') {
+    push(
+      'punchy',
+      'Punchy',
+      up ? `${tick} ${display} and climbing 📈` : `${tick} ${display} under pressure 📉`,
+    )
+  } else if (band === 'strong') {
+    push(
+      'punchy',
+      'Punchy',
+      up ? `${tick} ${display} 🔥 big move ${phrases.short}` : `${tick} ${display} 📉 sharp drop ${phrases.short}`,
+    )
+  } else if (band === 'huge') {
+    push(
+      'punchy',
+      'Punchy',
+      up ? `🚀 ${tick} ${display} moonshot ${phrases.today}` : `🔻 ${tick} ${display} freefall ${phrases.today}`,
+    )
+  } else {
+    push(
+      'punchy',
+      'Punchy',
+      up
+        ? `🚨 ${tick} ${display} — insane move ${phrases.today}`
+        : `🚨 ${tick} ${display} — brutal selloff ${phrases.today}`,
+    )
+  }
+
+  // Clean band-tag line (no verb spam) for all sizes ≥5%
+  if (band !== 'mild') {
+    const tag =
+      band === 'solid'
+        ? up
+          ? 'notable gain'
+          : 'notable drop'
+        : band === 'strong'
+          ? up
+            ? 'double-digit surge'
+            : 'double-digit drop'
+          : band === 'huge'
+            ? up
+              ? 'huge rally'
+              : 'huge selloff'
+            : up
+              ? 'extreme rally'
+              : 'extreme crash'
+    push('tagged', 'Tagged', `${tick} ${display} — ${tag} ${phrases.classic}`)
+  }
+
+  return options
+}
+
+/** Pick one session line for a tone (falls back to classic). */
+function pickShareSessionLineByTone(
+  options: ShareSessionLineOption[],
+  tone: ShareSessionLineTone,
+): string {
+  if (!options.length) return ''
+  if (tone === 'classic') {
+    return (
+      options.find((o) => o.id === 'classic')?.line ||
+      options.find((o) => o.id === 'gemini')?.line ||
+      options[0].line
+    )
+  }
+  if (tone === 'intensity') {
+    return (
+      options.find((o) => o.id === 'intensity')?.line ||
+      options.find((o) => o.id.startsWith('intensity'))?.line ||
+      options[0].line
+    )
+  }
+  if (tone === 'breaking') {
+    return (
+      options.find((o) => o.id === 'breaking')?.line ||
+      options.find((o) => o.id.startsWith('breaking'))?.line ||
+      options.find((o) => o.id === 'intensity')?.line ||
+      options[0].line
+    )
+  }
+  // punchy
+  return options.find((o) => o.id === 'punchy')?.line || options[0].line
+}
+
+/**
+ * Reason body for the share image — Likely driver content only.
+ * No “Likely driver:” label, no secondary / move / confidence.
+ * (Session headline is drawn separately.)
+ */
+function extractShareReasonBody(
+  summary: string,
+  titleFallback: string,
+  event: PriceMovementEvent,
+): string {
+  const sections = parseGeminiTweetSections(summary || '')
+  let quote =
+    sections.likely ||
+    String(summary || '')
+      .replace(/^likely\s*driver\s*:\s*/i, '')
+      .trim()
+
+  // If still looks like full blob including headline, drop first line when likely was empty
+  if (!sections.likely && sections.headline && quote.startsWith(sections.headline)) {
+    quote = quote.slice(sections.headline.length).trim()
+    quote = quote.replace(/^likely\s*driver\s*:\s*/i, '').trim()
+  }
+
+  // Drop secondary / move / confidence tails; single paragraph for the card
+  quote = quote
+    .replace(/\n\s*secondary\s*driver\s*:[\s\S]*$/i, '')
+    .replace(/\n\s*move\s*classification\s*:[\s\S]*$/i, '')
+    .replace(/\n\s*confidence\s*:[\s\S]*$/i, '')
+    .replace(/^likely\s*driver\s*:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!quote) {
+    const close = formatChange(event.price_change || event.momentum)
+    const premarket = formatChange(getPremarketChange(event))
+    const bits: string[] = []
+    if (close?.text) bits.push(`${close.text} at close`)
+    if (premarket?.text) bits.push(`pre-market ${premarket.text}`)
+    quote = bits.length
+      ? `${titleFallback} moved ${bits.join(' · ')}`
+      : `${titleFallback} notable price momentum`
+  }
+  return quote
 }
 
 /** Editable copy drawn on the share image (session-only; not in layout prefs). */
@@ -1214,9 +5480,35 @@ type ShareCardTextContent = {
   title: string
   percent: string
   price: string
+  /** First session line (so far in regular trading / pre-market…). */
+  sessionLine: string
   reason: string
   stamp: string
   brand: string
+}
+
+/** Pick title from style + optional manual edit (keeps custom edits). */
+function resolveShareTitleText(
+  style: ShareCardStyle,
+  textContent: ShareCardTextContent | null | undefined,
+  symbol: string,
+  companyLabel: string,
+): string {
+  const autoTicker = symbol
+  const autoCompany = String(companyLabel || '').trim() || symbol
+  const custom = String(textContent?.title || '').trim()
+  if (!custom) {
+    return style.titleMode === 'ticker' ? autoTicker : autoCompany
+  }
+  // Still one of the auto values → style toggle wins (fixes “title stuck” bug).
+  if (
+    custom === autoTicker ||
+    custom === autoCompany ||
+    custom.toUpperCase() === autoTicker
+  ) {
+    return style.titleMode === 'ticker' ? autoTicker : autoCompany
+  }
+  return custom
 }
 
 /** Build default image text from event + style (company name already resolved when possible). */
@@ -1229,31 +5521,33 @@ function buildShareCardTextContent(
   const symbol = String(ticker || '').toUpperCase()
   const close = formatChange(event.price_change || event.momentum)
   const premarket = formatChange(getPremarketChange(event))
-  const titleMode = style.titleMode === 'ticker' ? 'ticker' : 'company'
   const companyLabel = String(companyName || '').trim() || symbol
-  const titleText = titleMode === 'ticker' ? symbol : companyLabel
-
-  const sections = parseGeminiTweetSections(event.summary || '')
-  let quote =
-    sections.likely ||
-    sections.headline ||
-    String(event.summary || '').replace(/^likely\s*driver\s*:\s*/i, '').trim()
-  quote = quote.replace(/\s+/g, ' ').trim()
-  if (!quote) {
-    const bits: string[] = []
-    if (close?.text) bits.push(`${close.text} at close`)
-    if (premarket?.text) bits.push(`pre-market ${premarket.text}`)
-    quote = bits.length
-      ? `${titleText} moved ${bits.join(' · ')}`
-      : `${titleText} notable price momentum`
-  }
+  const titleText = resolveShareTitleText(style, null, symbol, companyLabel)
+  const rawSummary = String(event.summary || '')
+  const geminiLine = extractShareSessionHeadline(rawSummary)
+  const moveText = close?.text || premarket?.text || ''
+  const chartSession = inferShareChartSession(event, geminiLine)
+  const tone = style.sessionLineTone || 'classic'
+  const sessionOptions = buildShareSessionLineOptions({
+    ticker: symbol,
+    moveText,
+    session: chartSession,
+    geminiLine,
+  })
+  // Classic tone prefers Gemini wording when present; other tones use magnitude templates
+  const sessionLine =
+    tone === 'classic' && geminiLine
+      ? geminiLine
+      : pickShareSessionLineByTone(sessionOptions, tone) || geminiLine
+  const reason = extractShareReasonBody(rawSummary, titleText, event)
 
   return {
     title: titleText,
-    percent: close?.text || premarket?.text || '',
+    percent: moveText,
     price: formatSharePriceLabel(event.price),
-    reason: quote,
-    stamp: formatShareStampLabel(event),
+    sessionLine,
+    reason,
+    stamp: formatShareStampLabel(event, style.chartAxisTimezone || 'America/New_York'),
     brand: 'Track at Trigger',
   }
 }
@@ -1282,56 +5576,115 @@ async function renderMomentumTweetImage(
   companyName?: string | null,
   style: ShareCardStyle = DEFAULT_SHARE_CARD_STYLE,
   textContent?: ShareCardTextContent | null,
-): Promise<{ blob: Blob; objectUrl: string } | null> {
+  /**
+   * Optional user photo (data URL):
+   * - full-card **blurred background**
+   * - sharp hero frame in the photo slot (above/below header or chart)
+   */
+  sideImageDataUrl?: string | null,
+): Promise<{ blob: Blob; objectUrl: string; width: number; height: number } | null> {
   if (typeof document === 'undefined') return null
+  await ensureShareFontsLoaded()
   const symbol = String(ticker || '').toUpperCase()
   const close = formatChange(event.price_change || event.momentum)
   const premarket = formatChange(getPremarketChange(event))
   let isDown = Boolean(close?.negative || (!close?.positive && premarket?.negative))
   let isUp = Boolean(close?.positive || premarket?.positive) && !isDown
 
-  // Defaults when textContent omitted (e.g. first paint before overrides)
-  const titleMode = style.titleMode === 'ticker' ? 'ticker' : 'company'
-  const companyLabel =
-    titleMode === 'company'
-      ? await resolveShareCompanyName(symbol, companyName)
-      : String(companyName || '').trim() || symbol
-  const defaultTitle = titleMode === 'ticker' ? symbol : companyLabel
-  // Default: date · time on footer left next to Track at Trigger
-  const dateInFooter = style.dateInFooter !== false
+  // Session stamp: FULL convert of market ET time → selected zone + abbrev
+  // (e.g. 3:33 PM ET → 8:33 PM BST). Chart cutoff still uses original ET time_label.
+  const stampTz =
+    style.chartAxisTimezone &&
+    SHARE_CHART_TIMEZONES.some((z) => z.id === style.chartAxisTimezone)
+      ? style.chartAxisTimezone
+      : 'America/New_York'
+  // Always recompute from event + zone so ET/UK/IST switches fully convert the clock
+  const stampLabel = formatShareStampLabel(event, stampTz)
 
-  const sections = parseGeminiTweetSections(event.summary || '')
-  let defaultQuote =
-    sections.likely ||
-    sections.headline ||
-    String(event.summary || '').replace(/^likely\s*driver\s*:\s*/i, '').trim()
-  defaultQuote = defaultQuote.replace(/\s+/g, ' ').trim()
-  if (!defaultQuote) {
-    const bits: string[] = []
-    if (close?.text) bits.push(`${close.text} at close`)
-    if (premarket?.text) bits.push(`pre-market ${premarket.text}`)
-    defaultQuote = bits.length
-      ? `${defaultTitle} moved ${bits.join(' · ')}`
-      : `${defaultTitle} notable price momentum`
+  // Company name + Yahoo line (9:30 ET → stamp’s ET minute) in parallel
+  const [companyLabel, chartSeriesFull] = await Promise.all([
+    resolveShareCompanyName(symbol, companyName),
+    loadShareRegularSessionSeries(symbol, event.event_date, {
+      // Cutoff must stay in market ET, not the converted display stamp
+      stampText: event.time_label,
+      timeLabel: event.time_label,
+      sessionDays: clampShareChartSessionDays(style.chartSessionDays),
+      interval: clampShareChartInterval(style.chartInterval),
+    }),
+  ])
+  // End fixed at stamp; startPct trims from the left of the loaded sessions
+  const chartSeries = trimShareChartSeriesByStartPct(
+    chartSeriesFull,
+    style.chartVisibleStartPct,
+  )
+  if (chartSeries.length >= 2) {
+    const first = chartSeries[0].close
+    const lastClose = chartSeries[chartSeries.length - 1].close
+    if (lastClose < first) {
+      isDown = true
+      isUp = false
+    } else if (lastClose > first) {
+      isDown = false
+      isUp = true
+    }
   }
+  const defaultTitle = resolveShareTitleText(style, null, symbol, companyLabel)
+  const showSessionHeadline = style.showSessionHeadline !== false
+  // When session headline is on, stamp sits under that line (not footer / not price-right).
+  const timestampPlacement =
+    showSessionHeadline
+      ? 'under-session'
+      : style.timestampPlacement === 'price-right'
+        ? 'price-right'
+        : 'footer-left'
 
-  const titleText = (textContent?.title ?? defaultTitle).trim() || defaultTitle
+  const rawSummary = String(event.summary || '')
+  const defaultSessionLine = extractShareSessionHeadline(rawSummary)
+  const defaultQuote = extractShareReasonBody(rawSummary, defaultTitle, event)
+
+  const titleText = resolveShareTitleText(style, textContent, symbol, companyLabel)
   const moveText = (textContent?.percent ?? close?.text ?? premarket?.text ?? '').trim()
-  const priceLabel = (textContent?.price ?? formatSharePriceLabel(event.price)).trim()
-  const stampLabel = (textContent?.stamp ?? formatShareStampLabel(event)).trim()
+  const showSharePrice = style.showSharePrice !== false
+  const priceLabelRaw = (textContent?.price ?? formatSharePriceLabel(event.price)).trim()
+  const priceLabel = showSharePrice ? priceLabelRaw : ''
+  const sessionLineRaw =
+    textContent?.sessionLine !== undefined
+      ? String(textContent.sessionLine)
+      : defaultSessionLine
+  const sessionLine = showSessionHeadline ? sessionLineRaw.replace(/\s+/g, ' ').trim() : ''
   const quote = (textContent?.reason ?? defaultQuote).replace(/\s+/g, ' ').trim() || defaultQuote
-  const brandLabel = (textContent?.brand ?? 'Track at Trigger').trim() || 'Track at Trigger'
+  const showBrand = style.showBrand !== false
+  const brandLabelRaw = (textContent?.brand ?? 'Track at Trigger').trim() || 'Track at Trigger'
+  const brandLabel = showBrand ? brandLabelRaw : ''
+  const brandTone =
+    style.brandTone === 'dark' || style.brandTone === 'light' ? style.brandTone : 'auto'
+  const rawBrandHScale = Number(style.brandHeightScale)
+  const brandHeightScale =
+    Number.isFinite(rawBrandHScale) && rawBrandHScale >= 0.5 && rawBrandHScale <= 2.5
+      ? rawBrandHScale
+      : 1
 
   const moveFlags = shareMoveFlagsFromText(moveText, isDown, isUp)
   isDown = moveFlags.isDown
   isUp = moveFlags.isUp
 
-  const w = 1080
-  const imagePadding = Math.min(
+  const rawW = Number(style.canvasWidth)
+  const w =
+    Number.isFinite(rawW) && rawW >= 800
+      ? Math.min(3840, Math.round(rawW))
+      : DEFAULT_SHARE_CARD_STYLE.canvasWidth
+  const rawAspect = Number(style.aspectRatio)
+  const aspectRatio =
+    Number.isFinite(rawAspect) && rawAspect >= 0.75 && rawAspect <= 1.8
+      ? rawAspect
+      : DEFAULT_SHARE_CARD_STYLE.aspectRatio
+  // Design tokens are authored @ 1080w — scale fully so Full HD / 2K / 4K stay sharp & proportional
+  const typeScale = Math.min(4, Math.max(0.5, w / 1080))
+  const designPadX = Math.min(
     120,
     Math.max(16, Math.round(Number(style.imagePadding) || DEFAULT_SHARE_CARD_STYLE.imagePadding)),
   )
-  const topPad = Math.min(
+  const designTopPad = Math.min(
     200,
     Math.max(
       0,
@@ -1342,7 +5695,7 @@ async function renderMomentumTweetImage(
       ),
     ),
   )
-  const bottomPad = Math.min(
+  const designBottomPad = Math.min(
     200,
     Math.max(
       0,
@@ -1353,92 +5706,460 @@ async function renderMomentumTweetImage(
       ),
     ),
   )
-  const padX = imagePadding
+  // Full-bleed only: image wall-to-wall + black veil. No inset black content plate.
+  const padX = Math.round(designPadX * typeScale)
+  const topPad = Math.round(designTopPad * typeScale)
+  const bottomPad = Math.round(designBottomPad * typeScale)
   const textMaxW = w - padX * 2
-  const logoSize = Math.round(style.logoSize)
-  const logoGap = 18
-  const nameSize = Math.round(style.nameFontSize)
-  const pctSize = Math.round(style.pctFontSize)
-  const priceFontSize = Math.round(style.priceFontSize || 32)
+  const logoSize = Math.round((style.logoSize || 86) * typeScale)
+  const logoGap = Math.round(18 * typeScale)
+  // --- Design tokens (1080 canvas) · Google Sans Flex / AppFont table ---
+  const nameSize = Math.round((style.nameFontSize || 56) * typeScale) // company ExtraBold 56
+  const pctSize = Math.round((style.pctFontSize || 80) * typeScale) // pct Bold 80
+  const priceFontSize = Math.round((style.priceFontSize || 36) * typeScale) // price SemiBold 36
   const rawPriceWeight = Number(style.priceFontWeight)
   const priceFontWeight = Number.isFinite(rawPriceWeight)
     ? Math.min(900, Math.max(100, Math.round(rawPriceWeight / 100) * 100))
-    : 200
-  const stampFontSize = Math.round(style.stampFontSize || 30)
-  const reasonSize = Math.round(style.reasonFontSize)
-  const nameWeight = style.nameBold ? 800 : 500
-  const reasonWeight = style.reasonBold ? 800 : 500
-  const nameFont = `${nameWeight} ${nameSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`
-  const nameLineH = Math.round(nameSize * 1.35)
-  const pctFont = `800 ${pctSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`
-  const reasonFont = `${reasonWeight} ${reasonSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`
-  const reasonLineH = Math.round(reasonSize * 1.22)
-  const chartH = 360
-  const gapBeforeChart = Math.round(style.gapBeforeChart)
-  const gapAfterChart = Math.round(style.gapAfterChart)
-  const gapBeforeBrand = 130
-  const brandFont = '500 28px ui-sans-serif, system-ui, -apple-system, sans-serif'
-  // Adjustable weight; slightly tall letterforms via vertical scale when drawing
-  const priceFont = `${priceFontWeight} ${priceFontSize}px "Avenir Next", "Helvetica Neue", "Segoe UI", ui-sans-serif, system-ui, sans-serif`
-  const stampFont = `500 ${stampFontSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`
-  const priceTallScale = 1.18
+    : 600
+  const stampFontSize = Math.round((style.stampFontSize || 34) * typeScale) // reasonWhen 34
+  const reasonSize = Math.round((style.reasonFontSize || 40) * typeScale) // reasonDriver 40
+  const nameWeight = shareFontWeightCss(style.nameWeight, 'extrabold')
+  const reasonWeight = shareFontWeightCss(style.reasonWeight, 'regular')
+  const sessionWeightCss = shareFontWeightCss(style.sessionWeight, 'semibold')
+  const brandWeightCss = shareFontWeightCss(style.brandWeight, 'medium')
+  const nameFont = shareFont(nameWeight, nameSize)
+  // company lineHeight 64 @ size 56
+  const nameLineH = Math.round(nameSize * (64 / 56))
+  const pctFont = shareFont(800, pctSize) // Bold + weight 800
+  const reasonFont = shareFont(reasonWeight, reasonSize)
+  // reasonDriver lineHeight 54 @ size 40
+  const reasonLineH = Math.round(reasonSize * (54 / 40))
+  // Plot + time axis
+  // Extra room under plot for time ticks and/or day labels (Today · 6 August)
+  const timeDayGapPx = Math.min(
+    100,
+    Math.max(
+      0,
+      Math.round(
+        Number.isFinite(Number(style.chartTimeDayGap))
+          ? Number(style.chartTimeDayGap)
+          : DEFAULT_SHARE_CARD_STYLE.chartTimeDayGap,
+      ),
+    ),
+  )
+  const chartAxisExtra =
+    (style.showChartTimeAxis !== false ? 28 : 0) +
+    (style.showChartDayLabels === true
+      ? 22 + (style.showChartTimeAxis !== false ? timeDayGapPx : 4)
+      : 0)
+  const chartPlotBase = Math.min(
+    700,
+    Math.max(
+      140,
+      Math.round(
+        Number.isFinite(Number(style.chartPlotHeight)) && Number(style.chartPlotHeight) > 0
+          ? Number(style.chartPlotHeight)
+          : DEFAULT_SHARE_CARD_STYLE.chartPlotHeight,
+      ),
+    ),
+  )
+  // Full chart block = plot + time/day axes; taller plot = more vertical “zoom”
+  let chartH = Math.round((chartPlotBase + chartAxisExtra) * typeScale)
+  let gapBeforeChart = Math.round(style.gapBeforeChart * typeScale)
+  let gapAfterChart = Math.round(style.gapAfterChart * typeScale)
+  // Reason → Track at Trigger: reasonMarginBottom + brandMarginTop
+  // Collapse brand spacing when both brand text and store icons are hidden
+  const brandRowVisible =
+    showBrand || style.showStoreBadges !== false
+  const reasonGap = Number.isFinite(Number(style.reasonMarginBottom))
+    ? Math.min(200, Math.max(0, Number(style.reasonMarginBottom)))
+    : DEFAULT_SHARE_CARD_STYLE.reasonMarginBottom
+  const brandTopGap = Number.isFinite(Number(style.brandMarginTop))
+    ? Math.min(120, Math.max(0, Number(style.brandMarginTop)))
+    : DEFAULT_SHARE_CARD_STYLE.brandMarginTop
+  let gapBeforeBrand = brandRowVisible
+    ? Math.round((reasonGap + brandTopGap) * typeScale)
+    : Math.round(12 * typeScale) // small breathing room before bottom edge / footer date
+  // Space below Track at Trigger row
+  const brandBottomGap = Number.isFinite(Number(style.brandMarginBottom))
+    ? Math.min(160, Math.max(0, Number(style.brandMarginBottom)))
+    : DEFAULT_SHARE_CARD_STYLE.brandMarginBottom
+  // brandMarginBottom replaces/adds to bottom pad for the brand row breathing room
+  const brandBottomPad = brandRowVisible
+    ? Math.round(brandBottomGap * typeScale)
+    : Math.round(bottomPad * 0.5)
+  const rawBrandFs = Number(style.brandFontSize)
+  const brandFontSize = Math.round(
+    (Number.isFinite(rawBrandFs) && rawBrandFs >= 14
+      ? Math.min(64, rawBrandFs)
+      : DEFAULT_SHARE_CARD_STYLE.brandFontSize) * typeScale,
+  )
+  const brandFont = shareFont(brandWeightCss, brandFontSize)
+  const priceFont = shareFont(priceFontWeight, priceFontSize)
+  const stampFont = shareFont(500, stampFontSize) // Medium 500
+  // Absolute design line-heights (scaled)
+  const pctLineH = Math.round(pctSize * (86 / 80))
+  const priceLineH = Math.round(priceFontSize * (42 / 36))
+  const stampLineH = Math.round(stampFontSize * (42 / 34))
+  // brand height scale stretches vertical metrics (draw uses ctx.scale Y)
+  const brandLineH = Math.round(brandFontSize * (34 / 28) * brandHeightScale)
   const cardBg = shareCardBgHex(style.cardColor)
-  const bodyText = shareTextFillColor(style.textColor)
-  const mutedText = shareTextMutedColor(style.textColor)
+  const textId = style.textColor || 'black'
+  const bodyText = shareTextFillColor(textId)
+  const mutedText = shareTextMutedColor(textId)
+  const reasonFill = shareTextSoftColor(textId)
+  const brandFill =
+    brandTone === 'light'
+      ? SHARE_BRAND_LIGHT
+      : brandTone === 'dark'
+        ? SHARE_INK_SOFT
+        : shareTextSoftColor(textId)
+  const preferSquare = style.preferSquare !== false
+  const chartSession = inferShareChartSession(event, sessionLine)
 
   // Custom pasted logos win over CDN/proxy
   const customMap = loadCustomLogoMap()
   const logoImg = await loadShareLogo(symbol, customMap[symbol] || null)
+  const sideImg =
+    sideImageDataUrl && String(sideImageDataUrl).trim()
+      ? await loadImageFromUrl(String(sideImageDataUrl).trim())
+      : null
 
   // Offscreen measure canvas (fonts only)
   const measure = document.createElement('canvas').getContext('2d')
   if (!measure) return null
 
-  // Date stamp under price (left meta row) only when not on footer
-  const stampUnderPrice = Boolean(stampLabel) && !dateInFooter
-  const footerDate = dateInFooter ? stampLabel : ''
+  const stampBesidePrice = Boolean(stampLabel) && timestampPlacement === 'price-right'
+  const stampUnderSession =
+    Boolean(stampLabel) && timestampPlacement === 'under-session' && Boolean(sessionLine)
+  const footerDate = timestampPlacement === 'footer-left' ? stampLabel : ''
 
   measure.font = pctFont
+  setShareLetterSpacing(measure, -1.5 * typeScale)
   const pctW = moveText ? measure.measureText(moveText).width : 0
+  clearShareLetterSpacing(measure)
 
   // Header row: logo + title left, % right only
-  const nameLeft = padX + (logoImg ? logoSize + logoGap : 0)
+  // Logo always reserves space (image or monogram fallback)
+  const nameLeft = padX + logoSize + logoGap
   const nameMaxW = Math.max(
     180,
-    textMaxW - (logoImg ? logoSize + logoGap : 0) - (pctW ? pctW + 28 : 0),
+    textMaxW - logoSize - logoGap - (pctW ? pctW + 28 : 0),
   )
 
   measure.font = nameFont
-  const nameLines = measureWrappedText(measure, titleText, nameMaxW, 3)
+  setShareLetterSpacing(measure, -0.7 * typeScale)
+  // Max 2 lines + ellipsis (mobile styles.company)
+  const nameLines = measureWrappedText(measure, titleText, nameMaxW, 2)
+  clearShareLetterSpacing(measure)
+
+  // Session / section title — reasonTitle SemiBold 52 / lh 66
+  const rawSessionFs = Number(style.sessionFontSize)
+  const sessionFontSize = Math.round(
+    (Number.isFinite(rawSessionFs) && rawSessionFs > 0
+      ? Math.min(160, Math.max(18, rawSessionFs))
+      : DEFAULT_SHARE_CARD_STYLE.sessionFontSize) * typeScale,
+  )
+  const rawSessionLh = Number(style.sessionLineHeight)
+  const sessionLhMult =
+    Number.isFinite(rawSessionLh) && rawSessionLh >= 1 && rawSessionLh <= 1.8
+      ? rawSessionLh
+      : 66 / 52
+  const sessionLineH = Math.round(sessionFontSize * sessionLhMult)
+  const sessionFont = shareFont(sessionWeightCss, sessionFontSize)
+  measure.font = sessionFont
+  setShareLetterSpacing(measure, -0.4 * typeScale)
+  const sessionLines = sessionLine
+    ? measureWrappedText(measure, sessionLine, textMaxW, 4)
+    : []
+  clearShareLetterSpacing(measure)
 
   // Full reason — high line cap so likely driver is never cut short
   measure.font = reasonFont
+  setShareLetterSpacing(measure, -0.25 * typeScale)
   const reasonLines = measureWrappedText(measure, quote, textMaxW, 24)
+  clearShareLetterSpacing(measure)
 
   const nameBlockH =
     nameLines.length <= 1 ? nameSize + 8 : nameLines.length * nameLineH - 12
-  const identityBlockH = logoImg ? Math.max(logoSize, nameBlockH) : nameBlockH
-  const rightPctH = moveText ? pctSize + 8 : 0
+  // Logo slot always present (image or monogram)
+  const identityBlockH = Math.max(logoSize, nameBlockH)
+  const rightPctH = moveText ? pctLineH : 0
   const bandH = Math.max(identityBlockH, rightPctH, 40)
 
-  // Under header on the RIGHT (under %): share price + optional stamp
-  const priceDrawH = priceLabel ? Math.ceil(priceFontSize * priceTallScale) + 10 : 0
+  // Under header on the RIGHT (under %): share price (+ optional timestamp)
+  const priceDrawH = priceLabel ? priceLineH + 8 : 0
   const metaRowH =
-    priceDrawH +
-    (stampUnderPrice ? stampFontSize + 6 : 0) +
-    (priceLabel || stampUnderPrice ? 16 : 0)
+    priceLabel || stampBesidePrice
+      ? Math.max(priceDrawH, stampBesidePrice ? stampLineH + 8 : 0) + 12
+      : 0
 
-  const bandTop = topPad
-  const bandMidY = bandTop + bandH / 2
-  const headerBottom = bandTop + bandH
-  const metaTop = headerBottom + (metaRowH ? 8 : 0)
-  const blockBottom = metaTop + metaRowH
-  const chartTop = blockBottom + gapBeforeChart
-  const reasonFirstY = chartTop + chartH + gapAfterChart
-  const reasonLastY =
-    reasonFirstY + Math.max(0, reasonLines.length - 1) * reasonLineH
-  const brandY = reasonLastY + gapBeforeBrand
-  const h = Math.ceil(brandY + bottomPad)
+  // Session block: marginTop → headline → stamp gap → stamp → (stampReasonGap | marginBottom) → reason
+  const rawSessMt = Number(style.sessionMarginTop)
+  const rawSessMb = Number(style.sessionMarginBottom)
+  const rawSessStampGap = Number(style.sessionStampGap)
+  const rawStampReasonGap = Number(style.stampReasonGap)
+  const sessionBlockGapTop = sessionLines.length
+    ? Math.round(
+        (Number.isFinite(rawSessMt)
+          ? Math.min(120, Math.max(0, rawSessMt))
+          : DEFAULT_SHARE_CARD_STYLE.sessionMarginTop) * typeScale,
+      )
+    : 0
+  const sessionStampGapPx = stampUnderSession
+    ? Math.round(
+        (Number.isFinite(rawSessStampGap)
+          ? Math.min(80, Math.max(0, rawSessStampGap))
+          : DEFAULT_SHARE_CARD_STYLE.sessionStampGap) * typeScale,
+      )
+    : 0
+  // When stamp sits under session: gap after stamp → reason uses stampReasonGap.
+  // When no stamp under session: sessionMarginBottom is session → reason.
+  const sessionToReasonGap = Math.round(
+    (Number.isFinite(rawSessMb)
+      ? Math.min(160, Math.max(0, rawSessMb))
+      : DEFAULT_SHARE_CARD_STYLE.sessionMarginBottom) * typeScale,
+  )
+  const stampToReasonGapPx = stampUnderSession
+    ? Math.round(
+        (Number.isFinite(rawStampReasonGap)
+          ? Math.min(160, Math.max(0, rawStampReasonGap))
+          : DEFAULT_SHARE_CARD_STYLE.stampReasonGap) * typeScale,
+      )
+    : 0
+  let sessionAfterGap = sessionLines.length
+    ? stampUnderSession
+      ? stampToReasonGapPx
+      : sessionToReasonGap
+    : 0
+  let sessionBlockH = sessionLines.length
+    ? sessionBlockGapTop +
+      sessionLines.length * sessionLineH +
+      (stampUnderSession ? sessionStampGapPx + stampFontSize + 6 : 0) +
+      sessionAfterGap
+    : 0
+
+  // Pasted image is ONLY the full-card digital background — never a framed hero above/below header.
+  const photoPlacement = 'background' as const
+  const hasPhoto = false
+  // Photo metrics are design-px @ 1080 — scale to export width (only used for legacy hero slots)
+  let photoHeight = Math.round(
+    Math.min(
+      900,
+      Math.max(120, Math.round(Number(style.photoHeight) || DEFAULT_SHARE_CARD_STYLE.photoHeight)),
+    ) * typeScale,
+  )
+  const photoRadius = Math.round(
+    Math.min(
+      120,
+      Math.max(0, Math.round(Number(style.photoRadius) ?? DEFAULT_SHARE_CARD_STYLE.photoRadius)),
+    ) * typeScale,
+  )
+  const photoBorderWidth = Math.round(
+    Math.min(
+      16,
+      Math.max(
+        0,
+        Math.round(Number(style.photoBorderWidth) ?? DEFAULT_SHARE_CARD_STYLE.photoBorderWidth),
+      ),
+    ) * typeScale,
+  )
+  const photoMarginX = Math.round(
+    Math.min(
+      80,
+      Math.max(0, Math.round(Number(style.photoMarginX) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginX)),
+    ) * typeScale,
+  )
+  let photoMarginTop = Math.round(
+    Math.min(
+      120,
+      Math.max(0, Math.round(Number(style.photoMarginTop) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginTop)),
+    ) * typeScale,
+  )
+  let photoMarginBottom = Math.round(
+    Math.min(
+      160,
+      Math.max(
+        0,
+        Math.round(Number(style.photoMarginBottom) ?? DEFAULT_SHARE_CARD_STYLE.photoMarginBottom),
+      ),
+    ) * typeScale,
+  )
+  const photoFrost =
+    Math.min(100, Math.max(0, Number(style.photoFrost) ?? DEFAULT_SHARE_CARD_STYLE.photoFrost)) /
+    100
+
+  // Floors used when locking to IG 1:1 / story ratios (preferSquare)
+  const chartMinH = Math.max(
+    120,
+    Math.round((chartPlotBase * 0.45 + chartAxisExtra) * typeScale),
+  )
+  const photoMinH = hasPhoto ? Math.round(100 * typeScale) : 0
+
+  /**
+   * Stack: header+% → price → chart → session → reason → brand
+   * (Hero photo slots only when photoPlacement ≠ background.)
+   * Mutates sessionBlockH when sessionAfterGap changes.
+   */
+  const stackShareLayout = () => {
+    sessionBlockH = sessionLines.length
+      ? sessionBlockGapTop +
+        sessionLines.length * sessionLineH +
+        (stampUnderSession ? sessionStampGapPx + stampFontSize + 6 : 0) +
+        sessionAfterGap
+      : 0
+
+    let cursorY = topPad
+    let photoTop = 0
+    let bandTop = topPad
+    let metaTop = topPad
+    let chartTop = topPad
+
+    if (hasPhoto && photoPlacement === 'above-header') {
+      photoTop = cursorY + photoMarginTop
+      cursorY = photoTop + photoHeight + photoMarginBottom
+      bandTop = cursorY
+    } else {
+      bandTop = cursorY
+    }
+
+    const bandMidY = bandTop + bandH / 2
+    const headerBottom = bandTop + bandH
+    metaTop = headerBottom + (metaRowH ? 8 : 0)
+    const blockBottom = metaTop + metaRowH
+    cursorY = blockBottom + gapBeforeChart
+
+    if (hasPhoto && photoPlacement === 'below-header') {
+      photoTop = cursorY + photoMarginTop
+      cursorY = photoTop + photoHeight + photoMarginBottom
+    }
+
+    chartTop = cursorY
+    cursorY = chartTop + chartH
+
+    if (hasPhoto && photoPlacement === 'below-chart') {
+      photoTop = cursorY + photoMarginTop
+      cursorY = photoTop + photoHeight + photoMarginBottom
+    }
+
+    const reasonBlockH =
+      reasonLines.length > 0
+        ? Math.max(reasonSize, reasonLines.length * reasonLineH - (reasonLineH - reasonSize))
+        : 0
+    const naturalH =
+      cursorY + gapAfterChart + sessionBlockH + reasonBlockH + gapBeforeBrand + bottomPad
+
+    const chartBottomLive = chartTop + chartH
+    const afterChartY =
+      hasPhoto && photoPlacement === 'below-chart'
+        ? photoTop + photoHeight + photoMarginBottom
+        : chartBottomLive
+    const contentBlockTop = afterChartY + gapAfterChart
+    const sessionFirstY = contentBlockTop + (sessionLines.length ? sessionBlockGapTop : 0)
+    const sessionLastY =
+      sessionFirstY + Math.max(0, sessionLines.length - 1) * sessionLineH
+    const sessionStampY = stampUnderSession
+      ? sessionLastY + sessionStampGapPx + stampFontSize
+      : 0
+    const reasonFirstY = sessionLines.length
+      ? contentBlockTop + sessionBlockH
+      : contentBlockTop
+    const reasonLastY =
+      reasonFirstY + Math.max(0, reasonLines.length - 1) * reasonLineH
+    const brandY = reasonLastY + gapBeforeBrand
+    const contentH = Math.ceil(brandY + Math.max(bottomPad, brandBottomPad) + 8)
+
+    return {
+      photoTop,
+      bandTop,
+      bandMidY,
+      metaTop,
+      chartTop,
+      naturalH,
+      contentH,
+      contentBlockTop,
+      sessionFirstY,
+      sessionLastY,
+      sessionStampY,
+      reasonFirstY,
+      reasonLastY,
+      brandY,
+      reasonBlockH,
+    }
+  }
+
+  // aspectRatio is height/width (1 = IG square, 1.25 ≈ 4:5 story)
+  const targetH = Math.round(w * aspectRatio)
+  let layout = stackShareLayout()
+
+  // Lock shape: compress until content fits target, then force exact canvas height.
+  // (Old logic only trimmed ~partial excess → 1:1 often stayed taller than wide.)
+  if (preferSquare && layout.naturalH > targetH + 2) {
+    for (let step = 0; step < 48 && layout.naturalH > targetH + 2; step += 1) {
+      const need = layout.naturalH - targetH
+      let reduced = 0
+
+      // 1) Gaps
+      const shrinkAfter = Math.min(Math.max(0, gapAfterChart - 8), Math.ceil(need * 0.2))
+      const shrinkBeforeChart = Math.min(Math.max(0, gapBeforeChart - 8), Math.ceil(need * 0.12))
+      const shrinkBrand = Math.min(Math.max(0, gapBeforeBrand - 12), Math.ceil(need * 0.15))
+      const shrinkSessionGap = Math.min(Math.max(0, sessionAfterGap - 6), Math.ceil(need * 0.08))
+      gapAfterChart -= shrinkAfter
+      gapBeforeChart -= shrinkBeforeChart
+      gapBeforeBrand -= shrinkBrand
+      sessionAfterGap -= shrinkSessionGap
+      reduced += shrinkAfter + shrinkBeforeChart + shrinkBrand + shrinkSessionGap
+
+      // 2) Hero photo (biggest leftover when 1:1 fails)
+      if (hasPhoto && photoHeight > photoMinH) {
+        const shrinkPhoto = Math.min(
+          photoHeight - photoMinH,
+          Math.max(4, Math.ceil(need * 0.35)),
+        )
+        photoHeight -= shrinkPhoto
+        reduced += shrinkPhoto
+        const shrinkPmt = Math.min(Math.max(0, photoMarginTop - 0), Math.ceil(need * 0.05))
+        const shrinkPmb = Math.min(Math.max(0, photoMarginBottom - 0), Math.ceil(need * 0.05))
+        photoMarginTop -= shrinkPmt
+        photoMarginBottom -= shrinkPmb
+        reduced += shrinkPmt + shrinkPmb
+      }
+
+      // 3) Chart
+      if (chartH > chartMinH) {
+        const shrinkChart = Math.min(
+          chartH - chartMinH,
+          Math.max(4, Math.ceil(need * 0.28)),
+        )
+        chartH -= shrinkChart
+        reduced += shrinkChart
+      }
+
+      layout = stackShareLayout()
+      if (reduced <= 0) break
+    }
+  }
+
+  const {
+    photoTop,
+    bandTop,
+    bandMidY,
+    metaTop,
+    chartTop,
+    contentBlockTop,
+    sessionFirstY,
+    sessionLastY,
+    sessionStampY,
+    reasonFirstY,
+    reasonLastY,
+    brandY,
+  } = layout
+
+  // Exact export size when locked (IG 1:1 = 1080×1080 when canvasWidth=1080)
+  let h = layout.contentH
+  if (preferSquare) {
+    h = targetH
+  }
 
   const canvas = document.createElement('canvas')
   canvas.width = w
@@ -1446,101 +6167,527 @@ async function renderMomentumTweetImage(
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
 
-  ctx.fillStyle = cardBg
-  ctx.fillRect(0, 0, w, h)
-  // Soft decorative wash (light on dark cards, dark-tint on light)
-  const isDarkCard =
-    style.cardColor === 'black' ||
-    style.cardColor === 'navy' ||
-    style.cardColor === 'slate'
-  ctx.fillStyle = isDarkCard ? 'rgba(255, 255, 255, 0.06)' : 'rgba(255, 255, 255, 0.08)'
-  ctx.beginPath()
-  ctx.arc(w * 0.9, h * 0.85, 200, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.arc(w * 0.1, h * 0.95, 140, 0, Math.PI * 2)
-  ctx.fill()
+  // Layers when digital bg + frame:
+  // 1) base · 2) full-bleed background image · 3) black content frame · 4) stamp · 5) content
+  const isDarkCard = isDarkHex(cardBg)
+  const rawImgOp = Number(style.bgImageOpacity)
+  const bgImageOpacity =
+    Number.isFinite(rawImgOp) && rawImgOp >= 0
+      ? Math.min(100, Math.max(0, Math.round(rawImgOp))) / 100
+      : DEFAULT_SHARE_CARD_STYLE.bgImageOpacity / 100
+
+  // Full-bleed only: image wall-to-wall + bipolar Black / White axes (−100…+100)
+  if (sideImg) {
+    // Base under image (shows if image opacity < 100%)
+    ctx.fillStyle = isDarkCard ? softenBlackCardHex(cardBg) : cardBg
+    ctx.fillRect(0, 0, w, h)
+    const bgBlack = clampShareBgAxis(style.bgBlack, DEFAULT_SHARE_CARD_STYLE.bgBlack)
+    const bgWhite = clampShareBgAxis(style.bgWhite, DEFAULT_SHARE_CARD_STYLE.bgWhite)
+    const rawBlur = Number(style.bgBlur)
+    const bgBlurPx = Number.isFinite(rawBlur)
+      ? Math.min(80, Math.max(0, Math.round(rawBlur)))
+      : DEFAULT_SHARE_CARD_STYLE.bgBlur
+    drawShareBlurredPhotoBackground(ctx, sideImg, w, h, {
+      blurPx: bgBlurPx,
+      imageOpacity: bgImageOpacity,
+      blackAxis: bgBlack,
+      whiteAxis: bgWhite,
+    })
+  } else if (isDarkCard) {
+    const g = ctx.createLinearGradient(0, 0, 0, h)
+    g.addColorStop(0, lightenHex(cardBg, 0.06))
+    g.addColorStop(0.45, cardBg)
+    g.addColorStop(1, darkenHex(cardBg, 0.12))
+    ctx.fillStyle = g
+    ctx.fillRect(0, 0, w, h)
+    const lift = ctx.createRadialGradient(w * 0.5, h * 0.35, 0, w * 0.5, h * 0.35, Math.max(w, h) * 0.55)
+    lift.addColorStop(0, 'rgba(255,255,255,0.04)')
+    lift.addColorStop(1, 'rgba(0,0,0,0)')
+    ctx.fillStyle = lift
+    ctx.fillRect(0, 0, w, h)
+  } else {
+    ctx.fillStyle = cardBg
+    ctx.fillRect(0, 0, w, h)
+  }
+
+  // News stamp BEHIND all content (bg → stamp → header/chart/text)
+  // Whole-layer fade via drawShareNewsStamp offscreen composite
+  {
+    const movePctParsedEarly = parseShareMovePercent(moveText)
+    const absMovePctEarly = movePctParsedEarly?.abs ?? null
+    if (
+      shouldDrawShareNewsStamp(
+        style.newsStampMode,
+        style.sessionLineTone,
+        sessionLine,
+        absMovePctEarly,
+      )
+    ) {
+      const copy = resolveShareNewsStampCopy(style, isDown, absMovePctEarly)
+      const ink = resolveShareNewsStampInkHex(style.newsStampColor, isDown)
+      const rawStampD = Number(style.newsStampSize)
+      const stampD = Math.round(
+        (Number.isFinite(rawStampD) && rawStampD >= 100
+          ? Math.min(1000, rawStampD)
+          : DEFAULT_SHARE_CARD_STYLE.newsStampSize) * typeScale,
+      )
+      const px = Number(style.newsStampX)
+      const py = Number(style.newsStampY)
+      const stampCx =
+        (w * (Number.isFinite(px) ? Math.min(100, Math.max(0, px)) : 50)) / 100
+      const stampCy =
+        (h * (Number.isFinite(py) ? Math.min(100, Math.max(0, py)) : 42)) / 100
+      drawShareNewsStamp(ctx, stampCx, stampCy, stampD, {
+        centerLines: copy.center,
+        ringText: copy.ring,
+        color: ink,
+        rotationDeg: Number.isFinite(Number(style.newsStampRotation))
+          ? Number(style.newsStampRotation)
+          : -14,
+        opacity: Number.isFinite(Number(style.newsStampOpacity))
+          ? Number(style.newsStampOpacity)
+          : 88,
+        style: style.newsStampStyle === 'rect' ? 'rect' : 'circle',
+        density: Number.isFinite(Number(style.newsStampDotDensity))
+          ? Number(style.newsStampDotDensity)
+          : 55,
+      })
+    }
+  }
 
   const rightEdge = w - padX
 
-  // --- Header row: logo + title left, % right ---
+  // --- Header row: logo + company ExtraBold left, % Bold right ---
+  ctx.textBaseline = 'alphabetic'
   if (logoImg) {
     drawCircularLogo(ctx, logoImg, padX + logoSize / 2, bandMidY, logoSize)
+  } else {
+    drawLogoMonogram(ctx, symbol || titleText, padX + logoSize / 2, bandMidY, logoSize)
   }
+  // styles.company — ExtraBold 56 / lh 64 / #111 / tracking -0.7 / max 2 lines
   ctx.fillStyle = bodyText
   ctx.font = nameFont
+  setShareLetterSpacing(ctx, -0.7 * typeScale)
   let nameY =
     bandMidY - ((nameLines.length - 1) * nameLineH) / 2 + nameSize * 0.35
   for (const line of nameLines) {
     ctx.fillText(line, nameLeft, nameY)
     nameY += nameLineH
   }
+  clearShareLetterSpacing(ctx)
+  // One accent for BOTH the big % and the line chart (same up/down shade pickers).
+  // Direction: % move flags first; if flat, fall back to series first→last slope.
+  const chartLineDownFallback =
+    chartSeries.length >= 2
+      ? chartSeries[chartSeries.length - 1].close < chartSeries[0].close
+      : false
+  const accentIsDown = isDown ? true : isUp ? false : chartLineDownFallback
+  const moveAccentHex = accentIsDown
+    ? shareDownColorHex(style.downColorShade)
+    : shareUpColorHex(style.upColorShade)
+
   if (moveText) {
-    // Fixed up/down colors (no picker) — dark green for positive reads better on brand yellow
-    ctx.fillStyle = isDown ? SHARE_DOWN_RED : isUp ? SHARE_UP_GREEN : bodyText
+    // styles.pct — Bold 80 · identical hex to chart line
+    ctx.fillStyle = isDown || isUp || chartSeries.length >= 2 ? moveAccentHex : bodyText
     ctx.font = pctFont
+    setShareLetterSpacing(ctx, -1.5 * typeScale)
     const tw = ctx.measureText(moveText).width
-    // Vertically center % with the logo/title band
     ctx.fillText(moveText, rightEdge - tw, bandMidY + pctSize * 0.32)
+    clearShareLetterSpacing(ctx)
   }
 
-  // --- Under full header row, RIGHT (under %): share price + optional stamp ---
-  let metaY = metaTop + Math.ceil(priceFontSize * priceTallScale)
+  // --- Under %: styles.price SemiBold 36 / lh 42 / #111 · tabular right ---
+  const metaY = metaTop + Math.max(priceLineH, stampBesidePrice ? stampLineH : 0) * 0.85
+  const separator = priceLabel && stampBesidePrice ? ' · ' : ''
+  ctx.font = stampFont
+  setShareLetterSpacing(ctx, -0.2 * typeScale)
+  const stampText = stampBesidePrice ? `${separator}${stampLabel}` : ''
+  const stampW = stampText ? ctx.measureText(stampText).width : 0
+  clearShareLetterSpacing(ctx)
+  ctx.font = priceFont
+  const priceW = priceLabel ? ctx.measureText(priceLabel).width : 0
+  const metaLeft = rightEdge - priceW - stampW
   if (priceLabel) {
-    ctx.fillStyle = sharePriceFillColor(style.priceColor)
+    ctx.fillStyle = sharePriceFillColor(style.priceColor || 'black')
     ctx.font = priceFont
-    const tw = ctx.measureText(priceLabel).width
-    // Tall look via slight vertical stretch; weight from priceFontWeight slider
-    ctx.save()
-    ctx.translate(rightEdge - tw, metaY)
-    ctx.scale(1, priceTallScale)
-    ctx.fillText(priceLabel, 0, 0)
-    ctx.restore()
-    metaY += Math.ceil(priceFontSize * priceTallScale) + 10
+    ctx.fillText(priceLabel, metaLeft, metaY)
   }
-  if (stampUnderPrice) {
+  if (stampText) {
     ctx.fillStyle = mutedText
     ctx.font = stampFont
-    const tw = ctx.measureText(stampLabel).width
-    ctx.fillText(stampLabel, rightEdge - tw, metaY)
+    setShareLetterSpacing(ctx, -0.2 * typeScale)
+    ctx.fillText(stampText, metaLeft + priceW, metaY)
+    clearShareLetterSpacing(ctx)
   }
 
+  // Framed hero only for legacy placements — default is background-only (no image above/below header).
+  if (sideImg && hasPhoto) {
+    const photoW = Math.max(80, textMaxW - photoMarginX * 2)
+    const photoX = padX + photoMarginX
+    drawShareHeroPhoto(ctx, sideImg, photoX, photoTop, photoW, photoHeight, {
+      radius: photoRadius,
+      borderWidth: photoBorderWidth,
+      borderColor: isDarkCard ? 'rgba(255,255,255,0.42)' : 'rgba(255,255,255,0.72)',
+      frost: photoFrost,
+    })
+  }
+  // Chart line = same hex as the big % (moveAccentHex from up/down shade pickers)
   drawMiniChart(
     ctx,
     padX,
     chartTop,
     textMaxW,
     chartH,
-    isDown,
+    accentIsDown,
     `${symbol}-${event.event_date || ''}`,
     cardBg,
+    {
+      showTimeAxis: style.showChartTimeAxis !== false,
+      showDayLabels: style.showChartDayLabels === true,
+      session: chartSession,
+      axisTextColor: mutedText,
+      series: chartSeries.length >= 2 ? chartSeries : null,
+      axisMode: style.chartAxisMode === 'timestamp' ? 'timestamp' : 'elapsed',
+      axisTimezone:
+        style.chartAxisTimezone &&
+        SHARE_CHART_TIMEZONES.some((z) => z.id === style.chartAxisTimezone)
+          ? style.chartAxisTimezone
+          : 'America/New_York',
+      maxAxisLabels: style.chartAxisLabelCount ?? 5,
+      lineColor: moveAccentHex,
+      pointLabelMode: style.chartPointLabelMode || 'off',
+      priceLabelCount: style.chartPriceLabelCount ?? 4,
+      priceLabelColor: mutedText,
+      pointLabelsCustom: splitShareChartCustomLines(style.chartPointLabelsCustom),
+      pointSubLabelsCustom: splitShareChartCustomLines(style.chartPointSubLabelsCustom),
+      axisLabelsCustom: splitShareChartCustomLines(style.chartAxisLabelsCustom),
+      axisFontSize: Math.round(
+        (Number.isFinite(Number(style.chartAxisFontSize))
+          ? Math.min(48, Math.max(10, Number(style.chartAxisFontSize)))
+          : 18) * typeScale,
+      ),
+      pointFontSize: Math.round(
+        (Number.isFinite(Number(style.chartPointFontSize))
+          ? Math.min(48, Math.max(10, Number(style.chartPointFontSize)))
+          : 16) * typeScale,
+      ),
+      dayLabelFontSize: Math.round(
+        (Number.isFinite(Number(style.chartAxisFontSize))
+          ? Math.min(40, Math.max(10, Number(style.chartAxisFontSize) - 2))
+          : 14) * typeScale,
+      ),
+      timeDayGap: Math.round(timeDayGapPx * typeScale),
+      dayLabelMode: clampShareChartDayLabelMode(style.chartDayLabelMode),
+      lineWidth: Math.round(
+        (Number.isFinite(Number(style.chartLineWidth)) && Number(style.chartLineWidth) > 0
+          ? Math.min(24, Math.max(1, Number(style.chartLineWidth)))
+          : DEFAULT_SHARE_CARD_STYLE.chartLineWidth) * typeScale,
+      ),
+    },
   )
 
-  ctx.fillStyle = bodyText
+  // styles.reasonTitle — SemiBold 52 / lh 66 / #111 / tracking -0.4
+  if (sessionLines.length) {
+    ctx.fillStyle = bodyText
+    ctx.font = sessionFont
+    setShareLetterSpacing(ctx, -0.4 * typeScale)
+    let sy = sessionFirstY
+    for (let i = 0; i < sessionLines.length; i += 1) {
+      ctx.fillText(sessionLines[i], padX, sy)
+      if (i < sessionLines.length - 1) sy += sessionLineH
+    }
+    clearShareLetterSpacing(ctx)
+    // styles.reasonWhen — Medium 34 · “Today · 3:33 PM ET”
+    if (stampUnderSession && stampLabel) {
+      ctx.fillStyle = mutedText
+      ctx.font = stampFont
+      setShareLetterSpacing(ctx, -0.2 * typeScale)
+      ctx.fillText(stampLabel, padX, sessionStampY)
+      clearShareLetterSpacing(ctx)
+    }
+  }
+
+  // styles.reasonDriver — Regular 40 / lh 54 / rgba(17,17,17,0.82) / tracking -0.25
+  ctx.fillStyle = reasonFill
   ctx.font = reasonFont
+  setShareLetterSpacing(ctx, -0.25 * typeScale)
   let ry = reasonFirstY
   for (let i = 0; i < reasonLines.length; i += 1) {
     ctx.fillText(reasonLines[i], padX, ry)
     if (i < reasonLines.length - 1) ry += reasonLineH
   }
+  clearShareLetterSpacing(ctx)
 
-  // Footer: date left (uses stampFontSize) · Track at Trigger right
+  // Footer: Track at Trigger + store marks — placement left / right / center
+  // Store modes: circle = both icons · badge = App Store badge only · hide = off
+  // Brand text can be hidden independently via showBrand
   ctx.font = brandFont
-  const brandW = ctx.measureText(brandLabel).width
+  const brandW = brandLabel ? ctx.measureText(brandLabel).width : 0
+  const storeBadgeOn = style.showStoreBadges !== false
+  const storeStyle = style.storeBadgeStyle === 'badge' ? 'badge' : 'circle'
+  const brandPlacement =
+    style.brandPlacement === 'left' || style.brandPlacement === 'center'
+      ? style.brandPlacement
+      : 'right'
+  const rawStoreIcon = Number(style.storeIconSize)
+  const storeSize = Math.round(
+    (Number.isFinite(rawStoreIcon) && rawStoreIcon >= 16
+      ? Math.min(96, rawStoreIcon)
+      : 36) * typeScale,
+  )
+  const rawStoreWScale = Number(style.storeIconWidthScale)
+  const storeWidthScale =
+    Number.isFinite(rawStoreWScale) && rawStoreWScale >= 0.5 && rawStoreWScale <= 2.5
+      ? rawStoreWScale
+      : 1
+  const storeGap = Math.round(8 * typeScale)
+  const storeToTextGap =
+    brandLabel && storeBadgeOn ? Math.round(10 * typeScale) : 0
+
+  let appStoreImg: HTMLImageElement | null = null
+  let playStoreImg: HTMLImageElement | null = null
+  if (storeBadgeOn) {
+    if (storeStyle === 'badge') {
+      appStoreImg = await loadShareStoreIcon('/share-icons/app-store-badge.svg')
+    } else {
+      ;[appStoreImg, playStoreImg] = await Promise.all([
+        loadShareStoreIcon('/share-icons/app-store.webp'),
+        loadShareStoreIcon('/share-icons/google-play.webp'),
+      ])
+    }
+  }
+
+  let storeBlockW = 0
+  let badgeAppW = 0
+  let circleIconW = storeSize
+  if (storeBadgeOn) {
+    if (storeStyle === 'badge') {
+      // Official badge only — content-aware aspect (SVG / padded assets) × width scale
+      const aspect = appStoreImg ? getImageOpaqueAspect(appStoreImg) : 3.37
+      badgeAppW = storeSize * aspect * storeWidthScale
+      storeBlockW = storeToTextGap + badgeAppW
+    } else {
+      circleIconW = storeSize * storeWidthScale
+      storeBlockW = storeToTextGap + circleIconW * 2 + storeGap
+    }
+  }
+  const brandBlockW = brandW + storeBlockW
+  // If both brand text and store icons are hidden, still keep footer date placement
+  const hasBrandRow = Boolean(brandLabel) || storeBadgeOn
+  let brandX = w - padX - Math.max(brandBlockW, 1) // right (default)
+  if (brandPlacement === 'left') {
+    brandX = padX
+  } else if (brandPlacement === 'center') {
+    brandX = (w - Math.max(brandBlockW, 1)) / 2
+  }
+
+  // Date sits on the opposite side when brand is left/right; left when brand is center
   if (footerDate) {
     ctx.fillStyle = mutedText
     ctx.font = stampFont
-    ctx.fillText(footerDate, padX, brandY)
+    setShareLetterSpacing(ctx, -0.2 * typeScale)
+    const dateW = ctx.measureText(footerDate).width
+    let dateX = padX
+    if (hasBrandRow && brandPlacement === 'left') {
+      dateX = w - padX - dateW
+    } else if (brandPlacement === 'center') {
+      dateX = padX
+    }
+    ctx.fillText(footerDate, dateX, brandY)
+    clearShareLetterSpacing(ctx)
   }
-  ctx.fillStyle = bodyText
-  ctx.font = brandFont
-  ctx.fillText(brandLabel, w - padX - brandW, brandY)
 
+  if (brandLabel) {
+    ctx.fillStyle = brandFill
+    ctx.font = brandFont
+    void brandLineH
+    if (Math.abs(brandHeightScale - 1) > 0.01) {
+      // Non-uniform height: scale Y around the text baseline
+      ctx.save()
+      ctx.translate(brandX, brandY)
+      ctx.scale(1, brandHeightScale)
+      ctx.fillText(brandLabel, 0, 0)
+      ctx.restore()
+    } else {
+      ctx.fillText(brandLabel, brandX, brandY)
+    }
+  }
+
+  if (storeBadgeOn) {
+    const iconTop = brandY - storeSize * 0.78
+    let ix = brandX + brandW + storeToTextGap
+    if (storeStyle === 'badge') {
+      // App Store badge only
+      if (appStoreImg) {
+        drawShareStoreBadge(ctx, appStoreImg, ix, iconTop, badgeAppW, storeSize)
+      }
+    } else {
+      // Both circular icons — natural colors, optional width scale (non-square when ≠1)
+      if (appStoreImg) {
+        drawShareStoreIcon(ctx, appStoreImg, ix, iconTop, circleIconW, storeSize)
+      }
+      ix += circleIconW + storeGap
+      if (playStoreImg) {
+        drawShareStoreIcon(ctx, playStoreImg, ix, iconTop, circleIconW, storeSize)
+      }
+    }
+  }
+
+  // PNG at native canvas pixels (lossless Full HD / 2K / 4K — no downscale)
   const blob = await new Promise<Blob | null>((resolve) => {
     canvas.toBlob((b) => resolve(b), 'image/png')
   })
   if (!blob) return null
-  return { blob, objectUrl: URL.createObjectURL(blob) }
+  return {
+    blob,
+    objectUrl: URL.createObjectURL(blob),
+    width: w,
+    height: h,
+  }
+}
+
+/** Cached App Store / Play badge images for the share footer. */
+const shareStoreIconCache = new Map<string, HTMLImageElement | null>()
+/** Opaque content aspect ratio (width/height) cache — for padded badge PNGs. */
+const shareImageOpaqueAspectCache = new WeakMap<HTMLImageElement, number>()
+/** Opaque content source rect cache for trimmed draw. */
+const shareImageOpaqueRectCache = new WeakMap<
+  HTMLImageElement,
+  { sx: number; sy: number; sw: number; sh: number }
+>()
+
+async function loadShareStoreIcon(src: string): Promise<HTMLImageElement | null> {
+  if (shareStoreIconCache.has(src)) return shareStoreIconCache.get(src) || null
+  try {
+    const img = await loadImageFromUrl(src)
+    shareStoreIconCache.set(src, img)
+    return img
+  } catch {
+    shareStoreIconCache.set(src, null)
+    return null
+  }
+}
+
+/** Find non-transparent bounding box of an image (for square badge assets with padding). */
+function getImageOpaqueRect(img: HTMLImageElement): {
+  sx: number
+  sy: number
+  sw: number
+  sh: number
+} {
+  const cached = shareImageOpaqueRectCache.get(img)
+  if (cached) return cached
+  const iw = img.naturalWidth || img.width || 1
+  const ih = img.naturalHeight || img.height || 1
+  const full = { sx: 0, sy: 0, sw: iw, sh: ih }
+  try {
+    const c = document.createElement('canvas')
+    c.width = iw
+    c.height = ih
+    const g = c.getContext('2d', { willReadFrequently: true })
+    if (!g) {
+      shareImageOpaqueRectCache.set(img, full)
+      return full
+    }
+    g.drawImage(img, 0, 0)
+    const data = g.getImageData(0, 0, iw, ih).data
+    let minX = iw
+    let minY = ih
+    let maxX = -1
+    let maxY = -1
+    for (let y = 0; y < ih; y += 1) {
+      for (let x = 0; x < iw; x += 1) {
+        const a = data[(y * iw + x) * 4 + 3]
+        if (a > 12) {
+          if (x < minX) minX = x
+          if (y < minY) minY = y
+          if (x > maxX) maxX = x
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) {
+      shareImageOpaqueRectCache.set(img, full)
+      return full
+    }
+    // Small pad so edges aren’t clipped
+    const pad = 2
+    const rect = {
+      sx: Math.max(0, minX - pad),
+      sy: Math.max(0, minY - pad),
+      sw: Math.min(iw, maxX + pad + 1) - Math.max(0, minX - pad),
+      sh: Math.min(ih, maxY + pad + 1) - Math.max(0, minY - pad),
+    }
+    shareImageOpaqueRectCache.set(img, rect)
+    return rect
+  } catch {
+    shareImageOpaqueRectCache.set(img, full)
+    return full
+  }
+}
+
+function getImageOpaqueAspect(img: HTMLImageElement): number {
+  const cached = shareImageOpaqueAspectCache.get(img)
+  if (cached) return cached
+  const rect = getImageOpaqueRect(img)
+  const aspect = rect.sh > 0 ? rect.sw / rect.sh : 1
+  // Clamp to sane store-badge range (avoid tiny/huge if detect fails)
+  const clamped = Math.min(4.5, Math.max(0.8, aspect))
+  shareImageOpaqueAspectCache.set(img, clamped)
+  return clamped
+}
+
+/** Wide “Available on the App Store” style badge — natural colors, no recolor. */
+function drawShareStoreBadge(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  ctx.save()
+  // Draw only the opaque content rect so padded square PNGs fill the pill correctly
+  const rect = getImageOpaqueRect(img)
+  ctx.drawImage(img, rect.sx, rect.sy, rect.sw, rect.sh, x, y, w, h)
+  ctx.restore()
+}
+
+/**
+ * Store mark — natural asset colors only, no recolor, no forced background.
+ * Soft circular clip so square assets read as round icons.
+ */
+function drawShareStoreIcon(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  /** Width (and height when height omitted) in canvas px. */
+  width: number,
+  /** Optional height — when omitted, icon is square (width × width). */
+  height?: number,
+) {
+  const w = Math.max(1, width)
+  const h = Math.max(1, height ?? width)
+  const cx = x + w / 2
+  const cy = y + h / 2
+  // Ellipse clip so non-square width scales stay rounded
+  const rx = w / 2
+  const ry = h / 2
+
+  ctx.save()
+  ctx.beginPath()
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
+  ctx.closePath()
+  ctx.clip()
+
+  const iw = img.naturalWidth || img.width || w
+  const ih = img.naturalHeight || img.height || h
+  const scale = Math.max(w / iw, h / ih)
+  const dw = iw * scale
+  const dh = ih * scale
+  ctx.drawImage(img, cx - dw / 2, cy - dh / 2, dw, dh)
+  ctx.restore()
 }
 
 function roundRect(
@@ -1672,10 +6819,77 @@ function formatEventHeading(event: PriceMovementEvent) {
 
 const TICKER_SORT_OPTIONS: Array<{ id: TickerSortMode; label: string }> = [
   { id: 'subscribers', label: 'Subscribers (high → low)' },
+  { id: 'movement', label: 'Absolute % movement (largest first)' },
+  { id: 'movement_pos_to_neg', label: 'Movement: positive → negative' },
+  { id: 'movement_neg_to_pos', label: 'Movement: negative → positive' },
   { id: 'name', label: 'Company name (A → Z)' },
   { id: 'ticker', label: 'Ticker (A → Z)' },
   { id: 'saved', label: 'Saved dates (high → low)' },
 ]
+
+const TICKER_SORT_PREF_KEY = 'notifications-ticker-sort'
+const EXTREME_PINNED_PREF_KEY = 'notifications-extreme-pinned-v1'
+
+/** Local cache only — source of truth is pinned_monitored_tickers via API. */
+function cacheExtremePinned(items: ExtremePinnedItem[]) {
+  try {
+    writePref(
+      EXTREME_PINNED_PREF_KEY,
+      JSON.stringify(
+        items.map((row) => ({
+          ticker: row.ticker,
+          company_name: row.company_name,
+          pinned_at: row.pinned_at,
+          change_percent: row.change_percent ?? null,
+          currency: row.currency ?? null,
+        })),
+      ),
+    )
+  } catch {
+    /* localStorage unavailable */
+  }
+}
+
+function loadExtremePinnedCache(): ExtremePinnedItem[] {
+  try {
+    const raw = readPref(EXTREME_PINNED_PREF_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((row): ExtremePinnedItem | null => {
+        const ticker = String(row?.ticker || '')
+          .trim()
+          .toUpperCase()
+        if (!ticker) return null
+        return {
+          ticker,
+          company_name: String(row?.company_name || ticker).trim() || ticker,
+          pinned_at: String(row?.pinned_at || new Date().toISOString()),
+          change_percent:
+            row?.change_percent == null || !Number.isFinite(Number(row.change_percent))
+              ? null
+              : Number(row.change_percent),
+          currency: row?.currency ? String(row.currency) : null,
+          monitor_scope: 'pinned',
+        }
+      })
+      .filter((row): row is ExtremePinnedItem => Boolean(row))
+  } catch {
+    return []
+  }
+}
+
+function loadTickerSortPreference(): TickerSortMode {
+  try {
+    const saved = readPref(TICKER_SORT_PREF_KEY) as TickerSortMode | null
+    return TICKER_SORT_OPTIONS.some((option) => option.id === saved)
+      ? saved as TickerSortMode
+      : 'subscribers'
+  } catch {
+    return 'subscribers'
+  }
+}
 
 function sourceKey(source: MovementSource, index: number) {
   return source.url || source.domain || source.title || `source-${index}`
@@ -1685,70 +6899,161 @@ function sourceLabel(source: MovementSource) {
   return source.title || source.domain || source.url || 'Source'
 }
 
-/** Display/edit sources as names only (no website URL in the card). */
+/** Display/edit sources as names on one row (no multi-line list). */
 function serializeSourcesDraft(sources?: MovementSource[] | null): string {
   return (sources || [])
     .map((s) => String(s.title || s.domain || '').trim())
     .filter(Boolean)
-    .join('\n')
+    .join(' · ')
 }
 
 /**
- * Parse name-only lines back to sources.
- * Keeps URL/domain from previous sources when the name still matches (by name or index).
- * Still accepts legacy `Title | https://…` if someone pastes it.
+ * Parse a single-row source string back to sources.
+ * Accepts: "Bloomberg · Reuters · CNBC", commas, newlines, or legacy `Title | url`.
+ * Keeps URL/domain from previous sources when the name still matches.
  */
 function parseSourcesDraft(
   text: string,
   previousSources?: MovementSource[] | null,
 ): MovementSource[] {
   const prev = previousSources || []
-  return String(text || '')
-    .split(/\r?\n/)
+  // Split one row: middot / bullet / pipe-as-separator / comma / newlines.
+  // Do not split on `|` when it's `Title | https://…` (handled per token below).
+  const tokens = String(text || '')
+    .split(/\r?\n|·|•|,(?!\s*Inc\.?\b)|(?<=\S)\s+[|]\s+(?=[A-Za-z0-9])/)
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line, index) => {
-      const parts = line.split('|').map((p) => p.trim())
-      if (parts.length >= 2) {
-        const urlPart = parts[parts.length - 1]
-        const title = parts.slice(0, -1).join(' | ').trim()
-        const looksUrl = /^https?:\/\//i.test(urlPart)
-        let domain: string | null = null
-        if (looksUrl) {
-          try {
-            domain = new URL(urlPart).hostname.replace(/^www\./i, '')
-          } catch {
-            domain = null
-          }
-        }
-        return {
-          title: title || domain || urlPart,
-          url: looksUrl ? urlPart : null,
-          domain,
-        }
+    .flatMap((line) => {
+      // Legacy multi-line paste still works; also "A | B | C" name lists without URLs.
+      if (/https?:\/\//i.test(line) && line.includes('|')) return [line]
+      if (line.includes('|') && !/^https?:\/\//i.test(line.split('|').pop() || '')) {
+        return line.split('|').map((p) => p.trim()).filter(Boolean)
       }
-      if (/^https?:\/\//i.test(line)) {
-        try {
-          const host = new URL(line).hostname.replace(/^www\./i, '')
-          return { title: host, url: line, domain: host }
-        } catch {
-          return { title: line, url: line, domain: null }
-        }
-      }
-      const nameKey = line.toLowerCase()
-      const byName = prev.find((p) => {
-        const t = String(p.title || '').trim().toLowerCase()
-        const d = String(p.domain || '').trim().toLowerCase()
-        return t === nameKey || d === nameKey
-      })
-      const byIndex = prev[index]
-      const keep = byName || byIndex
-      return {
-        title: line,
-        url: keep?.url || null,
-        domain: keep?.domain || null,
-      }
+      return [line]
     })
+
+  return tokens.map((line, index) => {
+    const parts = line.split('|').map((p) => p.trim())
+    if (parts.length >= 2) {
+      const urlPart = parts[parts.length - 1]
+      const title = parts.slice(0, -1).join(' | ').trim()
+      const looksUrl = /^https?:\/\//i.test(urlPart)
+      let domain: string | null = null
+      if (looksUrl) {
+        try {
+          domain = new URL(urlPart).hostname.replace(/^www\./i, '')
+        } catch {
+          domain = null
+        }
+      }
+      return {
+        title: title || domain || urlPart,
+        url: looksUrl ? urlPart : null,
+        domain,
+      }
+    }
+    if (/^https?:\/\//i.test(line)) {
+      try {
+        const host = new URL(line).hostname.replace(/^www\./i, '')
+        return { title: host, url: line, domain: host }
+      } catch {
+        return { title: line, url: line, domain: null }
+      }
+    }
+    const nameKey = line.toLowerCase()
+    const byName = prev.find((p) => {
+      const t = String(p.title || '').trim().toLowerCase()
+      const d = String(p.domain || '').trim().toLowerCase()
+      return t === nameKey || d === nameKey
+    })
+    const byIndex = prev[index]
+    const keep = byName || byIndex
+    return {
+      title: line,
+      url: keep?.url || null,
+      domain: keep?.domain || null,
+    }
+  })
+}
+
+/** Compact one-row source chips (links when URL known). */
+function EventSourcesRow({
+  sources,
+  draft,
+  onDraftChange,
+  onBlur,
+  disabled,
+}: {
+  sources: MovementSource[]
+  draft?: string
+  onDraftChange: (value: string) => void
+  onBlur: () => void
+  disabled?: boolean
+}) {
+  const display =
+    draft != null ? draft : serializeSourcesDraft(sources)
+  const parsed = parseSourcesDraft(display, sources)
+  const [editing, setEditing] = useState(false)
+
+  if (editing || !parsed.length) {
+    return (
+      <Input
+        value={display}
+        onChange={(e) => onDraftChange(e.target.value)}
+        onBlur={() => {
+          setEditing(false)
+          onBlur()
+        }}
+        onFocus={() => setEditing(true)}
+        placeholder="Bloomberg · Reuters · CNBC"
+        disabled={disabled}
+        className="h-8 text-xs"
+        aria-label="Sources"
+      />
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      {parsed.map((source, index) => {
+        const label = source.title || source.domain || 'Source'
+        const href =
+          source.url ||
+          (source.domain ? `https://${source.domain}` : null)
+        const chipClass =
+          'inline-flex max-w-[12rem] items-center truncate rounded-full border border-border/60 bg-background/80 px-2 py-0.5 text-[11px] font-medium text-foreground transition-colors hover:bg-muted'
+        if (href) {
+          return (
+            <a
+              key={`${label}-${index}`}
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className={cn(chipClass, 'text-sky-700 hover:underline dark:text-sky-300')}
+              title={href}
+            >
+              {label}
+            </a>
+          )
+        }
+        return (
+          <span key={`${label}-${index}`} className={chipClass} title={label}>
+            {label}
+          </span>
+        )
+      })}
+      <button
+        type="button"
+        onClick={() => setEditing(true)}
+        disabled={disabled}
+        className="inline-flex size-6 items-center justify-center rounded-full border border-border/60 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+        title="Edit sources"
+        aria-label="Edit sources"
+      >
+        <PenLine className="size-3" />
+      </button>
+    </div>
+  )
 }
 
 /** Format price for share card (keep $ if present). */
@@ -1824,6 +7129,46 @@ const SOCIAL_PLATFORMS: Array<{
   },
 ]
 
+/** Section body inside a layout tab (hint only — title lives on the tab). */
+function ShareLayoutSection({
+  title: _title,
+  hint,
+  children,
+  first: _first,
+}: {
+  title: string
+  hint?: string
+  children: ReactNode
+  first?: boolean
+}) {
+  void _title
+  void _first
+  return (
+    <section className="space-y-2.5 pt-0.5">
+      {hint ? (
+        <p className="text-[10px] leading-snug text-muted-foreground">{hint}</p>
+      ) : null}
+      <div className="space-y-2.5">{children}</div>
+    </section>
+  )
+}
+
+/** Tab ids for image layout settings (sorted). */
+type ShareLayoutTabId =
+  | 'photo'
+  | 'text'
+  | 'session'
+  | 'colors'
+  | 'spacing'
+  | 'type'
+  | 'canvas'
+  | 'timestamp'
+  | 'brand'
+  | 'chart'
+  | 'store'
+  | 'seal'
+  | 'weight'
+
 /** Shared image layout sliders (tweet composer + social share). */
 function ShareCardLayoutControls({
   style,
@@ -1832,6 +7177,10 @@ function ShareCardLayoutControls({
   textContent,
   onTextChange,
   onTextReset,
+  sideImageDataUrl,
+  onSideImageChange,
+  googleSearchQuery,
+  titleIdentity,
 }: {
   style: ShareCardStyle
   onChange: (next: ShareCardStyle | ((prev: ShareCardStyle) => ShareCardStyle)) => void
@@ -1840,6 +7189,13 @@ function ShareCardLayoutControls({
   textContent?: ShareCardTextContent | null
   onTextChange?: (next: ShareCardTextContent) => void
   onTextReset?: () => void
+  /** Side photo (data URL) drawn at ~30% width next to the chart */
+  sideImageDataUrl?: string | null
+  onSideImageChange?: (dataUrl: string | null) => void
+  /** Opens Google Images — usually company name */
+  googleSearchQuery?: string
+  /** Used when toggling company name ↔ ticker on the image */
+  titleIdentity?: { ticker: string; companyName?: string | null }
 }) {
   const set = (patch: Partial<ShareCardStyle>) =>
     onChange((s) => {
@@ -1849,14 +7205,99 @@ function ShareCardLayoutControls({
     })
   const setText = (patch: Partial<ShareCardTextContent>) => {
     if (!textContent || !onTextChange) return
-    onTextChange({ ...textContent, ...patch })
+    onTextChange({ ...textContent, sessionLine: textContent.sessionLine ?? '', ...patch })
   }
+  const applyTitleMode = (mode: 'company' | 'ticker') => {
+    set({ titleMode: mode })
+    if (!textContent || !onTextChange) return
+    const symbol = String(titleIdentity?.ticker || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9.^_=\-]/g, '')
+    const company =
+      String(titleIdentity?.companyName || '').trim() ||
+      (symbol ? shareCompanyNameCache.get(symbol) : '') ||
+      symbol
+    const nextTitle = mode === 'ticker' ? symbol || textContent.title : company || textContent.title
+    onTextChange({ ...textContent, sessionLine: textContent.sessionLine ?? '', title: nextTitle })
+  }
+  const pasteSideRef = useRef<HTMLDivElement | null>(null)
+
+  const [sidePasteBusy, setSidePasteBusy] = useState(false)
+  const [sidePasteHint, setSidePasteHint] = useState('')
+  const [layoutTab, setLayoutTab] = useState<ShareLayoutTabId>(() =>
+    textContent && onTextChange ? 'text' : onSideImageChange ? 'photo' : 'colors',
+  )
+
+  const layoutTabs = useMemo(() => {
+    const all: Array<{ id: ShareLayoutTabId; label: string; show?: boolean }> = [
+      { id: 'photo', label: 'Background', show: Boolean(onSideImageChange) },
+      { id: 'text', label: 'Text', show: Boolean(textContent && onTextChange) },
+      { id: 'session', label: 'Session' },
+      { id: 'colors', label: 'Colors' },
+      { id: 'spacing', label: 'Spacing' },
+      { id: 'type', label: 'Type' },
+      { id: 'canvas', label: 'Canvas' },
+      { id: 'timestamp', label: 'Timestamp' },
+      { id: 'brand', label: 'Brand' },
+      { id: 'chart', label: 'Chart' },
+      { id: 'store', label: 'Store' },
+      { id: 'seal', label: 'Stamp' },
+      { id: 'weight', label: 'Weight' },
+    ]
+    return all.filter((t) => t.show !== false)
+  }, [onSideImageChange, textContent, onTextChange])
+
+  // If current tab is hidden (e.g. no photo controls), fall back
+  useEffect(() => {
+    if (!layoutTabs.some((t) => t.id === layoutTab) && layoutTabs[0]) {
+      setLayoutTab(layoutTabs[0].id)
+    }
+  }, [layoutTabs, layoutTab])
+
+  async function handleSidePaste(e: ReactClipboardEvent<HTMLDivElement | HTMLInputElement>) {
+    if (!onSideImageChange) return
+    const source = extractImageFromClipboard(e.clipboardData)
+    if (!source.blob && !source.url) {
+      setSidePasteHint('No image found — use “Copy image” (not copy link) on Google Images.')
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+    setSidePasteBusy(true)
+    setSidePasteHint('')
+    try {
+      const dataUrl = await dataUrlOrBlobFromPasteSource(source, 1200)
+      onSideImageChange(dataUrl)
+      set({ photoPlacement: 'background' })
+      setSidePasteHint('Full-bleed background — Black / White axes −100…+100.')
+    } catch (err) {
+      setSidePasteHint(
+        err instanceof Error
+          ? err.message
+          : 'Paste failed. Copy the image itself, then paste here.',
+      )
+    } finally {
+      setSidePasteBusy(false)
+    }
+  }
+
+  function openGoogleImages() {
+    const q = String(googleSearchQuery || textContent?.title || '').trim() || 'stock'
+    const url = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(q)}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
   return (
-    <div className="space-y-3 rounded-xl border border-border/60 bg-muted/20 p-3">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Image layout
-        </p>
+    <div className="flex h-full min-h-0 flex-col px-0.5">
+      <div className="mb-0 flex shrink-0 items-center justify-between gap-2 border-b border-border/60 pb-2">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Image layout
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            Tabs · click a section · preview updates live
+          </p>
+        </div>
         <Button
           type="button"
           size="sm"
@@ -1872,12 +7313,356 @@ function ShareCardLayoutControls({
         </Button>
       </div>
 
-      {textContent && onTextChange ? (
-        <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-2.5">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-              Image text
+      {/* Tab bar */}
+      <div
+        className="flex shrink-0 gap-0.5 overflow-x-auto border-b border-border/50 py-1.5 scrollbar-thin"
+        role="tablist"
+        aria-label="Layout setting sections"
+      >
+        {layoutTabs.map((t) => {
+          const active = layoutTab === t.id
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setLayoutTab(t.id)}
+              className={cn(
+                'shrink-0 rounded-md px-2.5 py-1.5 text-[11px] font-semibold transition-colors',
+                active
+                  ? 'bg-foreground text-background shadow-sm'
+                  : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+              )}
+            >
+              {t.label}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Active tab panel */}
+      <div className="min-h-0 flex-1 overflow-y-auto py-2.5 pr-0.5" role="tabpanel">
+      {onSideImageChange && layoutTab === 'photo' ? (
+        <ShareLayoutSection
+          first
+          title="1 · Digital background"
+          hint="Full-bleed image. Black and White axes both −100…+100 (0 = neutral)."
+        >
+          <div className="flex items-center justify-end gap-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7 min-w-7 px-2 text-xs font-bold"
+                title={
+                  googleSearchQuery
+                    ? `Google Images: “${googleSearchQuery}”`
+                    : 'Open Google Images'
+                }
+                onClick={openGoogleImages}
+              >
+                G
+              </Button>
+              {sideImageDataUrl ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 text-xs"
+                  onClick={() => onSideImageChange(null)}
+                >
+                  Clear
+                </Button>
+              ) : null}
+          </div>
+          <div
+            ref={pasteSideRef}
+            tabIndex={0}
+            onPaste={handleSidePaste}
+            onClick={() => pasteSideRef.current?.focus()}
+            className={cn(
+              'flex min-h-[5rem] cursor-text flex-col items-center justify-center gap-2 border-2 border-dashed px-3 py-3 text-center transition-colors',
+              'border-sky-500/45 bg-sky-500/5 hover:border-sky-500/70 focus:border-sky-600 focus:outline-none focus:ring-2 focus:ring-sky-500/30',
+            )}
+            role="textbox"
+            aria-label="Paste digital background image"
+          >
+            {sidePasteBusy ? (
+              <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                Reading clipboard…
+              </span>
+            ) : sideImageDataUrl ? (
+              <img
+                src={sideImageDataUrl}
+                alt="Background preview"
+                className="max-h-32 w-auto max-w-full rounded-md object-cover opacity-90"
+              />
+            ) : (
+              <p className="text-[11px] font-medium text-foreground/85">
+                Click here, then paste background image (⌘V / Ctrl+V)
+              </p>
+            )}
+          </div>
+          {sidePasteHint ? (
+            <p
+              className={cn(
+                'text-[10px] leading-snug',
+                sideImageDataUrl
+                  ? 'text-emerald-700 dark:text-emerald-300'
+                  : 'text-amber-700 dark:text-amber-300',
+              )}
+            >
+              {sidePasteHint}
             </p>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              id={`${idPrefix}-side-paste`}
+              type="text"
+              className="h-8 min-w-0 flex-1 text-xs"
+              placeholder="Or focus here and paste image…"
+              onPaste={handleSidePaste}
+              value=""
+              onChange={() => {
+                /* keep empty — paste only */
+              }}
+              aria-label="Paste background image input"
+            />
+            <label className="inline-flex h-8 cursor-pointer items-center rounded-md border border-border bg-background px-2.5 text-[11px] font-medium hover:bg-muted">
+              Choose file
+              <input
+                type="file"
+                accept="image/*"
+                className="sr-only"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  e.target.value = ''
+                  if (!file || !onSideImageChange) return
+                  setSidePasteBusy(true)
+                  setSidePasteHint('')
+                  void blobToLogoDataUrl(file, 1200)
+                    .then((dataUrl) => {
+                      onSideImageChange(dataUrl)
+                      set({ photoPlacement: 'background' })
+                      setSidePasteHint(
+                        'Full-bleed background. Use “Crisp clear” for sharp social posts (blur 0, no veil).',
+                      )
+                    })
+                    .catch((err) => {
+                      setSidePasteHint(
+                        err instanceof Error ? err.message : 'Could not read image file',
+                      )
+                    })
+                    .finally(() => setSidePasteBusy(false))
+                }}
+              />
+            </label>
+          </div>
+
+          {sideImageDataUrl ? (
+            <div className="space-y-2.5 border-t border-border/40 pt-2">
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-2.5 py-2">
+                <p className="text-[11px] font-semibold text-foreground">
+                  Full-bleed photo · clarity
+                </p>
+                <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">
+                  For sharp social posts: use <strong>Crisp clear</strong> (blur 0, no black/white
+                  veil). Raise blur or black only if you want a soft / faded look.
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label htmlFor={`${idPrefix}-bg-img-op`} className="text-xs font-medium">
+                    Background image opacity
+                  </Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {style.bgImageOpacity ?? 100}%
+                  </span>
+                </div>
+                <input
+                  id={`${idPrefix}-bg-img-op`}
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={style.bgImageOpacity ?? 100}
+                  onChange={(e) => set({ bgImageOpacity: Number(e.target.value) })}
+                  className="w-full accent-foreground"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  100% = full photo · lower = more solid card color showing through (looks faded)
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label htmlFor={`${idPrefix}-bg-blur`} className="text-xs font-medium">
+                    Background blur (clarity)
+                  </Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {style.bgBlur ?? 0}px
+                    {(style.bgBlur ?? 0) <= 0 ? ' · crisp' : ''}
+                  </span>
+                </div>
+                <input
+                  id={`${idPrefix}-bg-blur`}
+                  type="range"
+                  min={0}
+                  max={80}
+                  step={1}
+                  value={style.bgBlur ?? 0}
+                  onChange={(e) => set({ bgBlur: Number(e.target.value) })}
+                  className="w-full accent-foreground"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <span>0 sharp / clear</span>
+                  <span>soft glass</span>
+                  <span>80 heavy blur</span>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label htmlFor={`${idPrefix}-bg-black`} className="text-xs font-medium">
+                    Black veil
+                  </Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {(style.bgBlack ?? 0) > 0 ? '+' : ''}
+                    {style.bgBlack ?? 0}
+                  </span>
+                </div>
+                <input
+                  id={`${idPrefix}-bg-black`}
+                  type="range"
+                  min={-100}
+                  max={100}
+                  step={1}
+                  value={style.bgBlack ?? 0}
+                  onChange={(e) => set({ bgBlack: Number(e.target.value) })}
+                  className="w-full accent-foreground"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <span>−100 lift / less black</span>
+                  <span>0 none</span>
+                  <span>+100 heavy fade</span>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label htmlFor={`${idPrefix}-bg-white`} className="text-xs font-medium">
+                    White wash
+                  </Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {(style.bgWhite ?? 0) > 0 ? '+' : ''}
+                    {style.bgWhite ?? 0}
+                  </span>
+                </div>
+                <input
+                  id={`${idPrefix}-bg-white`}
+                  type="range"
+                  min={-100}
+                  max={100}
+                  step={1}
+                  value={style.bgWhite ?? 0}
+                  onChange={(e) => set({ bgWhite: Number(e.target.value) })}
+                  className="w-full accent-foreground"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <span>−100 crush highlights</span>
+                  <span>0 none</span>
+                  <span>+100 bright wash</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5 pt-0.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="default"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({
+                      bgImageOpacity: 100,
+                      bgBlur: 0,
+                      bgBlack: 0,
+                      bgWhite: 0,
+                    })
+                  }
+                >
+                  Crisp clear
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({ bgImageOpacity: 100, bgBlur: 0, bgBlack: 0, bgWhite: 0 })
+                  }
+                >
+                  Neutral 0 / 0
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({ bgImageOpacity: 100, bgBlur: 18, bgBlack: 20, bgWhite: 0 })
+                  }
+                >
+                  Soft glass
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({ bgImageOpacity: 100, bgBlur: 28, bgBlack: 35, bgWhite: 0 })
+                  }
+                >
+                  Soft black
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({ bgImageOpacity: 100, bgBlur: 36, bgBlack: 70, bgWhite: -15 })
+                  }
+                >
+                  Dark mood
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px]"
+                  onClick={() =>
+                    set({ bgImageOpacity: 100, bgBlur: 8, bgBlack: -20, bgWhite: 40 })
+                  }
+                >
+                  Bright
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </ShareLayoutSection>
+      ) : null}
+
+      {textContent && onTextChange && layoutTab === 'text' ? (
+        <ShareLayoutSection
+          first
+          title="2 · Text on image"
+          hint="Only these strings are drawn. Reason = Likely driver only (no Secondary)."
+        >
+          <div className="flex items-center justify-end">
             {onTextReset ? (
               <Button
                 type="button"
@@ -1890,9 +7675,6 @@ function ShareCardLayoutControls({
               </Button>
             ) : null}
           </div>
-          <p className="text-[10px] leading-snug text-muted-foreground">
-            Edit what appears on the image. Preview updates as you type.
-          </p>
           <div className="space-y-1">
             <Label htmlFor={`${idPrefix}-txt-title`} className="text-xs font-medium">
               Title
@@ -1931,9 +7713,157 @@ function ShareCardLayoutControls({
               />
             </div>
           </div>
-          <div className="space-y-1">
+          <div className="space-y-1.5 border-t border-border/40 pt-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label className="text-xs font-medium">
+                Session first line
+              </Label>
+              <div className="flex flex-wrap gap-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={style.showSessionHeadline !== false ? 'default' : 'outline'}
+                  className="h-7 text-[11px]"
+                  onClick={() => set({ showSessionHeadline: true })}
+                >
+                  Inserted
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={style.showSessionHeadline === false ? 'default' : 'outline'}
+                  className="h-7 text-[11px]"
+                  onClick={() => set({ showSessionHeadline: false })}
+                >
+                  Remove
+                </Button>
+              </div>
+            </div>
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Default: “…so far in regular trading”. Timestamp sits under it when on.
+            </p>
+            {style.showSessionHeadline !== false ? (
+              <>
+                <Input
+                  id={`${idPrefix}-txt-session`}
+                  value={textContent.sessionLine ?? ''}
+                  onChange={(e) => setText({ sessionLine: e.target.value })}
+                  className="h-8 text-sm"
+                  placeholder="$NVDA +4.2% so far in regular trading"
+                />
+                <div className="space-y-1.5">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Line tone (by move size)
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    {(
+                      [
+                        { id: 'classic' as const, label: 'Classic' },
+                        { id: 'intensity' as const, label: 'Intensity' },
+                        { id: 'breaking' as const, label: 'Breaking' },
+                        { id: 'punchy' as const, label: 'Punchy' },
+                      ] as const
+                    ).map((tone) => (
+                      <Button
+                        key={tone.id}
+                        type="button"
+                        size="sm"
+                        variant={
+                          (style.sessionLineTone || 'classic') === tone.id
+                            ? 'default'
+                            : 'outline'
+                        }
+                        className="h-7 text-[11px]"
+                        onClick={() => {
+                          set({ sessionLineTone: tone.id })
+                          const symbol = String(titleIdentity?.ticker || '')
+                            .toUpperCase()
+                            .replace(/[^A-Z0-9.^_=\-]/g, '')
+                          const session = inferShareChartSession(
+                            {
+                              summary: textContent.sessionLine || textContent.reason || '',
+                              time_label: textContent.stamp || '',
+                            } as PriceMovementEvent,
+                            textContent.sessionLine || '',
+                          )
+                          const opts = buildShareSessionLineOptions({
+                            ticker: symbol || textContent.title || 'TICKER',
+                            moveText: textContent.percent || '',
+                            session,
+                            geminiLine: textContent.sessionLine,
+                          })
+                          const line = pickShareSessionLineByTone(opts, tone.id)
+                          if (line) setText({ sessionLine: line })
+                        }}
+                      >
+                        {tone.label}
+                      </Button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] leading-snug text-muted-foreground">
+                    Bands: &lt;5% mild · 5–10% solid · 10–15% strong · 15–25% huge · 25%+ extreme.
+                    Classic keeps “…so far in regular trading”.
+                  </p>
+                  {(() => {
+                    const symbol = String(titleIdentity?.ticker || '')
+                      .toUpperCase()
+                      .replace(/[^A-Z0-9.^_=\-]/g, '')
+                    const session = inferShareChartSession(
+                      {
+                        summary: textContent.sessionLine || textContent.reason || '',
+                        time_label: textContent.stamp || '',
+                      } as PriceMovementEvent,
+                      textContent.sessionLine || '',
+                    )
+                    const opts = buildShareSessionLineOptions({
+                      ticker: symbol || textContent.title || 'TICKER',
+                      moveText: textContent.percent || '',
+                      session,
+                      geminiLine: textContent.sessionLine,
+                    })
+                    if (opts.length <= 1) return null
+                    return (
+                      <div className="space-y-1">
+                        <p className="text-[10px] font-medium text-muted-foreground">
+                          Try a line
+                        </p>
+                        <div className="flex flex-col gap-1">
+                          {opts.map((opt) => {
+                            const active =
+                              (textContent.sessionLine || '').trim() === opt.line
+                            return (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                onClick={() => setText({ sessionLine: opt.line })}
+                                className={
+                                  active
+                                    ? 'rounded-md border border-foreground bg-foreground/5 px-2 py-1.5 text-left text-[11px] leading-snug'
+                                    : 'rounded-md border border-border/60 px-2 py-1.5 text-left text-[11px] leading-snug hover:bg-muted/50'
+                                }
+                              >
+                                <span className="mr-1.5 font-semibold text-muted-foreground">
+                                  {opt.label}
+                                </span>
+                                <span>{opt.line}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })()}
+                </div>
+                <p className="text-[10px] text-muted-foreground border-t border-border/40 pt-2">
+                  Font size · weight · margins (above/below) → open the{' '}
+                  <strong>Session</strong> tab.
+                </p>
+              </>
+            ) : null}
+          </div>
+          <div className="space-y-1 border-t border-border/40 pt-2">
             <Label htmlFor={`${idPrefix}-txt-reason`} className="text-xs font-medium">
-              Reason / body
+              Reason (Likely driver only)
             </Label>
             <Textarea
               id={`${idPrefix}-txt-reason`}
@@ -1941,10 +7871,14 @@ function ShareCardLayoutControls({
               onChange={(e) => setText({ reason: e.target.value })}
               rows={4}
               className="min-h-[5.5rem] resize-y text-sm leading-relaxed"
-              placeholder="Likely driver text on the card…"
+              placeholder="Likely driver text only — no Secondary / classification…"
             />
+            <p className="text-[10px] text-muted-foreground">
+              Share image shows only the Likely driver body (label stripped). Secondary stays in
+              the event Reason field, not on the card.
+            </p>
           </div>
-          <div className="grid gap-2 sm:grid-cols-2">
+          <div className="grid gap-2 border-t border-border/40 pt-2 sm:grid-cols-2">
             <div className="space-y-1">
               <Label htmlFor={`${idPrefix}-txt-stamp`} className="text-xs font-medium">
                 Timestamp
@@ -1954,12 +7888,15 @@ function ShareCardLayoutControls({
                 value={textContent.stamp}
                 onChange={(e) => setText({ stamp: e.target.value })}
                 className="h-8 text-sm"
-                placeholder="5 August · 9:46 AM ET"
+                placeholder="Today · 3:03 PM"
               />
+              <p className="text-[10px] text-muted-foreground">
+                Today → “Today · time”; older day → “5 August”.
+              </p>
             </div>
             <div className="space-y-1">
               <Label htmlFor={`${idPrefix}-txt-brand`} className="text-xs font-medium">
-                Footer brand
+                Track at Trigger
               </Label>
               <Input
                 id={`${idPrefix}-txt-brand`}
@@ -1970,77 +7907,463 @@ function ShareCardLayoutControls({
               />
             </div>
           </div>
-        </div>
+        </ShareLayoutSection>
       ) : null}
 
-      <div className="space-y-1.5">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Card color
+      {layoutTab === 'session' ? (
+        <ShareLayoutSection
+          first
+          title="Session line"
+          hint="“…so far in regular trading” — font size, weight, line height, margins."
+        >
+          <div className="flex flex-wrap gap-1.5">
+            <Button
+              type="button"
+              size="sm"
+              variant={style.showSessionHeadline !== false ? 'default' : 'outline'}
+              className="h-7 text-[11px]"
+              onClick={() => set({ showSessionHeadline: true })}
+            >
+              Show on card
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={style.showSessionHeadline === false ? 'default' : 'outline'}
+              className="h-7 text-[11px]"
+              onClick={() => set({ showSessionHeadline: false })}
+            >
+              Hide
+            </Button>
+          </div>
+
+          {style.showSessionHeadline !== false ? (
+            <>
+              {(
+                [
+                  {
+                    id: 'sess-fs',
+                    label: 'Font size',
+                    key: 'sessionFontSize' as const,
+                    min: 22,
+                    max: 140,
+                    step: 1,
+                    unit: 'px',
+                    hint: '',
+                  },
+                  {
+                    id: 'sess-lh',
+                    label: 'Line height',
+                    key: 'sessionLineHeight' as const,
+                    min: 1,
+                    max: 1.8,
+                    step: 0.05,
+                    unit: '×',
+                    hint: '',
+                  },
+                  {
+                    id: 'sess-mt',
+                    label: 'Margin above session',
+                    key: 'sessionMarginTop' as const,
+                    min: 0,
+                    max: 120,
+                    step: 1,
+                    unit: 'px',
+                    hint: 'Space above the session line.',
+                  },
+                  {
+                    id: 'sess-mb',
+                    label: 'Session ↔ reason gap',
+                    key: 'sessionMarginBottom' as const,
+                    min: 0,
+                    max: 160,
+                    step: 1,
+                    unit: 'px',
+                    hint: 'When timestamp is not under session. With timestamp under session, use “Timestamp ↔ reason” below.',
+                  },
+                  {
+                    id: 'sess-stamp-gap',
+                    label: 'Session ↔ timestamp gap',
+                    key: 'sessionStampGap' as const,
+                    min: 0,
+                    max: 80,
+                    step: 1,
+                    unit: 'px',
+                    hint: 'Space between session line and “Today · time” under it.',
+                  },
+                  {
+                    id: 'stamp-reason-gap',
+                    label: 'Timestamp ↔ reason gap',
+                    key: 'stampReasonGap' as const,
+                    min: 0,
+                    max: 160,
+                    step: 1,
+                    unit: 'px',
+                    hint: 'Space under the timestamp → before reason body (when stamp sits under session).',
+                  },
+                ] as const
+              ).map((row) => (
+                <div key={row.id} className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <Label htmlFor={`${idPrefix}-${row.id}`} className="text-xs font-medium">
+                      {row.label}
+                    </Label>
+                    <span className="tabular-nums text-muted-foreground">
+                      {row.key === 'sessionLineHeight'
+                        ? Number(style[row.key] ?? 1.2).toFixed(2)
+                        : style[row.key] ?? 0}
+                      {row.unit}
+                    </span>
+                  </div>
+                  <input
+                    id={`${idPrefix}-${row.id}`}
+                    type="range"
+                    min={row.min}
+                    max={row.max}
+                    step={row.step}
+                    value={
+                      row.key === 'sessionLineHeight'
+                        ? Number(style.sessionLineHeight ?? 1.2)
+                        : Number(style[row.key] ?? 0)
+                    }
+                    onChange={(e) =>
+                      set({
+                        [row.key]: Number(e.target.value),
+                      })
+                    }
+                    className="w-full accent-foreground"
+                  />
+                  {row.hint ? (
+                    <p className="text-[10px] text-muted-foreground">{row.hint}</p>
+                  ) : null}
+                </div>
+              ))}
+
+              <div className="space-y-1.5 border-t border-border/40 pt-2">
+                <p className="text-xs font-medium">Font weight</p>
+                <div className="flex flex-wrap gap-1">
+                  {SHARE_FONT_WEIGHT_OPTIONS.map((opt) => (
+                    <Button
+                      key={opt.id}
+                      type="button"
+                      size="sm"
+                      variant={
+                        (style.sessionWeight || 'semibold') === opt.id ? 'default' : 'outline'
+                      }
+                      className="h-7 px-2 text-[11px]"
+                      onClick={() => set({ sessionWeight: opt.id })}
+                    >
+                      {opt.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+
+              {textContent && onTextChange ? (
+                <div className="space-y-1 border-t border-border/40 pt-2">
+                  <Label htmlFor={`${idPrefix}-sess-line-edit`} className="text-xs font-medium">
+                    Session line text
+                  </Label>
+                  <Input
+                    id={`${idPrefix}-sess-line-edit`}
+                    value={textContent.sessionLine ?? ''}
+                    onChange={(e) => setText({ sessionLine: e.target.value })}
+                    className="h-8 text-sm"
+                    placeholder="$NVDA +4.2% so far in regular trading"
+                  />
+                  <p className="text-[10px] text-muted-foreground">
+                    Tone / try-lines also live under the <strong>Text</strong> tab.
+                  </p>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <p className="text-[10px] text-muted-foreground">
+              Session line is hidden. Turn “Show on card” to edit size and spacing.
+            </p>
+          )}
+        </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'colors' ? (
+      <ShareLayoutSection
+        title="3 · Colors"
+        hint="Card bg by family + shades · text/price inks · move % greens/reds."
+      >
+        <p className="text-[10px] font-medium text-muted-foreground">
+          Card color — pick a family, then a shade
         </p>
-        <div className="flex flex-wrap gap-2">
-          {SHARE_CARD_COLOR_PRESETS.map((opt) => {
-            const selected = (style.cardColor || 'yellow') === opt.id
+        <div className="space-y-2.5">
+          {SHARE_CARD_COLOR_FAMILIES.map((fam) => {
+            const shades = SHARE_CARD_COLOR_PRESETS.filter((p) => p.family === fam.id)
+            if (!shades.length) return null
             return (
-              <button
-                key={opt.id}
-                type="button"
-                title={opt.label}
-                aria-label={`Card color ${opt.label}`}
-                aria-pressed={selected}
-                onClick={() =>
-                  set({
-                    cardColor: opt.id,
-                    // Auto-match body + price text when switching bg; user can override after
-                    textColor: opt.defaultText,
-                    priceColor: opt.defaultText,
-                  })
-                }
-                className={
-                  selected
-                    ? 'inline-flex items-center gap-1.5 rounded-full border-2 border-foreground px-2.5 py-1 text-xs font-medium shadow-sm'
-                    : 'inline-flex items-center gap-1.5 rounded-full border border-border/70 px-2.5 py-1 text-xs font-medium hover:bg-muted/60'
-                }
-              >
-                <span
-                  className="size-3.5 shrink-0 rounded-full border border-black/15 shadow-inner"
-                  style={{ backgroundColor: opt.bg }}
-                />
-                {opt.label}
-              </button>
+              <div key={fam.id} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {fam.label}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {shades.map((opt) => {
+                    const isOriginal = opt.id === 'yellow' // #F5B800 original share yellow
+                    const selected = (style.cardColor || 'yellow') === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        title={
+                          isOriginal
+                            ? `Original share card yellow #F5B800`
+                            : `${fam.label} · ${opt.label} ${opt.bg}`
+                        }
+                        aria-label={`Card ${fam.label} ${opt.label}`}
+                        aria-pressed={selected}
+                        onClick={() =>
+                          set({
+                            cardColor: opt.id,
+                            textColor: opt.defaultText,
+                            priceColor: opt.defaultText,
+                          })
+                        }
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition-colors',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : isOriginal
+                              ? 'border-amber-500/70 bg-amber-500/10 hover:bg-amber-500/15'
+                              : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className="size-4 shrink-0 rounded-full border border-black/15 shadow-inner"
+                          style={{ backgroundColor: opt.bg }}
+                        />
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
             )
           })}
         </div>
-      </div>
 
-      <div className="space-y-1.5">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Text color
-        </p>
-        <div className="flex flex-wrap gap-2">
+        <div className="space-y-2.5 border-t border-border/40 pt-2">
+          <p className="text-[10px] font-medium text-muted-foreground">
+            Text color — title, reason, timestamp, brand
+          </p>
+          {SHARE_TEXT_COLOR_FAMILIES.map((fam) => {
+            const shades = SHARE_TEXT_COLOR_PRESETS.filter((p) => p.family === fam.id)
+            if (!shades.length) return null
+            return (
+              <div key={fam.id} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {fam.label}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {shades.map((opt) => {
+                    const selected = (style.textColor || 'black') === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        title={`${opt.label} ${opt.hex}`}
+                        aria-label={`Text ${opt.label}`}
+                        aria-pressed={selected}
+                        onClick={() => set({ textColor: opt.id })}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className="size-4 shrink-0 rounded-full border border-black/20 shadow-inner"
+                          style={{ backgroundColor: opt.hex }}
+                        />
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        <div className="space-y-2.5 border-t border-border/40 pt-2">
+          <p className="text-[10px] font-medium text-muted-foreground">
+            Price color (under %)
+          </p>
+          {SHARE_TEXT_COLOR_FAMILIES.map((fam) => {
+            const shades = SHARE_TEXT_COLOR_PRESETS.filter((p) => p.family === fam.id)
+            if (!shades.length) return null
+            return (
+              <div key={`price-${fam.id}`} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {fam.label}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {shades.map((opt) => {
+                    const selected = (style.priceColor || 'black') === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        title={`Price ${opt.label} ${opt.hex}`}
+                        aria-label={`Price ${opt.label}`}
+                        aria-pressed={selected}
+                        onClick={() => set({ priceColor: opt.id })}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className="size-4 shrink-0 rounded-full border border-black/20 shadow-inner"
+                          style={{ backgroundColor: opt.hex }}
+                        />
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        <div className="space-y-2 border-t border-border/40 pt-2">
+          <p className="text-[10px] font-medium text-muted-foreground">
+            Up color — % + chart line when rising (greens · whites)
+          </p>
           {(
             [
-              { id: 'black' as const, label: 'Black' },
-              { id: 'grey' as const, label: 'Grey' },
-              { id: 'white' as const, label: 'White' },
+              { fam: 'green' as const, title: 'Green shades' },
+              { fam: 'white' as const, title: 'White / light' },
             ] as const
-          ).map((opt) => (
-            <Button
-              key={opt.id}
-              type="button"
-              size="sm"
-              variant={(style.textColor || 'black') === opt.id ? 'default' : 'outline'}
-              className="h-8 text-xs"
-              onClick={() => set({ textColor: opt.id })}
-            >
-              {opt.label}
-            </Button>
-          ))}
+          ).map((group) => {
+            const list = SHARE_UP_GREEN_SHADES.filter((s) => s.family === group.fam)
+            if (!list.length) return null
+            return (
+              <div key={`up-${group.fam}`} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {group.title}
+                </p>
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="radiogroup"
+                  aria-label={`Up ${group.title}`}
+                >
+                  {list.map((s) => {
+                    const maxId = Math.max(...SHARE_UP_GREEN_SHADES.map((x) => x.id))
+                    const selected =
+                      clampShareMoveShade(style.upColorShade, 2, maxId) === s.id
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        title={`${s.label} ${s.hex}`}
+                        aria-label={`Up ${s.label}`}
+                        onClick={() => set({ upColorShade: s.id })}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition-colors',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            'size-4 shrink-0 rounded-full border shadow-inner',
+                            s.family === 'white' ? 'border-black/25' : 'border-black/15',
+                          )}
+                          style={{ backgroundColor: s.hex }}
+                        />
+                        {s.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
         </div>
-        <p className="text-[10px] text-muted-foreground">
-          Title, reason, timestamp & “Track at Trigger”. Price has its own color below.
-        </p>
-      </div>
 
+        <div className="space-y-2 border-t border-border/40 pt-2">
+          <p className="text-[10px] font-medium text-muted-foreground">
+            Down color — % + chart line when falling (reds · whites)
+          </p>
+          {(
+            [
+              { fam: 'red' as const, title: 'Red shades' },
+              { fam: 'white' as const, title: 'White / light' },
+            ] as const
+          ).map((group) => {
+            const list = SHARE_DOWN_RED_SHADES.filter((s) => s.family === group.fam)
+            if (!list.length) return null
+            return (
+              <div key={`down-${group.fam}`} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {group.title}
+                </p>
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="radiogroup"
+                  aria-label={`Down ${group.title}`}
+                >
+                  {list.map((s) => {
+                    const maxId = Math.max(...SHARE_DOWN_RED_SHADES.map((x) => x.id))
+                    const selected =
+                      clampShareMoveShade(style.downColorShade, 2, maxId) === s.id
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        title={`${s.label} ${s.hex}`}
+                        aria-label={`Down ${s.label}`}
+                        onClick={() => set({ downColorShade: s.id })}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition-colors',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            'size-4 shrink-0 rounded-full border shadow-inner',
+                            s.family === 'white' ? 'border-black/25' : 'border-black/15',
+                          )}
+                          style={{ backgroundColor: s.hex }}
+                        />
+                        {s.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+          <p className="text-[10px] text-muted-foreground">
+            Same shade = big % + chart line. Classic green/red = original. White works best on
+            dark card colors.
+          </p>
+        </div>
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'spacing' ? (
+      <ShareLayoutSection
+        title="4 · Spacing"
+        hint="Padding and gaps — including session · timestamp · reason."
+      >
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-2 text-xs">
           <Label htmlFor={`${idPrefix}-image-pad`} className="text-xs font-medium">
@@ -2118,7 +8441,7 @@ function ShareCardLayoutControls({
         <input
           id={`${idPrefix}-gap-header`}
           type="range"
-          min={0}
+          min={-100}
           max={280}
           step={2}
           value={style.gapBeforeChart}
@@ -2146,6 +8469,65 @@ function ShareCardLayoutControls({
         />
       </div>
 
+      <div className="space-y-2 border-t border-border/40 pt-2">
+        <p className="text-[10px] font-medium text-muted-foreground">
+          Session · timestamp · reason gaps
+        </p>
+        <p className="text-[10px] text-muted-foreground">
+          Same controls as Session tab — scaled here for quick access.
+        </p>
+        {(
+          [
+            {
+              id: 'sp-sess-reason',
+              label: 'Session ↔ reason',
+              key: 'sessionMarginBottom' as const,
+              min: 0,
+              max: 160,
+              hint: 'When timestamp is not under the session line.',
+            },
+            {
+              id: 'sp-sess-stamp',
+              label: 'Session ↔ timestamp',
+              key: 'sessionStampGap' as const,
+              min: 0,
+              max: 80,
+              hint: 'Between session line and “Today · time”.',
+            },
+            {
+              id: 'sp-stamp-reason',
+              label: 'Timestamp ↔ reason',
+              key: 'stampReasonGap' as const,
+              min: 0,
+              max: 160,
+              hint: 'Under timestamp → before reason (stamp under session).',
+            },
+          ] as const
+        ).map((row) => (
+          <div key={row.id} className="space-y-1">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <Label htmlFor={`${idPrefix}-${row.id}`} className="text-xs font-medium">
+                {row.label}
+              </Label>
+              <span className="tabular-nums text-muted-foreground">
+                {style[row.key] ?? 0}px
+              </span>
+            </div>
+            <input
+              id={`${idPrefix}-${row.id}`}
+              type="range"
+              min={row.min}
+              max={row.max}
+              step={1}
+              value={Number(style[row.key] ?? 0)}
+              onChange={(e) => set({ [row.key]: Number(e.target.value) })}
+              className="w-full accent-foreground"
+            />
+            <p className="text-[10px] text-muted-foreground">{row.hint}</p>
+          </div>
+        ))}
+      </div>
+
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-2 text-xs">
           <Label htmlFor={`${idPrefix}-logo`} className="text-xs font-medium">
@@ -2164,7 +8546,11 @@ function ShareCardLayoutControls({
           className="w-full accent-foreground"
         />
       </div>
+      </ShareLayoutSection>
+      ) : null}
 
+      {layoutTab === 'type' ? (
+      <ShareLayoutSection title="5 · Type sizes" hint="Fonts for title, %, price, stamp, reason.">
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-xs">
@@ -2195,15 +8581,45 @@ function ShareCardLayoutControls({
             id={`${idPrefix}-pct`}
             type="range"
             min={18}
-            max={110}
+            max={200}
             step={1}
-            value={style.pctFontSize}
+            value={Math.min(200, Math.max(18, Number(style.pctFontSize) || 80))}
             onChange={(e) => set({ pctFontSize: Number(e.target.value) })}
             className="w-full accent-foreground"
           />
         </div>
       </div>
 
+      <div className="space-y-1.5 border-t border-border/40 pt-2">
+        <p className="text-[10px] font-medium text-muted-foreground">
+          Share price (under % change)
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showSharePrice !== false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showSharePrice: true })}
+          >
+            Show price
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showSharePrice === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showSharePrice: false })}
+          >
+            Hide price
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          $share price under the big % on the right. Hide to show only the move %.
+        </p>
+      </div>
+
+      {style.showSharePrice !== false ? (
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-xs">
@@ -2249,32 +8665,41 @@ function ShareCardLayoutControls({
           </p>
         </div>
       </div>
+      ) : null}
 
+      {style.showSharePrice !== false ? (
       <div className="space-y-1.5">
         <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           Price color
         </p>
-        <div className="flex flex-wrap gap-2">
-          {(
-            [
-              { id: 'black' as const, label: 'Black' },
-              { id: 'grey' as const, label: 'Grey' },
-              { id: 'white' as const, label: 'White' },
-            ] as const
+        <p className="text-[10px] text-muted-foreground">
+          Full shade picker is under <strong>3 · Colors</strong> (same inks as text).
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {SHARE_TEXT_COLOR_PRESETS.filter((p) =>
+            ['black', 'grey', 'white', 'ink', 'navy-text', 'off-white'].includes(p.id),
           ).map((opt) => (
-            <Button
+            <button
               key={opt.id}
               type="button"
-              size="sm"
-              variant={(style.priceColor || 'black') === opt.id ? 'default' : 'outline'}
-              className="h-8 text-xs"
               onClick={() => set({ priceColor: opt.id })}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                (style.priceColor || 'black') === opt.id
+                  ? 'border-2 border-foreground shadow-sm'
+                  : 'border-border/70 hover:bg-muted/50',
+              )}
             >
+              <span
+                className="size-3.5 shrink-0 rounded-full border border-black/15"
+                style={{ backgroundColor: opt.hex }}
+              />
               {opt.label}
-            </Button>
+            </button>
           ))}
         </div>
       </div>
+      ) : null}
 
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-2 text-xs">
@@ -2316,17 +8741,15 @@ function ShareCardLayoutControls({
         />
       </div>
 
-      <div className="space-y-1.5 border-t border-border/50 pt-2">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Title text
-        </p>
+      <div className="space-y-1.5 border-t border-border/40 pt-2">
+        <p className="text-[10px] font-medium text-muted-foreground">Title text mode</p>
         <div className="flex flex-wrap gap-2">
           <Button
             type="button"
             size="sm"
             variant={style.titleMode !== 'ticker' ? 'default' : 'outline'}
             className="h-8 text-xs"
-            onClick={() => set({ titleMode: 'company' })}
+            onClick={() => applyTitleMode('company')}
           >
             Company name
           </Button>
@@ -2335,66 +8758,1376 @@ function ShareCardLayoutControls({
             size="sm"
             variant={style.titleMode === 'ticker' ? 'default' : 'outline'}
             className="h-8 text-xs"
-            onClick={() => set({ titleMode: 'ticker' })}
+            onClick={() => applyTitleMode('ticker')}
           >
             Ticker symbol
           </Button>
         </div>
+        <p className="text-[10px] text-muted-foreground">
+          Company name comes from Yahoo Finance when the DB label is missing or just the ticker.
+        </p>
       </div>
 
-      <div className="space-y-1.5">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Date · timestamp
+      <div className="space-y-1.5 border-t border-border/40 pt-2">
+        <p className="text-[10px] font-medium text-muted-foreground">Track at Trigger color</p>
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              { id: 'auto' as const, label: 'Match text' },
+              { id: 'dark' as const, label: 'Dark color' },
+              { id: 'light' as const, label: 'Light color' },
+            ] as const
+          ).map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={(style.brandTone || 'auto') === opt.id ? 'default' : 'outline'}
+              className="h-8 text-xs"
+              onClick={() => set({ brandTone: opt.id })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Color only (black / white). Weight is in Font weight section.
         </p>
+      </div>
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'canvas' ? (
+      <ShareLayoutSection
+        title="6 · Canvas size"
+        hint="Export is a full-resolution PNG. Default Full HD (1920px wide)."
+      >
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-canvas-w`} className="text-xs font-medium">
+              Width (export)
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.canvasWidth ?? 1920}px
+              {(style.canvasWidth ?? 1920) >= 1920 ? ' · Full HD+' : ''}
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-canvas-w`}
+            type="range"
+            min={800}
+            max={3840}
+            step={10}
+            value={style.canvasWidth ?? 1920}
+            onChange={(e) => set({ canvasWidth: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span>800</span>
+            <span>1920 Full HD</span>
+            <span>3840 4K</span>
+          </div>
+        </div>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-aspect`} className="text-xs font-medium">
+              Height ratio (shape)
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {(style.aspectRatio ?? 1.05).toFixed(2)} · ~{Math.round(
+                (style.canvasWidth ?? 1920) * (style.aspectRatio ?? 1.05),
+              )}
+              px tall
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-aspect`}
+            type="range"
+            min={0.85}
+            max={1.55}
+            step={0.01}
+            value={style.aspectRatio ?? 1.05}
+            onChange={(e) => set({ aspectRatio: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span>Wider / squarish</span>
+            <span>Taller</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2 pt-0.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={style.preferSquare !== false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ preferSquare: true })}
+          >
+            Lock to ratio
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.preferSquare === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ preferSquare: false })}
+          >
+            Free height
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={
+              (style.canvasWidth ?? 1920) === 1920 && (style.aspectRatio ?? 1.05) === 1.05
+                ? 'default'
+                : 'outline'
+            }
+            className="h-7 text-[11px]"
+            onClick={() => set({ canvasWidth: 1920, aspectRatio: 1.05, preferSquare: true })}
+          >
+            Full HD 1920
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 text-[11px]"
+            onClick={() => set({ aspectRatio: 1, preferSquare: true, canvasWidth: 1920 })}
+          >
+            1:1 HD square
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 text-[11px]"
+            onClick={() => set({ aspectRatio: 1.25, preferSquare: true, canvasWidth: 1920 })}
+          >
+            Story 4:5 HD
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 text-[11px]"
+            onClick={() => set({ canvasWidth: 1080, aspectRatio: 1, preferSquare: true })}
+          >
+            1080 square
+          </Button>
+        </div>
+        <p className="text-[10px] leading-snug text-muted-foreground">
+          Copy / Download save this exact pixel size as a lossless PNG. Preview is only scaled down
+          for the dialog — the file is full resolution. Lock pads or compresses gaps to the ratio;
+          Free height = content decides height.
+        </p>
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'timestamp' ? (
+      <ShareLayoutSection
+        title="7 · Timestamp placement"
+        hint="Only when session line is removed."
+      >
         <div className="flex flex-wrap gap-2">
           <Button
             type="button"
             size="sm"
-            variant={style.dateInFooter !== false ? 'default' : 'outline'}
+            variant={style.timestampPlacement !== 'price-right' ? 'default' : 'outline'}
             className="h-8 text-xs"
-            onClick={() => set({ dateInFooter: true })}
+            disabled={style.showSessionHeadline !== false}
+            onClick={() => set({ timestampPlacement: 'footer-left' })}
           >
-            Footer left (default)
+            Footer left
           </Button>
           <Button
             type="button"
             size="sm"
-            variant={style.dateInFooter === false ? 'default' : 'outline'}
+            variant={style.timestampPlacement === 'price-right' ? 'default' : 'outline'}
             className="h-8 text-xs"
-            onClick={() => set({ dateInFooter: false })}
+            disabled={style.showSessionHeadline !== false}
+            onClick={() => set({ timestampPlacement: 'price-right' })}
           >
-            Under price
+            Right of share price
           </Button>
         </div>
         <p className="text-[10px] text-muted-foreground">
-          Footer left: “5 August · time” left of Track at Trigger. Font size = Timestamp slider
-          above.
+          {style.showSessionHeadline !== false
+            ? 'Session line is on → stamp always sits under that line.'
+            : 'Choose bottom-left, or next to the share price. Font = Timestamp slider.'}
         </p>
-      </div>
+      </ShareLayoutSection>
+      ) : null}
 
-      <div className="flex flex-wrap gap-2 pt-1">
-        <Button
-          type="button"
-          size="sm"
-          variant={style.nameBold ? 'default' : 'outline'}
-          className="h-8 text-xs"
-          onClick={() => set({ nameBold: !style.nameBold })}
-        >
-          Title {style.nameBold ? 'Bold' : 'Light'}
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant={style.reasonBold ? 'default' : 'outline'}
-          className="h-8 text-xs"
-          onClick={() => set({ reasonBold: !style.reasonBold })}
-        >
-          Reason {style.reasonBold ? 'Bold' : 'Light'}
-        </Button>
+      {layoutTab === 'brand' ? (
+      <ShareLayoutSection
+        title="8 · Track at Trigger"
+        hint="Show/hide brand text · scale size & height · position · margins. Store icons → Store tab."
+      >
+        <p className="text-[10px] font-medium text-muted-foreground">Brand text visibility</p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showBrand !== false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showBrand: true })}
+          >
+            Show “Track at Trigger”
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showBrand === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showBrand: false })}
+          >
+            Hide brand text
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Hides only the footer label. Store icons have their own show/hide under{' '}
+          <strong>Store</strong>.
+        </p>
+
+        {style.showBrand !== false ? (
+          <>
+            <div className="space-y-1 border-t border-border/40 pt-2">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <Label htmlFor={`${idPrefix}-brand-fs`} className="text-xs font-medium">
+                  Brand text scale (size)
+                </Label>
+                <span className="tabular-nums text-muted-foreground">
+                  {style.brandFontSize ?? 28}px
+                </span>
+              </div>
+              <input
+                id={`${idPrefix}-brand-fs`}
+                type="range"
+                min={14}
+                max={48}
+                step={1}
+                value={style.brandFontSize ?? 28}
+                onChange={(e) => set({ brandFontSize: Number(e.target.value) })}
+                className="w-full accent-foreground"
+              />
+              <p className="text-[10px] text-muted-foreground">
+                Overall font size (width + natural height).
+              </p>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <Label htmlFor={`${idPrefix}-brand-hscale`} className="text-xs font-medium">
+                  Brand text height
+                </Label>
+                <span className="tabular-nums text-muted-foreground">
+                  {(style.brandHeightScale ?? 1).toFixed(2)}×
+                </span>
+              </div>
+              <input
+                id={`${idPrefix}-brand-hscale`}
+                type="range"
+                min={0.5}
+                max={2}
+                step={0.05}
+                value={style.brandHeightScale ?? 1}
+                onChange={(e) => set({ brandHeightScale: Number(e.target.value) })}
+                className="w-full accent-foreground"
+              />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>Shorter</span>
+                <span>Taller (stretch)</span>
+              </div>
+            </div>
+          </>
+        ) : (
+          <p className="text-[10px] text-muted-foreground border-t border-border/40 pt-2">
+            Brand text is hidden. Turn “Show” to edit scale and height.
+          </p>
+        )}
+
+        <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+          Position on card
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {(
+            [
+              { id: 'left' as const, label: 'Bottom left' },
+              { id: 'center' as const, label: 'Bottom center' },
+              { id: 'right' as const, label: 'Bottom right' },
+            ] as const
+          ).map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={(style.brandPlacement || 'right') === opt.id ? 'default' : 'outline'}
+              className="h-7 text-[11px]"
+              onClick={() => set({ brandPlacement: opt.id })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Track at Trigger (+ store icons) at the bottom. Date sits on the opposite side when
+          left/right.
+        </p>
+        <div className="space-y-1 border-t border-border/40 pt-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-reason-mb`} className="text-xs font-medium">
+              Margin above (from reason)
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {(style.reasonMarginBottom ?? 56) + (style.brandMarginTop ?? 0)}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-reason-mb`}
+            type="range"
+            min={0}
+            max={180}
+            step={2}
+            value={style.reasonMarginBottom ?? 56}
+            onChange={(e) => set({ reasonMarginBottom: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Gap under reason body → before “Track at Trigger”.
+          </p>
+        </div>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-brand-mt`} className="text-xs font-medium">
+              Extra margin above
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.brandMarginTop ?? 0}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-brand-mt`}
+            type="range"
+            min={0}
+            max={100}
+            step={2}
+            value={style.brandMarginTop ?? 0}
+            onChange={(e) => set({ brandMarginTop: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+        </div>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-brand-mb`} className="text-xs font-medium">
+              Margin below
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.brandMarginBottom ?? 40}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-brand-mb`}
+            type="range"
+            min={0}
+            max={120}
+            step={2}
+            value={style.brandMarginBottom ?? 40}
+            onChange={(e) => set({ brandMarginBottom: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Space under “Track at Trigger” (+ store icons) to the card edge.
+          </p>
+        </div>
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'chart' ? (
+      <ShareLayoutSection
+        title="9 · Chart x-axis"
+        hint="Session range · time axis · optional $ / % on the line."
+      >
+        <p className="text-[10px] font-medium text-muted-foreground">Session range</p>
+        <div className="flex flex-wrap gap-1.5">
+          {(
+            [
+              { id: 1 as const, label: '1 day' },
+              { id: 2 as const, label: '2 days' },
+              { id: 3 as const, label: '3 days' },
+              { id: 5 as const, label: '5 days' },
+            ] as const
+          ).map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={
+                clampShareChartSessionDays(style.chartSessionDays) === opt.id
+                  ? 'default'
+                  : 'outline'
+              }
+              className="h-7 text-[11px]"
+              onClick={() => set({ chartSessionDays: opt.id })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Trading sessions ending on the event day. Changing range or interval reloads Yahoo
+          data on next preview refresh.
+        </p>
+
+        <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+          Bar interval (pricing)
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {SHARE_CHART_INTERVALS.filter((opt) => opt.id !== '1h').map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={
+                clampShareChartInterval(style.chartInterval) === opt.id ? 'default' : 'outline'
+              }
+              className="h-7 min-w-10 px-2 text-[11px]"
+              onClick={() => set({ chartInterval: opt.id })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          How fine the price line is sampled (1m = densest / wavy). Needs real Yahoo 1m data.
+        </p>
+
+        <div className="space-y-1 border-t border-border/40 pt-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-chart-plot-h`} className="text-xs font-medium">
+              Chart height
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {Math.min(
+                700,
+                Math.max(
+                  140,
+                  Number.isFinite(Number(style.chartPlotHeight)) && Number(style.chartPlotHeight) > 0
+                    ? Math.round(Number(style.chartPlotHeight))
+                    : 300,
+                ),
+              )}
+              px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-chart-plot-h`}
+            type="range"
+            min={140}
+            max={650}
+            step={10}
+            value={Math.min(
+              700,
+              Math.max(
+                140,
+                Number.isFinite(Number(style.chartPlotHeight)) && Number(style.chartPlotHeight) > 0
+                  ? Number(style.chartPlotHeight)
+                  : 300,
+              ),
+            )}
+            onChange={(e) => set({ chartPlotHeight: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            How tall the line plot is. Higher = longer chart / more vertical “zoom” on the move.
+          </p>
+        </div>
+
+        <div className="space-y-1 border-t border-border/40 pt-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-chart-line-w`} className="text-xs font-medium">
+              Line thickness
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {Math.min(
+                24,
+                Math.max(
+                  1,
+                  Number.isFinite(Number(style.chartLineWidth)) && Number(style.chartLineWidth) > 0
+                    ? Number(style.chartLineWidth)
+                    : 4,
+                ),
+              )}
+              px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-chart-line-w`}
+            type="range"
+            min={1}
+            max={16}
+            step={0.5}
+            value={Math.min(
+              24,
+              Math.max(
+                1,
+                Number.isFinite(Number(style.chartLineWidth)) && Number(style.chartLineWidth) > 0
+                  ? Number(style.chartLineWidth)
+                  : 4,
+              ),
+            )}
+            onChange={(e) => set({ chartLineWidth: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Stroke width of the price line (1 = hairline · 16 = bold). End dot scales with it.
+          </p>
+        </div>
+
+        <div className="space-y-1 border-t border-border/40 pt-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-chart-start-pct`} className="text-xs font-medium">
+              Chart start (trim left)
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {Math.min(90, Math.max(0, Math.round(Number(style.chartVisibleStartPct) || 0)))}%
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-chart-start-pct`}
+            type="range"
+            min={0}
+            max={90}
+            step={1}
+            value={Math.min(90, Math.max(0, Math.round(Number(style.chartVisibleStartPct) || 0)))}
+            onChange={(e) => set({ chartVisibleStartPct: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            End is always the event / stamp time. 0% = full session range · higher =
+            start later (zoom into the right side of 1d / 2d / 5d).
+          </p>
+        </div>
+
+        <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+          Axis visibility
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showChartTimeAxis !== false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showChartTimeAxis: true })}
+          >
+            Time on
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showChartTimeAxis === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showChartTimeAxis: false })}
+          >
+            Time off
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showChartDayLabels === true ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showChartDayLabels: true })}
+          >
+            Dates on
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showChartDayLabels !== true ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showChartDayLabels: false })}
+          >
+            Dates off
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Time = 0m / 9:30 AM ticks. Dates = day labels under multi-day charts.
+        </p>
+
+        {style.showChartDayLabels === true ? (
+          <div className="space-y-1.5">
+            <p className="text-[10px] font-medium text-muted-foreground">Day label style</p>
+            <div className="flex flex-wrap gap-1.5">
+              {(
+                [
+                  { id: 'today-long' as const, label: 'Today · 6 August' },
+                  { id: 'today-short' as const, label: 'Today · 6 Aug' },
+                  { id: 'date-long' as const, label: '7 August · 6 August' },
+                  { id: 'date-short' as const, label: '7 Aug · 6 Aug' },
+                  { id: 'relative' as const, label: 'Today · Yesterday · Back' },
+                  { id: 'relative-short' as const, label: 'Today · Yday · Back' },
+                ] as const
+              ).map((opt) => (
+                <Button
+                  key={opt.id}
+                  type="button"
+                  size="sm"
+                  variant={
+                    clampShareChartDayLabelMode(style.chartDayLabelMode) === opt.id
+                      ? 'default'
+                      : 'outline'
+                  }
+                  className="h-7 text-[11px]"
+                  onClick={() => set({ chartDayLabelMode: opt.id })}
+                >
+                  {opt.label}
+                </Button>
+              ))}
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              Calendar styles use real dates. Relative = Today (last session) · Yesterday ·
+              Back · 3 days back… for older sessions.
+            </p>
+          </div>
+        ) : null}
+
+        {style.showChartTimeAxis !== false && style.showChartDayLabels === true ? (
+          <div className="space-y-1 border-t border-border/40 pt-2">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <Label htmlFor={`${idPrefix}-chart-time-day-gap`} className="text-xs font-medium">
+                Gap: time ↔ dates
+              </Label>
+              <span className="tabular-nums text-muted-foreground">
+                {Math.min(
+                  100,
+                  Math.max(
+                    0,
+                    Math.round(
+                      Number.isFinite(Number(style.chartTimeDayGap))
+                        ? Number(style.chartTimeDayGap)
+                        : 14,
+                    ),
+                  ),
+                )}
+                px
+              </span>
+            </div>
+            <input
+              id={`${idPrefix}-chart-time-day-gap`}
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={Math.min(
+                100,
+                Math.max(
+                  0,
+                  Math.round(
+                    Number.isFinite(Number(style.chartTimeDayGap))
+                      ? Number(style.chartTimeDayGap)
+                      : 14,
+                  ),
+                ),
+              )}
+              onChange={(e) => set({ chartTimeDayGap: Number(e.target.value) })}
+              className="w-full accent-foreground"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              Vertical space between the time row and day labels (0–100px).
+            </p>
+          </div>
+        ) : null}
+
+        <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+          Time axis mode
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={(style.chartAxisMode || 'elapsed') === 'elapsed' ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ chartAxisMode: 'elapsed' })}
+          >
+            Elapsed (0m · 15m…)
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.chartAxisMode === 'timestamp' ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ chartAxisMode: 'timestamp' })}
+          >
+            Absolute time (9:30 AM…)
+          </Button>
+        </div>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label className="text-xs font-medium">Time label count</Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.chartAxisLabelCount ?? 5}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {[3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+              <Button
+                key={n}
+                type="button"
+                size="sm"
+                variant={(style.chartAxisLabelCount ?? 5) === n ? 'default' : 'outline'}
+                className="h-7 min-w-8 px-2 text-[11px]"
+                onClick={() => set({ chartAxisLabelCount: n })}
+              >
+                {n}
+              </Button>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            Exact time labels under the chart (3–10). Absolute time is clearest for multi-day.
+          </p>
+        </div>
+
+        <div className="space-y-1 border-t border-border/40 pt-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label htmlFor={`${idPrefix}-chart-axis-fs`} className="text-xs font-medium">
+              Time label font size
+            </Label>
+            <span className="tabular-nums text-muted-foreground">
+              {style.chartAxisFontSize ?? 18}px
+            </span>
+          </div>
+          <input
+            id={`${idPrefix}-chart-axis-fs`}
+            type="range"
+            min={10}
+            max={40}
+            step={1}
+            value={style.chartAxisFontSize ?? 18}
+            onChange={(e) => set({ chartAxisFontSize: Number(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Font for 0m / 15m / 1h or absolute clock under the chart.
+          </p>
+        </div>
+
+        <div className="space-y-1.5 border-t border-border/40 pt-2">
+          <p className="text-[10px] font-medium text-muted-foreground">
+            Labels on the line
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {(
+              [
+                { id: 'off' as const, label: 'Hide' },
+                { id: 'price' as const, label: 'Price' },
+                { id: 'percent' as const, label: '%' },
+                { id: 'both' as const, label: 'Both' },
+              ] as const
+            ).map((opt) => (
+              <Button
+                key={opt.id}
+                type="button"
+                size="sm"
+                variant={
+                  (style.chartPointLabelMode || 'off') === opt.id ? 'default' : 'outline'
+                }
+                className="h-7 text-[11px]"
+                onClick={() => set({ chartPointLabelMode: opt.id })}
+              >
+                {opt.label}
+              </Button>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            Both = % above the point, $ price below. Needs real chart data.
+          </p>
+          {(style.chartPointLabelMode || 'off') !== 'off' ? (
+            <div className="space-y-2">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label className="text-xs font-medium">Point count (3–8)</Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {style.chartPriceLabelCount ?? 4}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {[3, 4, 5, 6, 7, 8].map((n) => (
+                    <Button
+                      key={n}
+                      type="button"
+                      size="sm"
+                      variant={(style.chartPriceLabelCount ?? 4) === n ? 'default' : 'outline'}
+                      className="h-7 min-w-8 px-2 text-[11px]"
+                      onClick={() => set({ chartPriceLabelCount: n })}
+                    >
+                      {n}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label
+                  htmlFor={`${idPrefix}-chart-point-labels`}
+                  className="text-xs font-medium"
+                >
+                  Custom line labels (optional)
+                </Label>
+                <Textarea
+                  id={`${idPrefix}-chart-point-labels`}
+                  value={style.chartPointLabelsCustom ?? ''}
+                  onChange={(e) => set({ chartPointLabelsCustom: e.target.value })}
+                  rows={3}
+                  className="min-h-[4rem] resize-y font-mono text-xs"
+                  placeholder={
+                    (style.chartPointLabelMode || 'off') === 'percent' ||
+                    (style.chartPointLabelMode || 'off') === 'both'
+                      ? '+0%\n+1.2%\n+2.5%\n+3.1%'
+                      : '$100.00\n$101.20\n$102.50'
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  One label per line (same order as points). Empty = auto from data.
+                  {(style.chartPointLabelMode || 'off') === 'both'
+                    ? ' These are the top (%) lines.'
+                    : ''}
+                </p>
+              </div>
+              {(style.chartPointLabelMode || 'off') === 'both' ? (
+                <div className="space-y-1">
+                  <Label
+                    htmlFor={`${idPrefix}-chart-point-subs`}
+                    className="text-xs font-medium"
+                  >
+                    Custom bottom prices (optional)
+                  </Label>
+                  <Textarea
+                    id={`${idPrefix}-chart-point-subs`}
+                    value={style.chartPointSubLabelsCustom ?? ''}
+                    onChange={(e) => set({ chartPointSubLabelsCustom: e.target.value })}
+                    rows={3}
+                    className="min-h-[4rem] resize-y font-mono text-xs"
+                    placeholder={'$100.00\n$101.20\n$102.50\n$103.10'}
+                  />
+                  <p className="text-[10px] text-muted-foreground">
+                    One $ per line under each %. Empty = auto prices.
+                  </p>
+                </div>
+              ) : null}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <Label htmlFor={`${idPrefix}-chart-point-fs`} className="text-xs font-medium">
+                    Line label font size (price / %)
+                  </Label>
+                  <span className="tabular-nums text-muted-foreground">
+                    {style.chartPointFontSize ?? 16}px
+                  </span>
+                </div>
+                <input
+                  id={`${idPrefix}-chart-point-fs`}
+                  type="range"
+                  min={10}
+                  max={40}
+                  step={1}
+                  value={style.chartPointFontSize ?? 16}
+                  onChange={(e) => set({ chartPointFontSize: Number(e.target.value) })}
+                  className="w-full accent-foreground"
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="space-y-1.5 border-t border-border/40 pt-2">
+          <Label htmlFor={`${idPrefix}-chart-axis-labels`} className="text-xs font-medium">
+            Custom time labels (under chart)
+          </Label>
+          <Textarea
+            id={`${idPrefix}-chart-axis-labels`}
+            value={style.chartAxisLabelsCustom ?? ''}
+            onChange={(e) => set({ chartAxisLabelsCustom: e.target.value })}
+            rows={3}
+            className="min-h-[4rem] resize-y font-mono text-xs"
+            placeholder={'0m\n15m\n30m\n45m\n1h'}
+          />
+          <p className="text-[10px] text-muted-foreground">
+            One label per line, left → right. Empty = auto elapsed / clock. Matches your label
+            count when possible.
+          </p>
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-[10px] text-muted-foreground">
+            Session stamp timezone — full convert (e.g. 3:33 PM ET → 8:33 PM BST). Chart axis
+            stays clean (0m / 9:30 AM only, no zone).
+          </p>
+          <div className="flex flex-wrap gap-1">
+            {SHARE_CHART_TIMEZONES.map((z) => (
+              <Button
+                key={z.id}
+                type="button"
+                size="sm"
+                variant={
+                  (style.chartAxisTimezone || 'America/New_York') === z.id
+                    ? 'default'
+                    : 'outline'
+                }
+                className="h-7 px-2 text-[11px]"
+                onClick={() => set({ chartAxisTimezone: z.id })}
+                title={z.label}
+              >
+                {z.short}
+              </Button>
+            ))}
+          </div>
+        </div>
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'store' ? (
+      <ShareLayoutSection
+        title="10 · Store labels"
+        hint="Brand icons after Track at Trigger: show/hide · height · width scale."
+      >
+        <p className="text-[10px] font-medium text-muted-foreground">Visibility</p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={
+              style.showStoreBadges !== false && (style.storeBadgeStyle || 'circle') === 'circle'
+                ? 'default'
+                : 'outline'
+            }
+            className="h-7 text-[11px]"
+            onClick={() => set({ showStoreBadges: true, storeBadgeStyle: 'circle' })}
+          >
+            Circular icons
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={
+              style.showStoreBadges !== false && style.storeBadgeStyle === 'badge'
+                ? 'default'
+                : 'outline'
+            }
+            className="h-7 text-[11px]"
+            onClick={() => set({ showStoreBadges: true, storeBadgeStyle: 'badge' })}
+          >
+            App Store badge
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.showStoreBadges === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showStoreBadges: false })}
+          >
+            Hide icons
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Independent of brand text hide (Brand tab). Circular = App Store + Play · Badge =
+          App Store only.
+        </p>
+        {style.showStoreBadges !== false ? (
+          <>
+            <div className="space-y-1 border-t border-border/40 pt-2">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <Label htmlFor={`${idPrefix}-store-h`} className="text-xs font-medium">
+                  Icon / badge height
+                </Label>
+                <span className="tabular-nums text-muted-foreground">
+                  {style.storeIconSize ?? 36}px
+                </span>
+              </div>
+              <input
+                id={`${idPrefix}-store-h`}
+                type="range"
+                min={18}
+                max={72}
+                step={1}
+                value={style.storeIconSize ?? 36}
+                onChange={(e) => set({ storeIconSize: Number(e.target.value) })}
+                className="w-full accent-foreground"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <Label htmlFor={`${idPrefix}-store-wscale`} className="text-xs font-medium">
+                  Icon width scale
+                </Label>
+                <span className="tabular-nums text-muted-foreground">
+                  {(style.storeIconWidthScale ?? 1).toFixed(2)}×
+                </span>
+              </div>
+              <input
+                id={`${idPrefix}-store-wscale`}
+                type="range"
+                min={0.5}
+                max={2}
+                step={0.05}
+                value={style.storeIconWidthScale ?? 1}
+                onChange={(e) => set({ storeIconWidthScale: Number(e.target.value) })}
+                className="w-full accent-foreground"
+              />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>Narrower</span>
+                <span>Wider</span>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Width independent of height. 1× = natural proportion.
+              </p>
+            </div>
+          </>
+        ) : (
+          <p className="text-[10px] text-muted-foreground">
+            Store icons are hidden. Pick Circular or Badge to show and scale them.
+          </p>
+        )}
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'seal' ? (
+      <ShareLayoutSection
+        title="11 · News stamp"
+        hint="Circle seal or rectangular CERTIFIED stamp · drag position · dotted density."
+      >
+        <div className="flex flex-wrap gap-1.5">
+          {(
+            [
+              { id: 'auto' as const, label: 'Auto' },
+              { id: 'on' as const, label: 'Always on' },
+              { id: 'off' as const, label: 'Off' },
+            ] as const
+          ).map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={(style.newsStampMode || 'auto') === opt.id ? 'default' : 'outline'}
+              className="h-7 text-[11px]"
+              onClick={() => set({ newsStampMode: opt.id })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Auto = show when move ≥10%, Breaking tone, or session line says BREAKING.
+        </p>
+
+        <p className="text-[10px] font-medium text-muted-foreground">Stamp look (switch)</p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={(style.newsStampStyle || 'circle') === 'circle' ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ newsStampStyle: 'circle' })}
+          >
+            Circle seal
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={style.newsStampStyle === 'rect' ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ newsStampStyle: 'rect' })}
+          >
+            Rect stamp
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Circle = double ring + top/bottom arc (TRIGGER ALERT) + center banner. Rect =
+          rectangular CERTIFIED-style box.
+        </p>
+
+        <p className="text-[10px] font-medium text-muted-foreground">Preset (fills edit boxes)</p>
+        <div className="flex flex-wrap gap-1.5">
+          {(
+            [
+              { id: 'auto' as const, label: 'Auto' },
+              { id: 'breaking' as const, label: 'Breaking' },
+              { id: 'exploding' as const, label: 'Exploding' },
+              { id: 'surge' as const, label: 'Surging' },
+              { id: 'crash' as const, label: 'Crashing' },
+              { id: 'alert' as const, label: 'Alert' },
+            ] as const
+          ).map((opt) => (
+            <Button
+              key={opt.id}
+              type="button"
+              size="sm"
+              variant={(style.newsStampKind || 'auto') === opt.id ? 'default' : 'outline'}
+              className="h-7 text-[11px]"
+              onClick={() => {
+                if (opt.id === 'auto') {
+                  set({
+                    newsStampKind: 'auto',
+                    newsStampCenterText: '',
+                    newsStampRingText: '',
+                  })
+                  return
+                }
+                const copy = shareNewsStampCopy(opt.id)
+                set({
+                  newsStampKind: opt.id,
+                  newsStampCenterText: copy.center.join('\n'),
+                  newsStampRingText: copy.ring,
+                  newsStampMode:
+                    style.newsStampMode === 'off' ? 'on' : style.newsStampMode || 'on',
+                })
+              }}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+
+        <div className="space-y-1.5 border-t border-border/40 pt-2">
+          <Label htmlFor={`${idPrefix}-stamp-center`} className="text-xs font-medium">
+            Center wording
+          </Label>
+          <Textarea
+            id={`${idPrefix}-stamp-center`}
+            value={style.newsStampCenterText ?? ''}
+            onChange={(e) => set({ newsStampCenterText: e.target.value })}
+            rows={2}
+            className="min-h-[3.5rem] resize-y text-sm"
+            placeholder={'BREAKING\nNEWS'}
+          />
+          <p className="text-[10px] text-muted-foreground">
+            One word per line (max ~4). Empty = follow preset / auto.
+          </p>
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor={`${idPrefix}-stamp-ring`} className="text-xs font-medium">
+            Ring wording (top & bottom of circle)
+          </Label>
+          <Input
+            id={`${idPrefix}-stamp-ring`}
+            value={style.newsStampRingText ?? ''}
+            onChange={(e) => set({ newsStampRingText: e.target.value })}
+            className="h-8 text-sm"
+            placeholder="TRIGGER ALERT"
+            disabled={style.newsStampStyle === 'rect'}
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Circle only — arc text top & bottom. Empty = preset (e.g. TRIGGER ALERT).
+          </p>
+        </div>
+
+        <p className="text-[10px] font-medium text-muted-foreground">
+          Ink color — family, then shade
+        </p>
+        <div className="space-y-2">
+          {SHARE_NEWS_STAMP_INK_FAMILIES.map((fam) => {
+            const shades = SHARE_NEWS_STAMP_INK_PRESETS.filter((p) => p.family === fam.id)
+            if (!shades.length) return null
+            return (
+              <div key={fam.id} className="space-y-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {fam.label}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {shades.map((opt) => {
+                    const selected = (style.newsStampColor || 'red') === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        title={`${fam.label} · ${opt.label} ${opt.hex}`}
+                        aria-label={`Ink ${fam.label} ${opt.label}`}
+                        aria-pressed={selected}
+                        onClick={() => set({ newsStampColor: opt.id })}
+                        className={cn(
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                          selected
+                            ? 'border-2 border-foreground shadow-sm'
+                            : 'border-border/70 hover:bg-muted/50',
+                        )}
+                      >
+                        <span
+                          className="size-3.5 shrink-0 rounded-full border border-black/15 shadow-inner"
+                          style={{ backgroundColor: opt.hex }}
+                        />
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          Auto = red on down moves, gold on up. Classic red matches the original CERTIFIED look.
+        </p>
+
+        <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+          Position on card
+        </p>
+        <div className="flex flex-wrap gap-1">
+          {(
+            [
+              { label: 'TL', x: 18, y: 18 },
+              { label: 'Top', x: 50, y: 18 },
+              { label: 'TR', x: 82, y: 18 },
+              { label: 'Left', x: 18, y: 45 },
+              { label: 'Center', x: 50, y: 42 },
+              { label: 'Right', x: 82, y: 45 },
+              { label: 'BL', x: 18, y: 78 },
+              { label: 'Bottom', x: 50, y: 78 },
+              { label: 'BR', x: 82, y: 78 },
+            ] as const
+          ).map((p) => (
+            <Button
+              key={p.label}
+              type="button"
+              size="sm"
+              variant={
+                (style.newsStampX ?? 50) === p.x && (style.newsStampY ?? 42) === p.y
+                  ? 'default'
+                  : 'outline'
+              }
+              className="h-7 min-w-10 px-2 text-[11px]"
+              onClick={() => set({ newsStampX: p.x, newsStampY: p.y })}
+            >
+              {p.label}
+            </Button>
+          ))}
+        </div>
+        {(
+          [
+            {
+              id: 'stamp-x',
+              label: 'Left ↔ right',
+              key: 'newsStampX' as const,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+            },
+            {
+              id: 'stamp-y',
+              label: 'Top ↕ bottom',
+              key: 'newsStampY' as const,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+            },
+            {
+              id: 'stamp-dens',
+              label: 'Dotted density',
+              key: 'newsStampDotDensity' as const,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '',
+            },
+            {
+              id: 'stamp-size',
+              label: 'Size / scale',
+              key: 'newsStampSize' as const,
+              min: 100,
+              max: 1000,
+              step: 5,
+              unit: 'px',
+            },
+            {
+              id: 'stamp-rot',
+              label: 'Rotation',
+              key: 'newsStampRotation' as const,
+              min: -35,
+              max: 35,
+              step: 1,
+              unit: '°',
+            },
+            {
+              id: 'stamp-op',
+              label: 'Fade / opacity (whole stamp)',
+              key: 'newsStampOpacity' as const,
+              min: 8,
+              max: 100,
+              step: 1,
+              unit: '%',
+            },
+          ] as const
+        ).map((row) => (
+          <div key={row.id} className="space-y-1">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <Label htmlFor={`${idPrefix}-${row.id}`} className="text-xs font-medium">
+                {row.label}
+              </Label>
+              <span className="tabular-nums text-muted-foreground">
+                {style[row.key] ?? DEFAULT_SHARE_CARD_STYLE[row.key]}
+                {row.unit}
+              </span>
+            </div>
+            <input
+              id={`${idPrefix}-${row.id}`}
+              type="range"
+              min={row.min}
+              max={row.max}
+              step={row.step}
+              value={Number(style[row.key] ?? DEFAULT_SHARE_CARD_STYLE[row.key])}
+              onChange={(e) => set({ [row.key]: Number(e.target.value) })}
+              className="w-full accent-foreground"
+            />
+          </div>
+        ))}
+      </ShareLayoutSection>
+      ) : null}
+
+      {layoutTab === 'weight' ? (
+      <ShareLayoutSection
+        title="12 · Font weight"
+        hint="Light · Regular · Medium · SemiBold · Bold · ExtraBold (Google Sans Flex)."
+      >
+        {(
+          [
+            {
+              key: 'nameWeight' as const,
+              label: 'Company',
+              value: style.nameWeight || 'extrabold',
+            },
+            {
+              key: 'sessionWeight' as const,
+              label: 'Session line',
+              value: style.sessionWeight || 'semibold',
+            },
+            {
+              key: 'reasonWeight' as const,
+              label: 'Reason body',
+              value: style.reasonWeight || 'regular',
+            },
+            {
+              key: 'brandWeight' as const,
+              label: 'Track at Trigger',
+              value: style.brandWeight || 'medium',
+            },
+          ] as const
+        ).map((row) => (
+          <div key={row.key} className="space-y-1">
+            <span className="text-xs font-medium">{row.label}</span>
+            <div className="flex flex-wrap gap-1">
+              {SHARE_FONT_WEIGHT_OPTIONS.map((opt) => (
+                <Button
+                  key={opt.id}
+                  type="button"
+                  size="sm"
+                  variant={row.value === opt.id ? 'default' : 'outline'}
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => set({ [row.key]: opt.id })}
+                >
+                  {opt.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </ShareLayoutSection>
+      ) : null}
       </div>
-      <p className="text-[11px] text-muted-foreground">
-        Likely driver text is always shown in full — no word limit.
-      </p>
     </div>
   )
 }
@@ -2406,13 +10139,37 @@ function deviceKey(device: EnabledDevice) {
 export default function NotificationsPage() {
   const { theme, toggleTheme } = useTheme()
   const { toast } = useBottomToast()
-  const [notificationApp, setNotificationApp] = useState<NotificationApp>('trigger')
+  /** Header tabs: Home first (default) · Trigger · 9AM */
+  const [appTab, setAppTab] = useState<AppSwitcherTab>('hub')
+  /** Active push product when not on Home hub */
+  const notificationApp: NotificationApp =
+    appTab === 'nineam' || appTab === 'trigger' ? appTab : 'trigger'
   const [section, setSection] = useState<DashboardSection>('tickers')
   const [tickers, setTickers] = useState<MonitoredTicker[]>([])
+  const [liveQuotes, setLiveQuotes] = useState<Record<string, YahooLiveQuote>>({})
+  const [liveQuotesLastCheckedAt, setLiveQuotesLastCheckedAt] = useState<number | null>(null)
+  const [liveQuotesForTickerKey, setLiveQuotesForTickerKey] = useState('')
   const [listLoading, setListLoading] = useState(true)
   const [listError, setListError] = useState('')
+  const [tickersLoadedForApp, setTickersLoadedForApp] = useState<NotificationApp | null>(null)
   const [activeTicker, setActiveTicker] = useState<string>('')
-  const [tickerSort, setTickerSort] = useState<TickerSortMode>('subscribers')
+  const [tickerSort, setTickerSort] = useState<TickerSortMode>(() =>
+    loadTickerSortPreference(),
+  )
+  const initialMoverSelectionRef = useRef<string | null>(null)
+  const userSelectedTickerRef = useRef(false)
+  const updateTickerSort = useCallback((next: TickerSortMode) => {
+    setTickerSort(next)
+    try {
+      writePref(TICKER_SORT_PREF_KEY, next)
+    } catch {
+      /* localStorage unavailable */
+    }
+  }, [])
+  const selectTickerByUser = useCallback((ticker: string) => {
+    userSelectedTickerRef.current = true
+    setActiveTicker(String(ticker || '').trim().toUpperCase())
+  }, [])
   /** Sidebar Yahoo search — filter list + add missing equities */
   const [tickerSearchQuery, setTickerSearchQuery] = useState('')
   const [tickerSearchOpen, setTickerSearchOpen] = useState(false)
@@ -2420,6 +10177,25 @@ export default function NotificationsPage() {
   const [tickerSearchLoading, setTickerSearchLoading] = useState(false)
   const [tickerAddBusy, setTickerAddBusy] = useState<string | null>(null)
   const tickerSearchRef = useRef<HTMLDivElement | null>(null)
+  /** Stocks sidebar: Users | Extreme (view-only) | Pinned (time-labeled, never Users) */
+  const [stocksListTab, setStocksListTab] = useState<StocksListTab>('users')
+  const stocksListTabRef = useRef<StocksListTab>(stocksListTab)
+  stocksListTabRef.current = stocksListTab
+  const [extremeMovers, setExtremeMovers] = useState<YahooExtremeMover[]>([])
+  const [extremeMoversLoading, setExtremeMoversLoading] = useState(false)
+  const [extremeMoversError, setExtremeMoversError] = useState('')
+  const [extremeMoversFetchedAt, setExtremeMoversFetchedAt] = useState<string | null>(null)
+  const [extremeDirectionTab, setExtremeDirectionTab] =
+    useState<ExtremeDirectionTab>('positive')
+  const [companyProfile, setCompanyProfile] = useState<YahooCompanyProfile | null>(null)
+  const [companyProfileLoading, setCompanyProfileLoading] = useState(false)
+  const [extremePinned, setExtremePinned] = useState<ExtremePinnedItem[]>(() =>
+    loadExtremePinnedCache(),
+  )
+  const extremePinnedSet = useMemo(
+    () => new Set(extremePinned.map((item) => item.ticker.toUpperCase())),
+    [extremePinned],
+  )
   const [tabState, setTabState] = useState<Record<string, TabScrapeState>>({})
   const [creditHint, setCreditHint] = useState<string>('')
   const [firecrawlCredits, setFirecrawlCredits] = useState<{
@@ -2435,11 +10211,19 @@ export default function NotificationsPage() {
   /** fetch_all = ≥4% filter; nine_pm = all new/changed + digest at the end */
   const [fetchAllMode, setFetchAllMode] = useState<'fetch_all' | 'nine_pm'>('fetch_all')
   const [fetchAllRows, setFetchAllRows] = useState<FetchAllTickerRow[]>([])
-  const [fetchAllAlertBusyKey, setFetchAllAlertBusyKey] = useState<string | null>(null)
   const [fetchAllAlertMsg, setFetchAllAlertMsg] = useState<Record<string, string>>({})
   const [fetchAllAlertAllBusy, setFetchAllAlertAllBusy] = useState(false)
   const [fetchAllDigestMsg, setFetchAllDigestMsg] = useState('')
-  const [usagePopup, setUsagePopup] = useState<null | 'gemini' | 'firecrawl'>(null)
+  const [usagePopup, setUsagePopup] = useState<
+    null | 'gemini' | 'firecrawl' | 'perplexity'
+  >(null)
+  const [perplexityTotals, setPerplexityTotals] = useState<{
+    total_cost_usd?: number
+    total_cost_usd_display?: string
+    total_credits?: number
+    total_tokens?: number
+    total_calls?: number
+  } | null>(null)
   /** X / Twitter thread composer (review → Start opens new tab with tweet 1) */
   const [tweetComposerOpen, setTweetComposerOpen] = useState(false)
   const [tweetThread, setTweetThread] = useState<MomentumTweetThread | null>(null)
@@ -2457,6 +10241,8 @@ export default function NotificationsPage() {
   const [shareCardStyle, setShareCardStyle] = useState<ShareCardStyle>(() =>
     loadShareCardStyle(),
   )
+  /** Side photo on share card (session-only; chart 70% / photo 30%). */
+  const [shareSideImageDataUrl, setShareSideImageDataUrl] = useState<string | null>(null)
 
   /** Persist every layout change so the next Share open keeps the user’s settings. */
   const updateShareCardStyle = useCallback(
@@ -2503,6 +10289,24 @@ export default function NotificationsPage() {
     balance?: { remaining_credits?: number | null; plan_credits?: number | null } | null
     note?: string
   } | null>(null)
+  const [perplexityDailyUsage, setPerplexityDailyUsage] = useState<
+    Array<{
+      day: string
+      cost_usd?: number
+      cost_usd_display?: string
+      credits_used?: number
+      total_tokens?: number
+      calls?: number
+    }>
+  >([])
+  const [perplexityUsageTotals, setPerplexityUsageTotals] = useState<{
+    total_cost_usd_display?: string
+    total_credits?: number
+    total_tokens?: number
+    total_calls?: number
+    balance_note?: string
+    console_url?: string
+  } | null>(null)
   /** Left workspace rail (collapsible) — collapsed by default for more main space. */
   const [workspaceCollapsed, setWorkspaceCollapsed] = useState(true)
   /** Right-side activity log rail (collapsible) — collapsed by default. */
@@ -2524,6 +10328,41 @@ export default function NotificationsPage() {
   const [devices, setDevices] = useState<EnabledDevice[]>([])
   const [devicesLoading, setDevicesLoading] = useState(false)
   const [devicesError, setDevicesError] = useState('')
+  /** Settings: public.app_releases (ios | android | all). */
+  type AppReleaseRow = {
+    id: string
+    min_version: string
+    min_build: number
+    latest_version: string
+    latest_build: number
+    force_update: boolean
+    title?: string | null
+    message?: string | null
+    store_url?: string | null
+    check_eas_update?: boolean
+    enabled?: boolean
+    updated_at?: string | null
+  }
+  type AppReleasePlatform = 'ios' | 'android' | 'all'
+  const [appReleases, setAppReleases] = useState<AppReleaseRow[]>([])
+  const [appReleasePlatform, setAppReleasePlatform] = useState<AppReleasePlatform>('ios')
+  const [appLatestVersion, setAppLatestVersion] = useState('')
+  const [appLatestBuild, setAppLatestBuild] = useState('')
+  const [appMinVersion, setAppMinVersion] = useState('')
+  const [appMinBuild, setAppMinBuild] = useState('')
+  const [appForceUpdate, setAppForceUpdate] = useState(false)
+  const [appCheckEasUpdate, setAppCheckEasUpdate] = useState(true)
+  const [appReleaseEnabled, setAppReleaseEnabled] = useState(true)
+  const [appReleaseTitle, setAppReleaseTitle] = useState('')
+  const [appReleaseMessage, setAppReleaseMessage] = useState('')
+  const [appStoreUrl, setAppStoreUrl] = useState('')
+  const [appSettingsLoading, setAppSettingsLoading] = useState(false)
+  const [appSettingsSaving, setAppSettingsSaving] = useState(false)
+  const [appSettingsError, setAppSettingsError] = useState('')
+  const [appSettingsMessage, setAppSettingsMessage] = useState('')
+  const [appSettingsUpdatedAt, setAppSettingsUpdatedAt] = useState<string | null>(null)
+  const [appSettingsNeedsSchema, setAppSettingsNeedsSchema] = useState(false)
+  const [appSettingsNeedsServiceRole, setAppSettingsNeedsServiceRole] = useState(false)
   /** Selected news article id (single). */
   const [selectedArticleId, setSelectedArticleId] = useState<string | null>(null)
   /** Selected device keys: device_id if present, else expo_push_token. */
@@ -2555,6 +10394,11 @@ export default function NotificationsPage() {
   /** Gemini classify loading / errors keyed by ticker|event_date|field */
   const [geminiBusyKey, setGeminiBusyKey] = useState<string | null>(null)
   const [geminiErrorByKey, setGeminiErrorByKey] = useState<Record<string, string>>({})
+  /**
+   * Monotonic id so a slow Gemini response for date A cannot overwrite the
+   * review dialog opened for date B (felt like “always the date below”).
+   */
+  const geminiRequestSeqRef = useRef(0)
   /** Edit Gemini output before saving to Supabase. */
   const [geminiEditOpen, setGeminiEditOpen] = useState(false)
   const [geminiEditDraft, setGeminiEditDraft] = useState('')
@@ -2603,6 +10447,9 @@ export default function NotificationsPage() {
     thread: MomentumTweetThread
     imageBlob: Blob | null
     imageUrl: string | null
+    /** Native PNG pixel size (export is Full HD by default: 1920×…). */
+    imageWidth: number | null
+    imageHeight: number | null
     cardText: ShareCardTextContent
   } | null>(null)
   /** Last Gemini usage (tokens/credits/cost) keyed by event; also session last for log header. */
@@ -2637,21 +10484,33 @@ export default function NotificationsPage() {
   } | null>(null)
 
   const activeState = activeTicker ? tabState[activeTicker] || emptyTabState() : emptyTabState()
+  /** Push-ready devices only — stopped users never enter alert pools. */
+  const isDeviceAlertable = useCallback((device: EnabledDevice) => {
+    if (device.subscription_status === 'off') return false
+    if (device.enabled === false) return false
+    return true
+  }, [])
+  const alertableDevices = useMemo(
+    () => devices.filter(isDeviceAlertable),
+    [devices, isDeviceAlertable],
+  )
   const movementAlertDevices = useMemo(() => {
     if (!movementAlertTarget) return []
+    // Extreme / Pinned blasts: every notifications-on device, even if not on this ticker.
+    if (movementAlertTarget.allRecipients) return alertableDevices
     const ticker = movementAlertTarget.ticker.toUpperCase()
-    return devices.filter((device) =>
+    return alertableDevices.filter((device) =>
       (device.tickers || []).some((item) => item.toUpperCase() === ticker),
     )
-  }, [devices, movementAlertTarget])
+  }, [alertableDevices, movementAlertTarget])
   const movementAlertSelectedCount = useMemo(() => {
     const selected = new Set(movementAlertDeviceKeys)
     return movementAlertDevices.filter((device) => selected.has(deviceKey(device))).length
   }, [movementAlertDeviceKeys, movementAlertDevices])
   const digestDevices = useMemo(() => {
     const scope = new Set(digestScopeDeviceKeys)
-    return devices.filter((device) => scope.has(deviceKey(device)))
-  }, [devices, digestScopeDeviceKeys])
+    return alertableDevices.filter((device) => scope.has(deviceKey(device)))
+  }, [alertableDevices, digestScopeDeviceKeys])
   const digestSelectedCount = useMemo(() => {
     const selected = new Set(digestSelectedDeviceKeys)
     return digestDevices.filter((device) => selected.has(deviceKey(device))).length
@@ -2707,6 +10566,7 @@ export default function NotificationsPage() {
       // Momentum is stocks-only — drop commodity / crypto / forex / index.
       const next = ((body.tickers || []) as MonitoredTicker[]).filter(isEquityTicker)
       setTickers(next)
+      setTickersLoadedForApp(notificationApp)
       const totalsFromApi = body.gemini_totals as GeminiUsageTotals | undefined
       if (totalsFromApi && typeof totalsFromApi === 'object') {
         setGeminiTotals({
@@ -2720,8 +10580,14 @@ export default function NotificationsPage() {
           sumEventsGeminiUsage(next.flatMap((item) => item.saved_events || [])),
         )
       }
+      // Never steal focus from Extreme / Pinned into the Users list.
       setActiveTicker((current) => {
-        if (current && next.some((item) => item.ticker === current)) return current
+        const cur = String(current || '').trim().toUpperCase()
+        const tab = stocksListTabRef.current
+        if (tab === 'extreme' || tab === 'pinned') {
+          return cur || current || ''
+        }
+        if (cur && next.some((item) => item.ticker.toUpperCase() === cur)) return cur
         return next[0]?.ticker || ''
       })
     } catch (error) {
@@ -2735,53 +10601,76 @@ export default function NotificationsPage() {
     setDevicesLoading(true)
     setDevicesError('')
     try {
+      // Cache-bust so Audience always reflects latest subscribe/stop from Supabase.
       const response = await fetch(
-        `/api/notifications/devices?app=${encodeURIComponent(notificationApp)}`,
+        `/api/notifications/devices?app=${encodeURIComponent(notificationApp)}&_=${Date.now()}`,
       )
       const body = await response.json().catch(() => ({}))
       if (!response.ok) {
         throw new Error(body.error || `Failed to load devices (${response.status})`)
       }
       const next = ((body.devices || []) as EnabledDevice[]).map((device) => {
+        const enabledList = device.enabled_tickers || device.tickers || []
         const cryptoTickers = Array.from(
           new Set([
             ...((device.crypto_tickers || []) as string[]),
-            ...(device.tickers || []).filter(looksLikeCryptoTicker),
+            ...enabledList.filter(looksLikeCryptoTicker),
           ]),
         ).sort()
+        const stockTickers = stockTickersOnly(enabledList)
+        const disabledTickers = stockTickersOnly(device.disabled_tickers || [])
+        const enabled =
+          device.enabled != null
+            ? Boolean(device.enabled)
+            : stockTickers.length > 0 || cryptoTickers.length > 0
+        const subscription_status: EnabledDevice['subscription_status'] =
+          device.subscription_status ||
+          (enabled && disabledTickers.length > 0
+            ? 'partial'
+            : enabled
+              ? 'on'
+              : 'off')
         return {
           ...device,
+          enabled,
+          subscription_status,
+          enabled_tickers: stockTickers,
+          disabled_tickers: disabledTickers,
+          enabled_count: stockTickers.length,
+          disabled_count: disabledTickers.length,
           // Audience chips stay stocks-only; pro signal uses crypto list.
           crypto_tickers: cryptoTickers,
           pro_crypto: Boolean(device.pro_crypto) || cryptoTickers.length > 0,
-          tickers: stockTickersOnly(device.tickers),
+          tickers: stockTickers,
         }
       })
       setDevices(next)
-      // Default: select all when list first loads or was empty.
+      // Selection only among alertable (enabled) devices for sends.
+      const alertableKeys = next.filter((d) => d.enabled).map(deviceKey)
       setSelectedDeviceKeys((prev) => {
-        if (prev.length === 0 && next.length > 0) {
-          return next.map(deviceKey)
-        }
-        // Keep previous selections that still exist; if none remain, select all.
-        const keys = new Set(next.map(deviceKey))
+        if (prev.length === 0 && alertableKeys.length > 0) return alertableKeys
+        const keys = new Set(alertableKeys)
         const kept = prev.filter((k) => keys.has(k))
-        return kept.length ? kept : next.map(deviceKey)
+        return kept.length ? kept : alertableKeys
       })
       setCustomSelectedDeviceKeys((prev) => {
-        if (prev.length === 0 && next.length > 0) {
-          return next.map(deviceKey)
-        }
-        const keys = new Set(next.map(deviceKey))
+        if (prev.length === 0 && alertableKeys.length > 0) return alertableKeys
+        const keys = new Set(alertableKeys)
         const kept = prev.filter((k) => keys.has(k))
-        return kept.length ? kept : next.map(deviceKey)
+        return kept.length ? kept : alertableKeys
       })
-      appendNewsLog('info', `Loaded ${next.length} device(s) with notifications on`, {
-        device_ids: next.map((d) => d.device_id),
-      })
-      appendCustomLog('info', `Loaded ${next.length} device(s) with notifications on`, {
-        device_ids: next.map((d) => d.device_id),
-      })
+      const onCount = next.filter((d) => d.enabled).length
+      const offCount = next.filter((d) => !d.enabled).length
+      appendNewsLog(
+        'info',
+        `Loaded ${next.length} device(s) · ${onCount} notifications on · ${offCount} stopped`,
+        { device_ids: next.map((d) => d.device_id) },
+      )
+      appendCustomLog(
+        'info',
+        `Loaded ${next.length} device(s) · ${onCount} notifications on · ${offCount} stopped`,
+        { device_ids: next.map((d) => d.device_id) },
+      )
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load devices'
       setDevicesError(message)
@@ -2792,49 +10681,267 @@ export default function NotificationsPage() {
     }
   }, [appendNewsLog, appendCustomLog, notificationApp])
 
-  const loadNews = useCallback(
-    async (opts?: { append?: boolean }) => {
-      const append = Boolean(opts?.append)
-      if (append) setNewsLoadingMore(true)
-      else {
-        setNewsLoading(true)
-        setNewsError('')
+  const applyAppReleaseToForm = useCallback((row: AppReleaseRow | null | undefined) => {
+    if (!row) {
+      setAppLatestVersion('')
+      setAppLatestBuild('')
+      setAppMinVersion('')
+      setAppMinBuild('')
+      setAppForceUpdate(false)
+      setAppCheckEasUpdate(true)
+      setAppReleaseEnabled(true)
+      setAppReleaseTitle('')
+      setAppReleaseMessage('')
+      setAppStoreUrl('')
+      setAppSettingsUpdatedAt(null)
+      return
+    }
+    setAppLatestVersion(String(row.latest_version || ''))
+    setAppLatestBuild(
+      row.latest_build == null || Number.isNaN(Number(row.latest_build))
+        ? ''
+        : String(row.latest_build),
+    )
+    setAppMinVersion(String(row.min_version || ''))
+    setAppMinBuild(
+      row.min_build == null || Number.isNaN(Number(row.min_build))
+        ? ''
+        : String(row.min_build),
+    )
+    setAppForceUpdate(Boolean(row.force_update))
+    setAppCheckEasUpdate(row.check_eas_update !== false)
+    setAppReleaseEnabled(row.enabled !== false)
+    setAppReleaseTitle(String(row.title || ''))
+    setAppReleaseMessage(String(row.message || ''))
+    setAppStoreUrl(String(row.store_url || ''))
+    setAppSettingsUpdatedAt(row.updated_at || null)
+  }, [])
+
+  const loadAppSettings = useCallback(async () => {
+    setAppSettingsLoading(true)
+    setAppSettingsError('')
+    setAppSettingsMessage('')
+    setAppSettingsNeedsSchema(false)
+    setAppSettingsNeedsServiceRole(false)
+    try {
+      const response = await fetch(
+        `/api/notifications/app-settings?_=${Date.now()}`,
+      )
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        if (body.needs_schema) setAppSettingsNeedsSchema(true)
+        if (body.needs_service_role) setAppSettingsNeedsServiceRole(true)
+        throw new Error(body.error || `Failed to load settings (${response.status})`)
       }
+      // Load succeeded → table is readable; clear any prior schema warning.
+      setAppSettingsNeedsSchema(false)
+      const releases = (body.releases || []) as AppReleaseRow[]
+      setAppReleases(releases)
+      const current =
+        releases.find((r) => r.id === appReleasePlatform) ||
+        releases[0] ||
+        null
+      if (current && current.id !== appReleasePlatform) {
+        const nextId = current.id as AppReleasePlatform
+        if (nextId === 'ios' || nextId === 'android' || nextId === 'all') {
+          setAppReleasePlatform(nextId)
+        }
+      }
+      applyAppReleaseToForm(current)
+    } catch (error) {
+      setAppSettingsError(
+        error instanceof Error ? error.message : 'Failed to load app settings',
+      )
+    } finally {
+      setAppSettingsLoading(false)
+    }
+  }, [appReleasePlatform, applyAppReleaseToForm])
+
+  const saveAppSettings = useCallback(async () => {
+    setAppSettingsSaving(true)
+    setAppSettingsError('')
+    setAppSettingsMessage('')
+    setAppSettingsNeedsSchema(false)
+    setAppSettingsNeedsServiceRole(false)
+    try {
+      const response = await fetch('/api/notifications/app-settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: appReleasePlatform,
+          latest_version: appLatestVersion.trim(),
+          latest_build: appLatestBuild.trim(),
+          min_version: appMinVersion.trim(),
+          min_build: appMinBuild.trim(),
+          force_update: appForceUpdate,
+          check_eas_update: appCheckEasUpdate,
+          enabled: appReleaseEnabled,
+          title: appReleaseTitle.trim() || null,
+          message: appReleaseMessage.trim() || null,
+          store_url: appStoreUrl.trim() || null,
+        }),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        if (body.needs_schema) setAppSettingsNeedsSchema(true)
+        if (body.needs_service_role || body.code === 'RLS_WRITE_DENIED') {
+          setAppSettingsNeedsServiceRole(true)
+        }
+        throw new Error(body.error || `Save failed (${response.status})`)
+      }
+      const settings = body.settings as AppReleaseRow
+      setAppReleases((prev) => {
+        const next = prev.filter((r) => r.id !== settings.id)
+        next.push(settings)
+        return next.sort((a, b) => a.id.localeCompare(b.id))
+      })
+      applyAppReleaseToForm(settings)
+      setAppSettingsMessage(
+        body.message ||
+          `Saved ${settings.id} · v${settings.latest_version} · build ${settings.latest_build}`,
+      )
+      toast({
+        title: 'App release saved',
+        description: `${settings.id} · v${settings.latest_version} · build ${settings.latest_build}`,
+      })
+    } catch (error) {
+      setAppSettingsError(
+        error instanceof Error ? error.message : 'Failed to save app settings',
+      )
+    } finally {
+      setAppSettingsSaving(false)
+    }
+  }, [
+    appCheckEasUpdate,
+    appForceUpdate,
+    appLatestBuild,
+    appLatestVersion,
+    appMinBuild,
+    appMinVersion,
+    appReleaseEnabled,
+    appReleaseMessage,
+    appReleasePlatform,
+    appReleaseTitle,
+    appStoreUrl,
+    applyAppReleaseToForm,
+    toast,
+  ])
+
+  // When platform tab changes, fill form from cached releases (no extra fetch).
+  useEffect(() => {
+    if (section !== 'settings') return
+    const row = appReleases.find((r) => r.id === appReleasePlatform)
+    if (row) applyAppReleaseToForm(row)
+    else applyAppReleaseToForm(null)
+  }, [appReleasePlatform, appReleases, applyAppReleaseToForm, section])
+
+  /**
+   * Latest Yahoo Finance news for the user's monitored watchlist tickers
+   * (not stale Supabase market_news_articles).
+   */
+  const loadNews = useCallback(
+    async (_opts?: { append?: boolean }) => {
+      // Yahoo feed is a fresh full replace — no Supabase pagination.
+      setNewsLoading(true)
+      setNewsLoadingMore(false)
+      setNewsError('')
       try {
-        const offset = append ? news.length : 0
+        // Prefer monitored tickers already in state; if empty, fetch once.
+        let symbols = tickers
+          .map((t) => String(t.ticker || '').trim().toUpperCase())
+          .filter(Boolean)
+        if (!symbols.length) {
+          try {
+            const tRes = await fetch(
+              `/api/notifications/monitored-tickers?app=${encodeURIComponent(notificationApp)}`,
+            )
+            const tBody = await tRes.json().catch(() => ({}))
+            if (tRes.ok && Array.isArray(tBody.tickers)) {
+              const equity = (tBody.tickers as MonitoredTicker[]).filter(
+                isEquityTicker,
+              )
+              symbols = equity
+                .map((t) => String(t.ticker || '').trim().toUpperCase())
+                .filter(Boolean)
+              setTickers(equity)
+            }
+          } catch {
+            /* optional */
+          }
+        }
+
+        // Dedupe + cap (API allows up to 24)
+        const seen = new Set<string>()
+        const unique: string[] = []
+        for (const s of symbols) {
+          if (seen.has(s)) continue
+          seen.add(s)
+          unique.push(s)
+          if (unique.length >= 24) break
+        }
+
+        if (!unique.length) {
+          setNews([])
+          setNewsTotal(0)
+          setNewsHasMore(false)
+          setSelectedArticleId(null)
+          setNewsError(
+            'No watchlist tickers yet — add monitored stocks under Tickers, then reload news.',
+          )
+          appendNewsLog('warn', 'News skipped — empty watchlist')
+          return
+        }
+
+        const params = new URLSearchParams({
+          tickers: unique.join(','),
+          max_age_days: '14',
+          per_ticker: '8',
+          limit: '48',
+        })
         const response = await fetch(
-          `/api/notifications/news?limit=40&offset=${offset}`,
+          `/api/yahoo/watchlist-news?${params.toString()}`,
         )
         const body = await response.json().catch(() => ({}))
         if (!response.ok) {
-          throw new Error(body.error || `Failed to load news (${response.status})`)
+          throw new Error(
+            body.error || `Failed to load Yahoo news (${response.status})`,
+          )
         }
         const batch = (body.articles || []) as NewsArticle[]
-        setNews((prev) => (append ? [...prev, ...batch] : batch))
-        setNewsTotal(typeof body.total === 'number' ? body.total : null)
-        setNewsHasMore(Boolean(body.has_more))
-        if (!append && batch.length > 0) {
+        setNews(batch)
+        setNewsTotal(
+          typeof body.count === 'number' ? body.count : batch.length,
+        )
+        setNewsHasMore(false)
+        if (batch.length > 0) {
           setSelectedArticleId((current) =>
-            current && batch.some((a) => a.id === current) ? current : batch[0].id,
+            current && batch.some((a) => a.id === current)
+              ? current
+              : batch[0].id,
           )
+        } else {
+          setSelectedArticleId(null)
         }
         appendNewsLog(
           'info',
-          append
-            ? `Loaded ${batch.length} more articles (offset ${offset})`
-            : `Loaded ${batch.length} news articles from Supabase`,
-          { total: body.total, offset },
+          `Loaded ${batch.length} latest Yahoo Finance articles for ${unique.length} watchlist ticker(s) (≤14 days)`,
+          {
+            tickers: unique,
+            errors: body.errors,
+            max_age_days: body.max_age_days,
+          },
         )
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to load news'
-        if (!append) setNewsError(message)
+        const message =
+          error instanceof Error ? error.message : 'Failed to load news'
+        setNewsError(message)
         appendNewsLog('error', message)
       } finally {
         setNewsLoading(false)
         setNewsLoadingMore(false)
       }
     },
-    [appendNewsLog, news.length],
+    [appendNewsLog, notificationApp, tickers],
   )
 
   const loadCreditsHint = useCallback(async () => {
@@ -2864,13 +10971,38 @@ export default function NotificationsPage() {
     }
   }, [])
 
+  const loadPerplexityTotals = useCallback(async () => {
+    try {
+      const response = await fetch('/api/notifications/usage/perplexity?days=90')
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) return
+      setPerplexityTotals({
+        total_cost_usd: Number(body.total_cost_usd) || 0,
+        total_cost_usd_display:
+          body.total_cost_usd_display ||
+          formatUsdCompact(body.total_cost_usd) ||
+          '$0.000000',
+        total_credits: Number(body.total_credits) || 0,
+        total_tokens: Number(body.total_tokens) || 0,
+        total_calls: Number(body.total_calls) || 0,
+      })
+    } catch {
+      // optional
+    }
+  }, [])
+
   useEffect(() => {
+    // Always refresh Perplexity spend totals (shown in top bar / hub)
+    void loadPerplexityTotals()
+    // Home hub: light landing only — load product data when Trigger / 9AM is open
+    if (appTab === 'hub') return
     void loadTickers()
     void loadCreditsHint()
     void loadDevices()
-  }, [loadTickers, loadCreditsHint, loadDevices])
+  }, [appTab, loadTickers, loadCreditsHint, loadPerplexityTotals, loadDevices])
 
   useEffect(() => {
+    if (appTab === 'hub') return
     setDevices([])
     if (notificationApp === 'trigger') {
       setSection((current) =>
@@ -2887,7 +11019,7 @@ export default function NotificationsPage() {
     setDigestScopeDeviceKeys([])
     setDigestSelectedDeviceKeys([])
     setDigestMessage('')
-  }, [notificationApp])
+  }, [appTab, notificationApp])
 
   // When entering News or Custom, refresh devices (and news for News tab).
   useEffect(() => {
@@ -2898,6 +11030,10 @@ export default function NotificationsPage() {
     }
     if (section === 'custom' || section === 'users') {
       void loadDevices()
+      return
+    }
+    if (section === 'settings') {
+      void loadAppSettings()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only on section enter
   }, [section])
@@ -2947,11 +11083,34 @@ export default function NotificationsPage() {
         : `Refresh clicked for ${ticker}`,
     )
     try {
+      const monitorScope = activeMonitorScope(ticker)
+      const symbol = String(ticker || '')
+        .trim()
+        .toUpperCase()
+      // Only create pinned_monitored_tickers rows when already bookmarked / on Pinned tab.
+      // Extreme view-only scrapes must not auto-pin or touch Users.
+      const createIfMissing =
+        monitorScope === 'pinned' &&
+        (stocksListTab === 'pinned' || extremePinnedSet.has(symbol))
       const response = await fetch(
         `/api/notifications/scrape/${encodeURIComponent(ticker)}?auto_save=${
           shouldAutoSave ? '1' : '0'
+        }&monitor_scope=${encodeURIComponent(monitorScope)}${
+          createIfMissing ? '&create_if_missing=1' : ''
         }`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            monitor_scope: monitorScope,
+            create_if_missing: createIfMissing,
+            company_name:
+              tickers.find((row) => row.ticker === ticker)?.company_name ||
+              extremePinned.find((row) => row.ticker === ticker)?.company_name ||
+              extremeMovers.find((row) => row.ticker === ticker)?.company_name ||
+              undefined,
+          }),
+        },
       )
       const body = await response.json().catch(() => ({}))
       if (!response.ok) {
@@ -2990,6 +11149,11 @@ export default function NotificationsPage() {
         failureStage = 'auto-save'
         throw new Error(autoSave?.message || 'Backend did not confirm that the data was saved.')
       }
+      // Extreme/Pinned → only refresh pinned store. Never reload Users list for that path
+      // (Users is subscriber-backed device_monitored_tickers only).
+      if (monitorScope === 'pinned') {
+        void loadPinnedTickers()
+      }
       if (body.credits?.after?.remaining_credits != null) {
         const used = body.credits.used
         setCreditHint(
@@ -3010,8 +11174,10 @@ export default function NotificationsPage() {
       if (
         shouldAutoSave &&
         ((autoSave?.inserted || 0) > 0 || (autoSave?.updated || 0) > 0) &&
-        options?.reloadAfterSave !== false
+        options?.reloadAfterSave !== false &&
+        monitorScope === 'device'
       ) {
+        // Only reload Users list when we actually wrote device_monitored_tickers.
         void loadTickers()
       }
       return result
@@ -3144,6 +11310,7 @@ export default function NotificationsPage() {
           price_change: event.price_change || event.momentum,
           event,
           auto_save: true,
+          monitor_scope: activeMonitorScope(ticker),
         }),
       })
       const body = await response.json().catch(() => ({}))
@@ -3231,7 +11398,6 @@ export default function NotificationsPage() {
     setFetchAllMode(mode)
     setFetchAllRows(initialRows)
     setFetchAllAlertMsg({})
-    setFetchAllAlertBusyKey(null)
     setFetchAllDigestMsg('')
     setFetchAllHitsOpen(true)
     setAllTickersLoading(true)
@@ -3336,7 +11502,7 @@ export default function NotificationsPage() {
   async function handleFetchAllQuickAlert(hit: FetchAllHit) {
     const ticker = hit.ticker.toUpperCase()
     const hitKey = `${ticker}|${hit.event.event_date}`
-    const eligible = devices.filter((device) =>
+    const eligible = alertableDevices.filter((device) =>
       (device.tickers || []).some((item) => item.toUpperCase() === ticker),
     )
     if (!eligible.length) {
@@ -3347,7 +11513,6 @@ export default function NotificationsPage() {
       return
     }
 
-    setFetchAllAlertBusyKey(hitKey)
     setFetchAllAlertMsg((prev) => {
       const next = { ...prev }
       delete next[hitKey]
@@ -3382,8 +11547,6 @@ export default function NotificationsPage() {
       const message = error instanceof Error ? error.message : 'Alert failed'
       setFetchAllAlertMsg((prev) => ({ ...prev, [hitKey]: message }))
       appendLocalLog(ticker, 'error', message)
-    } finally {
-      setFetchAllAlertBusyKey((current) => (current === hitKey ? null : current))
     }
   }
 
@@ -3592,6 +11755,7 @@ export default function NotificationsPage() {
         resolvedCompany,
         style,
         cardText,
+        shareSideImageDataUrl,
       )
       setTweetImageBlob(image?.blob || null)
       setTweetImageUrl(image?.objectUrl || null)
@@ -3615,6 +11779,7 @@ export default function NotificationsPage() {
             tweetRenderCtx.companyName,
             shareCardStyle,
             tweetRenderCtx.cardText,
+            shareSideImageDataUrl,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -3626,6 +11791,10 @@ export default function NotificationsPage() {
             }
             return
           }
+          if (!image) {
+            console.warn('[share] tweet preview render returned null')
+            return
+          }
           setTweetImageUrl((prev) => {
             if (prev) {
               try {
@@ -3634,9 +11803,11 @@ export default function NotificationsPage() {
                 /* ignore */
               }
             }
-            return image?.objectUrl || null
+            return image.objectUrl
           })
-          setTweetImageBlob(image?.blob || null)
+          setTweetImageBlob(image.blob)
+        } catch (err) {
+          console.warn('[share] tweet preview re-render failed', err)
         } finally {
           if (!cancelled) setShareImageRerendering(false)
         }
@@ -3646,9 +11817,9 @@ export default function NotificationsPage() {
       cancelled = true
       window.clearTimeout(timer)
     }
-    // Intentionally depend on style + open + ctx (incl. cardText)
+    // Intentionally depend on style + open + ctx (incl. cardText) + side photo
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shareCardStyle, tweetComposerOpen, tweetRenderCtx])
+  }, [shareCardStyle, tweetComposerOpen, tweetRenderCtx, shareSideImageDataUrl])
 
   /** Same layout sliders / text edits live-update the Share-on-social-media image. */
   useEffect(() => {
@@ -3664,6 +11835,7 @@ export default function NotificationsPage() {
             socialShareCtx.companyName,
             shareCardStyle,
             socialShareCtx.cardText,
+            shareSideImageDataUrl,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -3673,6 +11845,10 @@ export default function NotificationsPage() {
                 /* ignore */
               }
             }
+            return
+          }
+          if (!image) {
+            console.warn('[share] renderMomentumTweetImage returned null')
             return
           }
           setSocialShareCtx((prev) => {
@@ -3686,10 +11862,14 @@ export default function NotificationsPage() {
             }
             return {
               ...prev,
-              imageBlob: image?.blob || null,
-              imageUrl: image?.objectUrl || null,
+              imageBlob: image.blob,
+              imageUrl: image.objectUrl,
+              imageWidth: image.width,
+              imageHeight: image.height,
             }
           })
+        } catch (err) {
+          console.warn('[share] preview re-render failed', err)
         } finally {
           if (!cancelled) setShareImageRerendering(false)
         }
@@ -3706,6 +11886,7 @@ export default function NotificationsPage() {
     socialShareCtx?.ticker,
     socialShareCtx?.event?.event_date,
     socialShareCtx?.cardText,
+    shareSideImageDataUrl,
   ])
 
   async function copyTweetText(text: string, label: string) {
@@ -3741,6 +11922,7 @@ export default function NotificationsPage() {
             tweetRenderCtx.companyName,
             shareCardStyle,
             tweetRenderCtx.cardText,
+            shareSideImageDataUrl,
           )
           blobToCopy = fresh?.blob || null
           if (fresh?.objectUrl) {
@@ -3803,7 +11985,7 @@ export default function NotificationsPage() {
     }
   }
 
-  async function openUsagePopup(kind: 'gemini' | 'firecrawl') {
+  async function openUsagePopup(kind: 'gemini' | 'firecrawl' | 'perplexity') {
     setUsagePopup(kind)
     setUsageLoading(true)
     setUsageError('')
@@ -3816,6 +11998,26 @@ export default function NotificationsPage() {
         setGeminiUsageTotals({
           total_cost_usd_display: body.total_cost_usd_display,
           total_tokens: body.total_tokens,
+        })
+      } else if (kind === 'perplexity') {
+        const response = await fetch('/api/notifications/usage/perplexity?days=90')
+        const body = await response.json().catch(() => ({}))
+        if (!response.ok) throw new Error(body.error || `Failed (${response.status})`)
+        setPerplexityDailyUsage(Array.isArray(body.daily) ? body.daily : [])
+        setPerplexityUsageTotals({
+          total_cost_usd_display: body.total_cost_usd_display,
+          total_credits: body.total_credits,
+          total_tokens: body.total_tokens,
+          total_calls: body.total_calls,
+          balance_note: body.balance?.note,
+          console_url: body.balance?.console_url,
+        })
+        setPerplexityTotals({
+          total_cost_usd: Number(body.total_cost_usd) || 0,
+          total_cost_usd_display: body.total_cost_usd_display,
+          total_credits: Number(body.total_credits) || 0,
+          total_tokens: Number(body.total_tokens) || 0,
+          total_calls: Number(body.total_calls) || 0,
         })
       } else {
         const response = await fetch('/api/notifications/usage/firecrawl?days=30')
@@ -4240,20 +12442,51 @@ export default function NotificationsPage() {
   /**
    * Structure a scrape reason via Gemini (Likely/Secondary driver format).
    * Opens review dialog — does NOT send push. Save writes structured reason to Supabase.
+   *
+   * Important: bind to the *clicked card’s* date only. Snapshot event fields + use the
+   * visible reason draft so we never structure the date below by accident (stale refs /
+   * overlapping async responses).
    */
   async function handleGeminiSummarize(
     ticker: string,
     event: PriceMovementEvent,
     field: 'summary' | 'premarket' = 'summary',
   ) {
-    const key = geminiEventKey(ticker, event, field)
-    // Prefer the original scraped reason when re-running Gemini on an already-classified card.
-    const sourceText =
-      field === 'premarket'
-        ? getPremarketReason(event)
-        : String(event.original_summary || '').trim() ||
-          reasonTextForGemini(event) ||
-          String(event.summary || '').trim()
+    // Snapshot at click time — do not read from live list later (reorder / re-fetch safe).
+    const eventSnapshot: PriceMovementEvent = {
+      ...event,
+      event_date: String(event.event_date || '').slice(0, 10),
+      time_label: event.time_label || null,
+      summary: event.summary,
+      original_summary: event.original_summary,
+      price: event.price,
+      price_change: event.price_change || event.momentum,
+      momentum: event.momentum || event.price_change,
+    }
+    const eventDate = eventSnapshot.event_date
+    const key = geminiEventKey(ticker, eventSnapshot, field)
+    const draftKey = reasonDraftKey(ticker, eventSnapshot)
+    const displayedReason = String(reasonDrafts[draftKey] ?? eventSnapshot.summary ?? '').trim()
+    const alreadyGemini = hasGeminiFormating(eventSnapshot)
+
+    // Prefer what the user sees on *this* card.
+    // Re-run on already-Gemini cards: use original scrape if present, else visible text.
+    let sourceText = ''
+    if (field === 'premarket') {
+      sourceText = getPremarketReason(eventSnapshot)
+    } else if (alreadyGemini) {
+      sourceText =
+        String(eventSnapshot.original_summary || '').trim() ||
+        displayedReason ||
+        reasonTextForGemini(eventSnapshot) ||
+        String(eventSnapshot.summary || '').trim()
+    } else {
+      sourceText =
+        displayedReason ||
+        String(eventSnapshot.original_summary || '').trim() ||
+        reasonTextForGemini(eventSnapshot) ||
+        String(eventSnapshot.summary || '').trim()
+    }
 
     if (!sourceText) {
       setGeminiErrorByKey((prev) => ({
@@ -4266,6 +12499,7 @@ export default function NotificationsPage() {
     const companyName =
       tickers.find((item) => item.ticker === ticker)?.company_name || ticker
 
+    const requestId = ++geminiRequestSeqRef.current
     setGeminiBusyKey(key)
     setGeminiErrorByKey((prev) => {
       const next = { ...prev }
@@ -4277,7 +12511,8 @@ export default function NotificationsPage() {
     appendLocalLog(
       ticker,
       'info',
-      `Gemini: structuring reason for ${event.event_date}…`,
+      `Gemini: structuring reason for ${eventDate}${eventSnapshot.time_label ? ` · ${eventSnapshot.time_label}` : ''}…`,
+      { event_date: eventDate, source_preview: sourceText.slice(0, 160) },
     )
 
     try {
@@ -4289,14 +12524,24 @@ export default function NotificationsPage() {
           text: sourceText,
           ticker,
           company_name: companyName,
-          event_date: event.event_date,
-          price: event.price,
-          price_change: event.price_change || event.momentum,
-          event,
+          event_date: eventDate,
+          price: eventSnapshot.price,
+          price_change: eventSnapshot.price_change || eventSnapshot.momentum,
+          event: eventSnapshot,
           auto_save: false,
+          monitor_scope: activeMonitorScope(ticker),
         }),
       })
       const body = await response.json().catch(() => ({}))
+      // Drop stale responses (user clicked another date while this one was in flight).
+      if (requestId !== geminiRequestSeqRef.current) {
+        appendLocalLog(
+          ticker,
+          'info',
+          `Gemini response ignored (stale) · was for ${eventDate}`,
+        )
+        return
+      }
       // Always surface usage when API returned it (even on validation failure).
       if (body.usage || body.tokens || body.credits_used != null) {
         const usagePayload = rememberGeminiUsage(key, body)
@@ -4306,6 +12551,7 @@ export default function NotificationsPage() {
           tokens: body.tokens,
           max_output_tokens: body.max_output_tokens,
           validation: body.validation,
+          event_date: eventDate,
         })
       }
       if (!response.ok) {
@@ -4322,8 +12568,8 @@ export default function NotificationsPage() {
         )
       }
 
-      // Preview in review dialog + card draft (save on confirm).
-      setGeminiEditTarget({ ticker, event })
+      // Preview in review dialog + card draft (save on confirm) — always the clicked date.
+      setGeminiEditTarget({ ticker, event: eventSnapshot })
       setGeminiEditOriginal(sourceText)
       setGeminiEditDraft(summary)
       setGeminiEditModel(
@@ -4337,7 +12583,7 @@ export default function NotificationsPage() {
       setGeminiEditOpen(true)
       setReasonDrafts((prev) => ({
         ...prev,
-        [reasonDraftKey(ticker, event)]: summary,
+        [draftKey]: summary,
       }))
 
       const usagePayload = rememberGeminiUsage(key, body)
@@ -4345,8 +12591,9 @@ export default function NotificationsPage() {
       appendLocalLog(
         ticker,
         'success',
-        `Gemini structured reason · ${event.event_date} — review & save (not a push)`,
+        `Gemini structured reason · ${eventDate} — review & save (not a push)`,
         {
+          event_date: eventDate,
           model: body.model,
           model_version: body.model_version,
           models_tried: body.models_tried,
@@ -4358,10 +12605,12 @@ export default function NotificationsPage() {
       )
       appendLocalLog(ticker, 'info', usagePayload.message, usagePayload)
     } catch (error) {
+      if (requestId !== geminiRequestSeqRef.current) return
       const message = error instanceof Error ? error.message : 'Gemini structure failed'
       setGeminiErrorByKey((prev) => ({ ...prev, [key]: message }))
-      appendLocalLog(ticker, 'error', message)
+      appendLocalLog(ticker, 'error', `${message} · ${eventDate}`)
     } finally {
+      // Clear busy for this key even if a newer request is running (that one has its own key).
       setGeminiBusyKey((current) => (current === key ? null : current))
     }
   }
@@ -4424,6 +12673,7 @@ export default function NotificationsPage() {
           },
           usage_override: usageOverride,
           auto_save: true,
+          monitor_scope: activeMonitorScope(ticker),
         }),
       })
       const body = await response.json().catch(() => ({}))
@@ -4487,7 +12737,7 @@ export default function NotificationsPage() {
             gemini_formating: true,
           },
         )
-        void loadTickers()
+        reloadAfterWrite(ticker)
         setGeminiEditOpen(false)
         setGeminiEditDraft('')
         setGeminiEditOriginal('')
@@ -4615,6 +12865,7 @@ export default function NotificationsPage() {
               event,
               prompt_template: promptTemplate,
               auto_save: true,
+          monitor_scope: activeMonitorScope(ticker),
             }),
           })
           const body = await response.json().catch(() => ({}))
@@ -4689,7 +12940,7 @@ export default function NotificationsPage() {
         error: failCount ? `${failCount} date(s) failed Gemini` : '',
       })
       appendLocalLog(ticker, failCount ? 'warn' : 'success', message)
-      void loadTickers()
+      reloadAfterWrite(ticker)
       if (failCount === 0) {
         setGeminiPromptOpen(false)
       }
@@ -4702,12 +12953,19 @@ export default function NotificationsPage() {
 
   async function handleSaveReasonEdit(ticker: string, event: PriceMovementEvent) {
     const key = reasonDraftKey(ticker, event)
-    const draft = (reasonDrafts[key] ?? event.summary ?? '').trim()
+    // Prefer explicit user draft; otherwise show cleaned scrape reason (no move %).
+    const draft = reasonDisplayText(event, reasonDrafts[key]).trim()
     const sourcesText =
       sourceDrafts[key] ?? serializeSourcesDraft(event.sources || [])
     const nextSources = parseSourcesDraft(sourcesText, event.sources || [])
     const prevSourcesText = serializeSourcesDraft(event.sources || [])
-    const reasonUnchanged = draft === String(event.summary || '').trim()
+    const storedClean = stripRedundantMovePercentFromReason(
+      String(event.summary || ''),
+      event,
+    ).trim()
+    // Skip save when only residual move-% was display-stripped (nothing user changed).
+    const reasonUnchanged =
+      draft === String(event.summary || '').trim() || draft === storedClean
     const sourcesUnchanged = sourcesText.trim() === prevSourcesText.trim()
     if (!draft) {
       appendLocalLog(ticker, 'warn', `Empty reason not saved for ${event.event_date}`)
@@ -4745,6 +13003,7 @@ export default function NotificationsPage() {
             gemini_formating: event.gemini_formating || Boolean(event.gemini_classified_at),
           },
           auto_save: true,
+          monitor_scope: activeMonitorScope(ticker),
         }),
       })
       const body = await response.json().catch(() => ({}))
@@ -4767,7 +13026,7 @@ export default function NotificationsPage() {
         },
       )
       appendLocalLog(ticker, 'success', `Reason saved for ${event.event_date}`)
-      void loadTickers()
+      reloadAfterWrite(ticker)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Reason save failed'
       appendLocalLog(ticker, 'error', message)
@@ -4841,6 +13100,7 @@ export default function NotificationsPage() {
         resolvedCompany,
         style,
         cardText,
+        shareSideImageDataUrl,
       )
       setSocialShareCtx((prev) => {
         if (prev?.imageUrl) {
@@ -4857,6 +13117,8 @@ export default function NotificationsPage() {
           thread,
           imageBlob: image?.blob || null,
           imageUrl: image?.objectUrl || null,
+          imageWidth: image?.width ?? null,
+          imageHeight: image?.height ?? null,
           cardText,
         }
       })
@@ -4869,20 +13131,38 @@ export default function NotificationsPage() {
     }
   }
 
-  function downloadShareImage(blob: Blob | null, ticker?: string) {
+  function downloadShareImage(
+    blob: Blob | null,
+    ticker?: string,
+    dims?: { width?: number | null; height?: number | null },
+  ) {
     if (!blob) return
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `trigger-${(ticker || 'share').toLowerCase()}-momentum.png`
+    const dimPart =
+      dims?.width && dims?.height ? `-${dims.width}x${dims.height}` : ''
+    a.download = `trigger-${(ticker || 'share').toLowerCase()}-momentum${dimPart}.png`
+    a.rel = 'noopener'
+    document.body.appendChild(a)
     a.click()
+    a.remove()
     window.setTimeout(() => {
       try {
         URL.revokeObjectURL(url)
       } catch {
         /* ignore */
       }
-    }, 1500)
+    }, 2500)
+    const sizeLabel =
+      dims?.width && dims?.height
+        ? `${dims.width}×${dims.height} PNG`
+        : 'Full-resolution PNG'
+    toast({
+      title: 'Image downloaded',
+      description: `${sizeLabel} — open the file (not the in-app preview) for Full HD quality.`,
+      durationMs: 4000,
+    })
   }
 
   /**
@@ -5072,6 +13352,7 @@ export default function NotificationsPage() {
               price_change: event.price_change || event.momentum,
               event,
               auto_save: false,
+          monitor_scope: activeMonitorScope(ticker),
             }),
           })
           const body = await response.json().catch(() => ({}))
@@ -5188,6 +13469,10 @@ export default function NotificationsPage() {
       )
 
       patchTab(ticker, { saving: true, error: '', saveMessage: '', saveIsNoop: false })
+      const saveScope = activeMonitorScope(ticker)
+      const saveSymbol = String(ticker || '')
+        .trim()
+        .toUpperCase()
       const saveResponse = await fetch(
         `/api/notifications/save/${encodeURIComponent(ticker)}`,
         {
@@ -5199,12 +13484,23 @@ export default function NotificationsPage() {
             scraped_at: state.result?.scraped_at,
             source_provider: state.result?.scrape_source || state.result?.source_provider,
             asset_class: state.result?.asset_class,
+            monitor_scope: saveScope,
+            create_if_missing:
+              saveScope === 'pinned' &&
+              (stocksListTab === 'pinned' || extremePinnedSet.has(saveSymbol)),
+            company_name:
+              tickers.find((row) => row.ticker === ticker)?.company_name ||
+              extremePinned.find((row) => row.ticker === ticker)?.company_name ||
+              undefined,
           }),
         },
       )
       const saveBody = await saveResponse.json().catch(() => ({}))
       if (!saveResponse.ok) {
         throw new Error(saveBody.error || `Save failed (${saveResponse.status})`)
+      }
+      if (activeMonitorScope(ticker) === 'pinned') {
+        void loadPinnedTickers()
       }
 
       const noop = saveBody.changed === false
@@ -5260,7 +13556,7 @@ export default function NotificationsPage() {
         total_credits: totalCredits,
         total_cost_usd: Math.round(totalCost * 1e8) / 1e8,
       })
-      void loadTickers()
+      reloadAfterWrite(ticker)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Gemini bulk failed'
       patchTab(ticker, { saving: false, error: message })
@@ -5297,7 +13593,11 @@ export default function NotificationsPage() {
   }
 
   function openTriggerDigest(device?: EnabledDevice) {
-    const candidates = device ? [device] : devices
+    const candidates = device
+      ? isDeviceAlertable(device)
+        ? [device]
+        : []
+      : alertableDevices
     const keys = candidates.map(deviceKey)
     setDigestScopeDeviceKeys(keys)
     setDigestSelectedDeviceKeys(keys)
@@ -5481,15 +13781,40 @@ export default function NotificationsPage() {
     })
 
     try {
+      // Yahoo watchlist articles are not Supabase rows — send headline + url directly.
+      const isYahoo =
+        article.provider === 'yahoo-finance' ||
+        String(article.id || '').startsWith('yahoo-') ||
+        /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(String(article.id || ''))
+      const headerTickers = (article.tickers || [])
+        .slice(0, 4)
+        .map((t) => String(t).toUpperCase())
+        .filter(Boolean)
+      const pushPayload = isYahoo
+        ? {
+            app_key: notificationApp,
+            type: 'news_alert',
+            title:
+              article.impact_body ||
+              (headerTickers.length
+                ? headerTickers.join(' · ')
+                : 'Yahoo Finance'),
+            body: article.title,
+            headline: article.title,
+            url: article.url || null,
+            device_ids: selected.map((d) => d.device_id).filter(Boolean),
+            expo_push_tokens: selected.map((d) => d.expo_push_token),
+          }
+        : {
+            app_key: notificationApp,
+            article_id: article.id,
+            device_ids: selected.map((d) => d.device_id).filter(Boolean),
+            expo_push_tokens: selected.map((d) => d.expo_push_token),
+          }
       const response = await fetch('/api/notifications/alert-news', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          app_key: notificationApp,
-          article_id: article.id,
-          device_ids: selected.map((d) => d.device_id).filter(Boolean),
-          expo_push_tokens: selected.map((d) => d.expo_push_token),
-        }),
+        body: JSON.stringify(pushPayload),
       })
       const body = await response.json().catch(() => ({}))
       if (!response.ok) {
@@ -5515,6 +13840,7 @@ export default function NotificationsPage() {
         channel_note: body.channel_note,
         sample_expo_payload: body.sample_expo_payload,
         ios_nse_required: body.ios_nse_required,
+        source: isYahoo ? 'yahoo-finance' : 'supabase',
       })
       appendNewsLog('info', 'Text-only notification payload', body.sample_expo_payload || null)
     } catch (error) {
@@ -5529,11 +13855,27 @@ export default function NotificationsPage() {
 
   async function openMovementAlert(ticker: string, event: PriceMovementEvent | null = null) {
     const normalizedTicker = ticker.toUpperCase()
-    const eligible = devices.filter((device) =>
-      (device.tickers || []).some((item) => item.toUpperCase() === normalizedTicker),
-    )
-    setMovementAlertTarget({ ticker: normalizedTicker, event })
-    setMovementAlertDeviceKeys(eligible.map(deviceKey))
+    // Extreme / Pinned stocks usually have zero subscribers for that ticker — still list everyone.
+    const allRecipients =
+      stocksListTab === 'extreme' ||
+      stocksListTab === 'pinned' ||
+      extremePinnedSet.has(normalizedTicker)
+    const eligible = allRecipients
+      ? alertableDevices
+      : alertableDevices.filter((device) =>
+          (device.tickers || []).some((item) => item.toUpperCase() === normalizedTicker),
+        )
+    // All-recipients mode: nothing pre-selected (Select all / pick manually).
+    // Subscriber mode: pre-select everyone watching this ticker (existing behaviour).
+    const defaultKeys = allRecipients ? [] : eligible.map(deviceKey)
+    const companyName =
+      tickers.find((row) => row.ticker === normalizedTicker)?.company_name ||
+      extremePinned.find((row) => row.ticker === normalizedTicker)?.company_name ||
+      extremeMovers.find((row) => row.ticker === normalizedTicker)?.company_name ||
+      normalizedTicker
+
+    setMovementAlertTarget({ ticker: normalizedTicker, event, allRecipients })
+    setMovementAlertDeviceKeys(defaultKeys)
     setMovementAlertOpen(true)
     setMovementPreviewTitle('')
     setMovementPreviewBody('')
@@ -5542,7 +13884,9 @@ export default function NotificationsPage() {
     appendLocalLog(ticker, 'info', 'Alert recipient picker opened', {
       app_key: notificationApp,
       event_date: event?.event_date || 'latest saved',
-      default_selected: eligible.length,
+      all_recipients: allRecipients,
+      pool_size: eligible.length,
+      default_selected: defaultKeys.length,
       device_ids: eligible.map((device) => device.device_id),
     })
     try {
@@ -5554,6 +13898,8 @@ export default function NotificationsPage() {
           body: JSON.stringify({
             app_key: notificationApp,
             event,
+            company_name: companyName,
+            all_recipients: allRecipients,
           }),
         },
       )
@@ -5596,9 +13942,16 @@ export default function NotificationsPage() {
       alertMessage: '',
       alertIsError: false,
     })
+    const companyName =
+      tickers.find((row) => row.ticker === ticker)?.company_name ||
+      extremePinned.find((row) => row.ticker === ticker)?.company_name ||
+      extremeMovers.find((row) => row.ticker === ticker)?.company_name ||
+      ticker
+
     appendLocalLog(ticker, 'info', `Sending selected movement alert for ${ticker}`, {
       app_key: notificationApp,
       event_date: movementAlertTarget.event?.event_date || 'latest saved',
+      all_recipients: Boolean(movementAlertTarget.allRecipients),
       recipient_count: selected.length,
       device_ids: selected.map((device) => device.device_id),
     })
@@ -5612,6 +13965,8 @@ export default function NotificationsPage() {
           event: movementAlertTarget.event,
           title: movementPreviewTitle.trim() || undefined,
           body: movementPreviewBody.trim() || undefined,
+          company_name: companyName,
+          all_recipients: Boolean(movementAlertTarget.allRecipients),
           device_ids: selected.map((device) => device.device_id).filter(Boolean),
           expo_push_tokens: selected.map((device) => device.expo_push_token),
         }),
@@ -5683,6 +14038,13 @@ export default function NotificationsPage() {
     })
     try {
       // Only new + content-changed dates are written; already-saved dates are skipped server-side.
+      const monitorScope = activeMonitorScope(ticker)
+      const symbol = String(ticker || '')
+        .trim()
+        .toUpperCase()
+      const createIfMissing =
+        monitorScope === 'pinned' &&
+        (stocksListTab === 'pinned' || extremePinnedSet.has(symbol))
       const response = await fetch(`/api/notifications/save/${encodeURIComponent(ticker)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -5690,6 +14052,12 @@ export default function NotificationsPage() {
           events,
           source_url: state.result?.url,
           scraped_at: state.result?.scraped_at,
+          monitor_scope: monitorScope,
+          create_if_missing: createIfMissing,
+          company_name:
+            tickers.find((row) => row.ticker === ticker)?.company_name ||
+            extremePinned.find((row) => row.ticker === ticker)?.company_name ||
+            undefined,
         }),
       })
       const body = await response.json().catch(() => ({}))
@@ -5702,6 +14070,10 @@ export default function NotificationsPage() {
         (noop
           ? 'No changes — same content already saved.'
           : `Saved ${body.inserted || 0} new / ${body.updated || 0} updated date(s).`)
+
+      if (monitorScope === 'pinned') {
+        void loadPinnedTickers()
+      }
 
       // Mark written events as saved in the local timeline.
       const written = new Set<string>([
@@ -5755,7 +14127,7 @@ export default function NotificationsPage() {
         total_saved_events: body.total_saved_events,
         structure: body.structure,
       })
-      if (!noop) void loadTickers()
+      if (!noop) reloadAfterWrite(ticker)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Save failed'
       patchTab(ticker, { saving: false, error: message })
@@ -5763,15 +14135,360 @@ export default function NotificationsPage() {
     }
   }
 
-  const activeMeta = useMemo(
-    () => tickers.find((item) => item.ticker === activeTicker) || null,
-    [tickers, activeTicker],
+  const monitoredTickerSet = useMemo(
+    () => new Set(tickers.map((item) => item.ticker.toUpperCase())),
+    [tickers],
   )
 
-  /** Stocks-only list (categories removed — no commodity/crypto/forex/index). */
+  /**
+   * Users → device_monitored_tickers (real app subscribers only)
+   * Extreme/Pinned → pinned_monitored_tickers (never writes into Users)
+   */
+  const activeMonitorScope = useCallback(
+    (ticker?: string): 'device' | 'pinned' => {
+      const symbol = String(ticker || activeTicker || '')
+        .trim()
+        .toUpperCase()
+      // Explicit Extreme / Pinned tabs always use the pinned store.
+      if (stocksListTab === 'extreme' || stocksListTab === 'pinned') return 'pinned'
+      // Pinned bookmark that is not a real subscriber stock stays pinned even if
+      // the sidebar briefly sits on Users (e.g. after a background reload).
+      if (symbol && extremePinnedSet.has(symbol)) {
+        const userRow = tickers.find((row) => row.ticker.toUpperCase() === symbol)
+        const realSubs = (userRow?.subscriber_count ?? 0) > 0
+        if (!realSubs) return 'pinned'
+      }
+      return 'device'
+    },
+    [stocksListTab, activeTicker, extremePinnedSet, tickers],
+  )
+
+  // Company fundamentals under logo (market cap, about, sector, …)
+  useEffect(() => {
+    if (!activeTicker) {
+      setCompanyProfile(null)
+      setCompanyProfileLoading(false)
+      return
+    }
+    let cancelled = false
+    const controller = new AbortController()
+    setCompanyProfileLoading(true)
+    setCompanyProfile(null)
+    fetchYahooCompanyProfile(activeTicker, controller.signal)
+      .then((body) => {
+        if (cancelled) return
+        setCompanyProfile(body.profile || null)
+      })
+      .catch(() => {
+        if (!cancelled) setCompanyProfile(null)
+      })
+      .finally(() => {
+        if (!cancelled) setCompanyProfileLoading(false)
+      })
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [activeTicker])
+
+  const activeMeta = useMemo((): MonitoredTicker | null => {
+    if (!activeTicker) return null
+    const symbol = String(activeTicker).trim().toUpperCase()
+    const isPinnedBookmark = extremePinnedSet.has(symbol)
+    const userRow =
+      tickers.find((item) => item.ticker.toUpperCase() === symbol) || null
+    const realSubs = (userRow?.subscriber_count ?? 0) > 0
+
+    // Extreme / Pinned tabs never pull Users/device meta (no fake subscribers / unsubscribe UI).
+    const usePinnedMeta =
+      stocksListTab === 'extreme' ||
+      stocksListTab === 'pinned' ||
+      (isPinnedBookmark && !realSubs)
+
+    if (usePinnedMeta) {
+      const pinned = extremePinned.find((row) => row.ticker.toUpperCase() === symbol)
+      if (pinned) {
+        return {
+          ticker: pinned.ticker,
+          company_name: pinned.company_name || pinned.ticker,
+          created_at: pinned.pinned_at,
+          updated_at: pinned.last_saved_at || pinned.pinned_at,
+          has_saved_movements: Boolean(
+            pinned.has_saved_movements || (pinned.saved_event_count ?? 0) > 0,
+          ),
+          saved_event_count: pinned.saved_event_count ?? pinned.saved_events?.length ?? 0,
+          last_saved_at: pinned.last_saved_at || null,
+          // Pinned store has no app subscribers — never surface Users unsubscribe state.
+          subscriber_count: 0,
+          device_ids: [],
+          saved_events: pinned.saved_events || [],
+          asset_class: 'equity',
+          scrape_source: 'perplexity',
+        }
+      }
+      // Extreme view-only (not bookmarked yet)
+      if (stocksListTab === 'extreme') {
+        const mover = extremeMovers.find((row) => row.ticker.toUpperCase() === symbol)
+        return {
+          ticker: symbol,
+          company_name: mover?.company_name || symbol,
+          subscriber_count: 0,
+          device_ids: [],
+          saved_event_count: 0,
+          saved_events: [],
+          asset_class: 'equity',
+          scrape_source: 'perplexity',
+        }
+      }
+      // Pinned tab but row not loaded yet — do NOT fall through to Users.
+      if (stocksListTab === 'pinned' || isPinnedBookmark) {
+        return {
+          ticker: symbol,
+          company_name: symbol,
+          subscriber_count: 0,
+          device_ids: [],
+          saved_event_count: 0,
+          saved_events: [],
+          asset_class: 'equity',
+          scrape_source: 'perplexity',
+        }
+      }
+    }
+
+    // Users tab only: real subscriber-backed rows
+    return userRow
+  }, [
+    activeTicker,
+    stocksListTab,
+    extremePinned,
+    extremePinnedSet,
+    extremeMovers,
+    tickers,
+  ])
+
+  const liveTickerKey = useMemo(() => {
+    const set = new Set(tickers.map((item) => item.ticker.toUpperCase()).filter(Boolean))
+    for (const item of extremePinned) {
+      if (item.ticker) set.add(item.ticker.toUpperCase())
+    }
+    if (activeTicker) set.add(activeTicker.toUpperCase())
+    return [...set].sort().join(',')
+  }, [tickers, extremePinned, activeTicker])
+
+  // Keep list percentages and the selected ticker price fresh from Yahoo every 5 seconds.
+  useEffect(() => {
+    const symbols = liveTickerKey.split(',').filter(Boolean)
+    if (!symbols.length) {
+      setLiveQuotes({})
+      setLiveQuotesForTickerKey('')
+      return
+    }
+
+    let cancelled = false
+    let requestRunning = false
+    let activeController: AbortController | null = null
+    const refresh = async () => {
+      if (requestRunning) return
+      requestRunning = true
+      activeController = new AbortController()
+      try {
+        const body = await fetchYahooQuotes(symbols, activeController.signal)
+        if (!cancelled) {
+          setLiveQuotes(body.quotes || {})
+          setLiveQuotesForTickerKey(symbols.join(','))
+          const fetchedAt = Date.parse(body.fetchedAt)
+          setLiveQuotesLastCheckedAt(Number.isFinite(fetchedAt) ? fetchedAt : Date.now())
+        }
+      } catch {
+        // Preserve the last successful values during a temporary Yahoo/network failure.
+      } finally {
+        requestRunning = false
+        activeController = null
+      }
+    }
+
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 5_000)
+    return () => {
+      cancelled = true
+      activeController?.abort()
+      window.clearInterval(timer)
+    }
+  }, [liveTickerKey])
+
+  const activeLiveQuote = activeTicker ? liveQuotes[activeTicker.toUpperCase()] : null
+  const activeMarketSession = yahooMarketSession(activeLiveQuote)
+  const extremeActiveMeta = useMemo(() => {
+    if (!activeTicker) return null
+    const symbol = activeTicker.toUpperCase()
+    const pinned = extremePinned.find((row) => row.ticker === symbol)
+    if (pinned) return pinned
+    const mover = extremeMovers.find((row) => row.ticker === symbol)
+    if (mover) {
+      return {
+        ticker: mover.ticker,
+        company_name: mover.company_name,
+        pinned_at: '',
+        change_percent: mover.regularMarketChangePercent,
+        currency: mover.currency || null,
+      } satisfies ExtremePinnedItem
+    }
+    return null
+  }, [activeTicker, extremePinned, extremeMovers])
+
+  const activeCompanyName =
+    activeMeta?.company_name && activeMeta.company_name !== activeTicker
+      ? activeMeta.company_name
+      : extremeActiveMeta?.company_name && extremeActiveMeta.company_name !== activeTicker
+        ? extremeActiveMeta.company_name
+        : activeLiveQuote?.shortName || activeTicker
+  const activeMarketPillItems: MarketDataPillItem[] = (() => {
+    if (!activeLiveQuote) return []
+
+    const item = (
+      label: string,
+      price: number | null | undefined,
+      percent: number | null | undefined,
+      sourceTimestamp: string | null | undefined,
+      statusOnly = false,
+    ): MarketDataPillItem => {
+      const priceTimestamp =
+        sourceTimestamp ||
+        (liveQuotesLastCheckedAt ? new Date(liveQuotesLastCheckedAt).toISOString() : null)
+      return {
+        label,
+        price: price ?? null,
+        percent: percent ?? null,
+        source: 'Yahoo',
+        href: yahooQuoteUrl(activeTicker),
+        sourceRefreshSeconds: 5,
+        updatedAt: sourceTimestamp,
+        priceTimeLabel: statusOnly
+          ? null
+          : formatMarketTimestamp(priceTimestamp, 'America/New_York'),
+        priceTimestamp: statusOnly ? null : priceTimestamp,
+        statusOnly,
+      }
+    }
+
+    if (activeMarketSession === 'regular') {
+      return [
+        item(
+          'Regular session',
+          activeLiveQuote.regularMarketPrice,
+          activeLiveQuote.regularMarketChangePercent,
+          activeLiveQuote.regularMarketTime,
+        ),
+      ]
+    }
+
+    // Labels + fields match Yahoo Finance quote page + API marketState
+    const items: MarketDataPillItem[] = []
+    if (activeMarketSession === 'premarket') {
+      // marketState PRE → preMarket*
+      items.push(
+        item(
+          'Pre-market',
+          activeLiveQuote.preMarketPrice,
+          activeLiveQuote.preMarketChangePercent,
+          activeLiveQuote.preMarketTime,
+          activeLiveQuote.preMarketPrice == null,
+        ),
+      )
+    } else if (activeMarketSession === 'after-hours') {
+      // marketState POST | POSTPOST → postMarket*
+      items.push(
+        item(
+          'After-hours',
+          activeLiveQuote.postMarketPrice,
+          activeLiveQuote.postMarketChangePercent,
+          activeLiveQuote.postMarketTime,
+          activeLiveQuote.postMarketPrice == null,
+        ),
+      )
+    } else if (activeMarketSession === 'overnight') {
+      // marketState PREPRE → Overnight (Yahoo API still uses postMarket* fields)
+      items.push(
+        item(
+          'Overnight',
+          activeLiveQuote.postMarketPrice,
+          activeLiveQuote.postMarketChangePercent,
+          activeLiveQuote.postMarketTime,
+          activeLiveQuote.postMarketPrice == null,
+        ),
+      )
+    } else if (activeMarketSession === 'closed') {
+      // marketState CLOSED → At close only (no fake Pre-market / Overnight)
+      items.push(item('Market', null, null, null, true))
+    }
+
+    // Always show regular session close for reference (Yahoo “At close”)
+    if (activeMarketSession !== 'regular') {
+      items.push(
+        item(
+          'At close',
+          activeLiveQuote.regularMarketPrice,
+          activeLiveQuote.regularMarketChangePercent,
+          activeLiveQuote.regularMarketTime,
+        ),
+      )
+    }
+    return items
+  })()
+
+  useEffect(() => {
+    initialMoverSelectionRef.current = null
+    userSelectedTickerRef.current = false
+  }, [notificationApp])
+
+  // Once the first Yahoo batch arrives, open the stock with the largest
+  // absolute percentage move. This runs once per app and never overrides a
+  // ticker the user has already selected themselves.
+  useEffect(() => {
+    if (!liveQuotesLastCheckedAt || !tickers.length) return
+    if (tickersLoadedForApp !== notificationApp) return
+    if (liveQuotesForTickerKey !== liveTickerKey) return
+    if (initialMoverSelectionRef.current === notificationApp) return
+    if (userSelectedTickerRef.current) {
+      initialMoverSelectionRef.current = notificationApp
+      return
+    }
+
+    let largestTicker = ''
+    let largestAbsoluteMove = -1
+    for (const item of tickers) {
+      const percent = currentMarketQuoteValues(
+        liveQuotes[item.ticker.toUpperCase()],
+      ).percent
+      if (percent == null || !Number.isFinite(percent)) continue
+      const absoluteMove = Math.abs(percent)
+      if (absoluteMove > largestAbsoluteMove) {
+        largestTicker = item.ticker
+        largestAbsoluteMove = absoluteMove
+      }
+    }
+
+    if (!largestTicker) return
+    initialMoverSelectionRef.current = notificationApp
+    setActiveTicker(largestTicker)
+  }, [
+    liveQuotes,
+    liveQuotesForTickerKey,
+    liveQuotesLastCheckedAt,
+    liveTickerKey,
+    notificationApp,
+    tickers,
+    tickersLoadedForApp,
+  ])
+
+  /**
+   * Users list only: equities with ≥1 real subscriber for this app.
+   * Extreme → Pinned bookmarks never appear here unless real devices also
+   * subscribed to that ticker (then both lists can show it for different reasons).
+   */
   const filteredTickers = useMemo(() => {
     const q = tickerSearchQuery.trim().toLowerCase()
-    let list = [...tickers]
+    let list = tickers.filter((item) => (item.subscriber_count ?? 0) > 0)
     if (q) {
       list = list.filter((item) => {
         const t = item.ticker.toLowerCase()
@@ -5780,6 +14497,32 @@ export default function NotificationsPage() {
       })
     }
     list.sort((a, b) => {
+      if (
+        tickerSort === 'movement' ||
+        tickerSort === 'movement_pos_to_neg' ||
+        tickerSort === 'movement_neg_to_pos'
+      ) {
+        const aMove = currentMarketQuoteValues(liveQuotes[a.ticker.toUpperCase()]).percent
+        const bMove = currentMarketQuoteValues(liveQuotes[b.ticker.toUpperCase()]).percent
+        // Missing quotes always sink to the bottom for any movement sort.
+        if (aMove == null && bMove == null) return a.ticker.localeCompare(b.ticker)
+        if (aMove == null) return 1
+        if (bMove == null) return -1
+
+        let diff = 0
+        if (tickerSort === 'movement') {
+          // Absolute % movement: largest swing first (e.g. -8% before +3%)
+          diff = Math.abs(bMove) - Math.abs(aMove)
+        } else if (tickerSort === 'movement_pos_to_neg') {
+          // Signed: highest gainers → biggest losers (e.g. +12%, +5%, -1%, -9%)
+          diff = bMove - aMove
+        } else {
+          // Signed: biggest losers → highest gainers (e.g. -9%, -1%, +5%, +12%)
+          diff = aMove - bMove
+        }
+        if (diff !== 0) return diff
+        return a.ticker.localeCompare(b.ticker)
+      }
       if (tickerSort === 'subscribers') {
         const diff = (b.subscriber_count ?? 0) - (a.subscriber_count ?? 0)
         if (diff !== 0) return diff
@@ -5801,12 +14544,12 @@ export default function NotificationsPage() {
       return a.ticker.localeCompare(b.ticker)
     })
     return list
-  }, [tickers, tickerSort, tickerSearchQuery])
-
-  const monitoredTickerSet = useMemo(
-    () => new Set(tickers.map((item) => item.ticker.toUpperCase())),
-    [tickers],
-  )
+  }, [
+    tickers,
+    tickerSort,
+    tickerSearchQuery,
+    liveQuotes,
+  ])
 
   // Debounced Yahoo Finance search for the sidebar add/search box
   useEffect(() => {
@@ -5863,7 +14606,7 @@ export default function NotificationsPage() {
         .replace(/[^A-Z0-9.^_=\-]/g, '')
       if (!ticker) return
       if (monitoredTickerSet.has(ticker)) {
-        setActiveTicker(ticker)
+        selectTickerByUser(ticker)
         setTickerSearchQuery('')
         setTickerSearchOpen(false)
         toast({ title: `${ticker} already in list`, description: 'Selected in the sidebar.' })
@@ -5884,7 +14627,7 @@ export default function NotificationsPage() {
           throw new Error(body.error || `Failed to add ${ticker}`)
         }
         await loadTickers()
-        setActiveTicker(ticker)
+        selectTickerByUser(ticker)
         setTickerSearchQuery('')
         setTickerSearchOpen(false)
         toast({
@@ -5901,11 +14644,201 @@ export default function NotificationsPage() {
         setTickerAddBusy(null)
       }
     },
-    [loadTickers, monitoredTickerSet, toast],
+    [loadTickers, monitoredTickerSet, selectTickerByUser, toast],
   )
 
-  // Keep the active ticker inside the stocks list.
+  const loadExtremeMovers = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setExtremeMoversLoading(true)
+    setExtremeMoversError('')
+    try {
+      // Yahoo Day Gainers + Day Losers, abs ≥10% (no $1B filter — full top lists).
+      const body = await fetchYahooExtremeMovers({
+        minPercent: 10,
+        minMarketCap: 0,
+        count: 100,
+      })
+      setExtremeMovers(Array.isArray(body.movers) ? body.movers : [])
+      setExtremeMoversFetchedAt(body.fetchedAt || new Date().toISOString())
+    } catch (error) {
+      setExtremeMoversError(
+        error instanceof Error ? error.message : 'Failed to load extreme movers',
+      )
+    } finally {
+      if (!opts?.silent) setExtremeMoversLoading(false)
+    }
+  }, [])
+
+  /** Extreme: split by sign, largest absolute % first within each tab. */
+  const filteredExtremeMovers = useMemo(() => {
+    const list = extremeMovers.filter((item) => {
+      const pct = Number(item.regularMarketChangePercent)
+      if (!Number.isFinite(pct) || pct === 0) return false
+      return extremeDirectionTab === 'positive' ? pct > 0 : pct < 0
+    })
+    list.sort(
+      (a, b) =>
+        Math.abs(Number(b.regularMarketChangePercent) || 0) -
+          Math.abs(Number(a.regularMarketChangePercent) || 0) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    return list
+  }, [extremeMovers, extremeDirectionTab])
+
+  const extremePositiveCount = useMemo(
+    () =>
+      extremeMovers.filter((item) => Number(item.regularMarketChangePercent) > 0).length,
+    [extremeMovers],
+  )
+  const extremeNegativeCount = useMemo(
+    () =>
+      extremeMovers.filter((item) => Number(item.regularMarketChangePercent) < 0).length,
+    [extremeMovers],
+  )
+
+  // Load Extreme tab from Yahoo when opened (and refresh while it stays open).
   useEffect(() => {
+    if (stocksListTab !== 'extreme' || section !== 'tickers') return
+    void loadExtremeMovers()
+    const timer = window.setInterval(() => {
+      void loadExtremeMovers({ silent: true })
+    }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [stocksListTab, section, loadExtremeMovers])
+
+  const loadPinnedTickers = useCallback(async () => {
+    try {
+      const response = await fetch('/api/notifications/pinned-tickers')
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        // Table may not exist yet — keep local cache, surface once.
+        if (response.status === 503 || body.code === 'pinned_table_missing') {
+          console.warn(body.error || 'pinned_monitored_tickers missing')
+          return
+        }
+        throw new Error(body.error || `Failed to load pinned (${response.status})`)
+      }
+      const rows = Array.isArray(body.tickers) ? (body.tickers as ExtremePinnedItem[]) : []
+      const next = rows.map((row) => ({
+        ...row,
+        ticker: String(row.ticker || '').toUpperCase(),
+        company_name: row.company_name || row.ticker,
+        pinned_at: row.pinned_at || new Date().toISOString(),
+        monitor_scope: 'pinned' as const,
+      }))
+      setExtremePinned(next)
+      cacheExtremePinned(next)
+    } catch (error) {
+      console.warn('loadPinnedTickers', error)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadPinnedTickers()
+  }, [loadPinnedTickers])
+
+  /** After scrape/save/Gemini, refresh the correct list — never dump pinned into Users. */
+  const reloadAfterWrite = useCallback(
+    (ticker?: string) => {
+      if (activeMonitorScope(ticker) === 'pinned') void loadPinnedTickers()
+      else void loadTickers()
+    },
+    [activeMonitorScope, loadPinnedTickers, loadTickers],
+  )
+
+  /** One-click pin / unpin — writes pinned_monitored_tickers, never Users list. */
+  const togglePinExtreme = useCallback(
+    async (item: {
+      ticker: string
+      company_name?: string | null
+      regularMarketChangePercent?: number | null
+      change_percent?: number | null
+      currency?: string | null
+    }) => {
+      const ticker = String(item.ticker || '')
+        .trim()
+        .toUpperCase()
+      if (!ticker) return
+      const companyName = String(item.company_name || ticker).trim() || ticker
+      const pct =
+        item.regularMarketChangePercent != null &&
+        Number.isFinite(item.regularMarketChangePercent)
+          ? item.regularMarketChangePercent
+          : item.change_percent != null && Number.isFinite(item.change_percent)
+            ? item.change_percent
+            : null
+
+      if (extremePinnedSet.has(ticker)) {
+        try {
+          const response = await fetch(
+            `/api/notifications/pinned-tickers/${encodeURIComponent(ticker)}`,
+            { method: 'DELETE' },
+          )
+          const body = await response.json().catch(() => ({}))
+          if (!response.ok) throw new Error(body.error || 'Unpin failed')
+          setExtremePinned((prev) => {
+            const next = prev.filter((row) => row.ticker !== ticker)
+            cacheExtremePinned(next)
+            return next
+          })
+          toast({ title: `Unpinned ${ticker}` })
+        } catch (error) {
+          toast({
+            title: `Could not unpin ${ticker}`,
+            description: error instanceof Error ? error.message : 'Unpin failed',
+            variant: 'destructive',
+          })
+        }
+        return
+      }
+
+      try {
+        const response = await fetch('/api/notifications/pinned-tickers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker, company_name: companyName }),
+        })
+        const body = await response.json().catch(() => ({}))
+        if (!response.ok) throw new Error(body.error || 'Pin failed')
+        const nextItem: ExtremePinnedItem = {
+          ticker,
+          company_name: companyName,
+          pinned_at: new Date().toISOString(),
+          change_percent: pct,
+          currency: item.currency || 'USD',
+          monitor_scope: 'pinned',
+          saved_event_count: 0,
+          saved_events: [],
+        }
+        setExtremePinned((prev) => {
+          const without = prev.filter((row) => row.ticker !== ticker)
+          const next = [nextItem, ...without]
+          cacheExtremePinned(next)
+          return next
+        })
+        setStocksListTab('pinned')
+        selectTickerByUser(ticker)
+        toast({
+          title: `Pinned ${ticker}`,
+          description: 'Stored in pinned_monitored_tickers · not Users',
+        })
+        void loadPinnedTickers()
+      } catch (error) {
+        toast({
+          title: `Could not pin ${ticker}`,
+          description:
+            error instanceof Error
+              ? error.message
+              : 'Pin failed — run schema_pinned_monitored_tickers.sql?',
+          variant: 'destructive',
+        })
+      }
+    },
+    [extremePinnedSet, loadPinnedTickers, selectTickerByUser, toast],
+  )
+
+  // Keep the active ticker inside the Users stocks list (don't clobber Extreme/Pinned picks).
+  useEffect(() => {
+    if (stocksListTab !== 'users') return
     if (!filteredTickers.length) {
       if (activeTicker) setActiveTicker('')
       return
@@ -5913,7 +14846,7 @@ export default function NotificationsPage() {
     if (!filteredTickers.some((item) => item.ticker === activeTicker)) {
       setActiveTicker(filteredTickers[0].ticker)
     }
-  }, [filteredTickers, activeTicker])
+  }, [filteredTickers, activeTicker, stocksListTab])
 
   const events = activeState.result?.events || []
   const storedEvents = activeMeta?.saved_events || []
@@ -5936,22 +14869,138 @@ export default function NotificationsPage() {
   const previewBody = customBody.trim() || 'Notification body will appear here…'
   const previewTitleEmpty = !customTitle.trim()
   const previewBodyEmpty = !customBody.trim()
-  const isTrigger = notificationApp === 'trigger'
+  const isHub = appTab === 'hub'
+  const isTrigger = appTab === 'trigger'
+  const isNineAm = appTab === 'nineam'
 
   return (
     <div
+      data-desk={isTrigger ? 'trigger' : isHub ? 'hub' : undefined}
       className={cn(
         'flex h-svh flex-col overflow-hidden text-foreground',
-        isTrigger
-          ? 'bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-muted/80 via-background to-background'
-          : 'bg-background',
+        isHub ? 'bg-background' : isTrigger ? 'desk-shell' : 'bg-background',
       )}
     >
+      {/* Home: ticker tabs (line) + app switcher · momentum panel */}
+      {isHub ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <SndkMomentumPanel
+            onOpenInTrigger={(ticker, label) => {
+              const symbol = String(ticker || '')
+                .trim()
+                .toUpperCase()
+              if (!symbol) return
+              // Switch into Trigger, then select/add this stock in the sidebar
+              setAppTab('trigger')
+              setStocksListTab('users')
+              if (monitoredTickerSet.has(symbol)) {
+                selectTickerByUser(symbol)
+              } else {
+                void addMonitoredTicker(symbol, label || symbol)
+              }
+            }}
+            appSwitcher={
+              <div className="flex h-7 shrink-0 items-center gap-0.5 border-0 bg-transparent p-0 shadow-none">
+                <div
+                  className="flex h-7 items-center gap-0.5"
+                  role="tablist"
+                  aria-label="App"
+                >
+                  {(
+                    [
+                      {
+                        id: 'hub' as const,
+                        label: 'Home',
+                        icon: <LayoutGrid className="size-3.5" />,
+                      },
+                      {
+                        id: 'trigger' as const,
+                        label: 'Trigger',
+                        icon: <Zap className="size-3.5" />,
+                      },
+                      {
+                        id: 'nineam' as const,
+                        label: '9AM',
+                        icon: (
+                          <span className="text-[11px] font-bold leading-none">
+                            9
+                          </span>
+                        ),
+                      },
+                    ] as const
+                  ).map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={appTab === tab.id}
+                      title={tab.label}
+                      onClick={() => setAppTab(tab.id)}
+                      className={cn(
+                        'inline-flex size-7 items-center justify-center rounded-full border-0 bg-transparent shadow-none transition-colors',
+                        appTab === tab.id
+                          ? 'text-foreground'
+                          : 'text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {tab.icon}
+                    </button>
+                  ))}
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      title="Settings"
+                      aria-label="Settings"
+                      className="inline-flex size-7 items-center justify-center rounded-full border-0 bg-transparent text-muted-foreground shadow-none transition-colors hover:text-foreground"
+                    >
+                      <Settings className="size-3.5" strokeWidth={1.75} />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="center"
+                    side="top"
+                    sideOffset={8}
+                    className="min-w-[11rem]"
+                  >
+                    <DropdownMenuLabel className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      Settings
+                    </DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault()
+                        toggleTheme()
+                      }}
+                      className="gap-2"
+                    >
+                      {theme === 'dark' ? (
+                        <Sun className="size-3.5" strokeWidth={1.75} />
+                      ) : (
+                        <Moon className="size-3.5" strokeWidth={1.75} />
+                      )}
+                      <span className="flex-1">
+                        {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground">
+                        {theme === 'dark' ? 'On' : 'Off'}
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            }
+          />
+        </div>
+      ) : null}
+
       <header
         className={cn(
           'relative z-20 shrink-0',
+          isHub && 'hidden',
           isTrigger
-            ? 'border-b border-border/50 bg-background/70 backdrop-blur-xl'
+            ? 'desk-topbar'
             : 'border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80',
         )}
       >
@@ -5961,52 +15010,95 @@ export default function NotificationsPage() {
             isTrigger ? 'h-16' : 'h-14',
           )}
         >
-          {isTrigger ? (
-            <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-2 text-xs sm:text-sm">
-              <span
-                className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-2.5 py-1 shadow-sm"
-                title="Monitored instruments"
+          {isHub ? (
+            <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-1.5">
+              <div className="mr-1 min-w-0">
+                <p className="truncate text-sm font-semibold tracking-tight">NewsLabs</p>
+                <p className="truncate text-xs text-muted-foreground">Notifications home</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void openUsagePopup('perplexity')}
+                className="inline-flex items-center gap-1.5 rounded-full border border-[#0B2E26]/15 bg-white px-2.5 py-1 text-[11px] font-semibold text-[#0B2E26] shadow-sm hover:bg-[#F4F7F6]"
+                title="Perplexity spend & token credits — click for daily breakdown"
               >
-                <span className="text-muted-foreground">Instruments</span>
-                <span className="font-semibold tabular-nums text-foreground">
-                  {tickers.length}
+                <Search className="size-3 shrink-0 opacity-80" />
+                Perplexity{' '}
+                <strong className="tabular-nums">
+                  {perplexityTotals?.total_cost_usd_display ||
+                    formatUsdCompact(perplexityTotals?.total_cost_usd) ||
+                    '$0.000000'}
+                </strong>
+                <span className="font-medium text-[#6B7C76]">
+                  · {(perplexityTotals?.total_credits || 0).toLocaleString()} tok
                 </span>
+              </button>
+            </div>
+          ) : isTrigger ? (
+            <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-1.5">
+              <div className="mr-1 hidden min-w-0 sm:block">
+                <p className="text-[11px] font-semibold tracking-tight text-foreground">
+                  Trigger
+                </p>
+                <p className="text-[10px] text-muted-foreground">Momentum desk</p>
+              </div>
+              <span className="desk-stat" title="Monitored instruments">
+                Instruments <strong>{tickers.length}</strong>
               </span>
               <span
-                className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-2.5 py-1 shadow-sm"
-                title="Devices with notifications on"
+                className="desk-stat"
+                title={`${devices.filter((d) => d.enabled).length} notifications on · ${devices.filter((d) => !d.enabled).length} stopped`}
               >
-                <span className="text-muted-foreground">Devices</span>
-                <span className="font-semibold tabular-nums text-foreground">
-                  {devices.length}
-                </span>
+                Devices{' '}
+                <strong>{devices.filter((d) => d.enabled).length}</strong>
               </span>
               <button
                 type="button"
                 onClick={() => void openUsagePopup('gemini')}
-                className="inline-flex items-center gap-1.5 rounded-full border border-violet-500/30 bg-violet-500/10 px-2.5 py-1 text-violet-950 shadow-sm transition-colors hover:bg-violet-500/15 dark:text-violet-100"
+                className="desk-stat desk-stat--accent"
                 title={
                   geminiTotals
                     ? `Gemini total · ${geminiTotals.total_tokens || 0} tokens — click for daily breakdown`
                     : 'Gemini spend — click for daily breakdown'
                 }
               >
-                <Sparkles className="size-3 shrink-0" />
-                <span className="text-violet-900/80 dark:text-violet-100/80">Gemini</span>
-                <span className="font-semibold tabular-nums">
+                <Sparkles className="size-3 shrink-0 opacity-80" />
+                Gemini{' '}
+                <strong>
                   {geminiTotals?.cost_usd_display ||
                     formatUsdCompact(geminiTotals?.cost_usd) ||
                     '$0.000000'}
+                </strong>
+              </button>
+              <button
+                type="button"
+                onClick={() => void openUsagePopup('perplexity')}
+                className="desk-stat desk-stat--accent"
+                title={
+                  perplexityTotals
+                    ? `Perplexity · ${perplexityTotals.total_cost_usd_display || '$0'} · ${(perplexityTotals.total_credits || 0).toLocaleString()} token credits — click for daily breakdown`
+                    : 'Perplexity spend & credits — click for daily breakdown'
+                }
+              >
+                <Search className="size-3 shrink-0 opacity-80" />
+                Perplexity{' '}
+                <strong>
+                  {perplexityTotals?.total_cost_usd_display ||
+                    formatUsdCompact(perplexityTotals?.total_cost_usd) ||
+                    '$0.000000'}
+                </strong>
+                <span className="ml-1 opacity-80">
+                  · {(perplexityTotals?.total_credits || 0).toLocaleString()} tok
                 </span>
               </button>
               <button
                 type="button"
                 onClick={() => void openUsagePopup('firecrawl')}
-                className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-2.5 py-1 shadow-sm transition-colors hover:bg-muted/70"
+                className="desk-stat"
                 title={creditHint || 'Firecrawl remaining — click for daily credits'}
               >
-                <span className="text-muted-foreground">Firecrawl</span>
-                <span className="font-semibold tabular-nums text-foreground">
+                Firecrawl{' '}
+                <strong>
                   {firecrawlCredits?.remaining != null
                     ? firecrawlCredits.plan != null
                       ? `${firecrawlCredits.remaining}/${firecrawlCredits.plan}`
@@ -6018,7 +15110,7 @@ export default function NotificationsPage() {
                           .replace(/\s*credits\.?$/i, '')
                           .trim()
                       : '—'}
-                </span>
+                </strong>
               </button>
             </div>
           ) : (
@@ -6028,7 +15120,7 @@ export default function NotificationsPage() {
             </div>
           )}
 
-          {/* App switcher — logos only, centered in main header */}
+          {/* App switcher — Home · Trigger · 9AM (Home default) */}
           <div
             className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5"
             role="tablist"
@@ -6037,15 +15129,37 @@ export default function NotificationsPage() {
             <button
               type="button"
               role="tab"
+              aria-selected={isHub}
+              aria-label="Home"
+              title="Home"
+              onClick={() => setAppTab('hub')}
+              className={cn(
+                isTrigger
+                  ? cn('desk-icon-btn', isHub && 'is-active')
+                  : cn(
+                      'inline-flex size-10 items-center justify-center rounded-full border transition-colors',
+                      isHub
+                        ? 'border-foreground/15 bg-foreground text-background shadow-sm'
+                        : 'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
+                    ),
+              )}
+            >
+              <LayoutGrid className="size-4" />
+            </button>
+            <button
+              type="button"
+              role="tab"
               aria-selected={isTrigger}
               aria-label="Trigger"
               title="Trigger"
-              onClick={() => setNotificationApp('trigger')}
+              onClick={() => setAppTab('trigger')}
               className={cn(
-                'inline-flex size-10 items-center justify-center rounded-full border transition-colors',
                 isTrigger
-                  ? 'border-foreground/15 bg-foreground text-background shadow-sm'
-                  : 'border-border/70 bg-card text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+                  ? cn('desk-icon-btn', isTrigger && 'is-active')
+                  : cn(
+                      'inline-flex size-10 items-center justify-center rounded-full border transition-colors',
+                      'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
+                    ),
               )}
             >
               <Zap className="size-4" />
@@ -6053,15 +15167,19 @@ export default function NotificationsPage() {
             <button
               type="button"
               role="tab"
-              aria-selected={!isTrigger}
+              aria-selected={isNineAm}
               aria-label="9AM"
               title="9AM"
-              onClick={() => setNotificationApp('nineam')}
+              onClick={() => setAppTab('nineam')}
               className={cn(
-                'inline-flex size-10 items-center justify-center rounded-full border text-sm font-bold transition-colors',
-                !isTrigger
-                  ? 'border-foreground/15 bg-foreground text-background shadow-sm'
-                  : 'border-border/70 bg-card text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+                isTrigger
+                  ? 'desk-icon-btn text-sm font-bold'
+                  : cn(
+                      'inline-flex size-10 items-center justify-center rounded-full border text-sm font-bold transition-colors',
+                      isNineAm
+                        ? 'border-foreground/15 bg-foreground text-background shadow-sm'
+                        : 'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
+                    ),
               )}
             >
               9
@@ -6069,7 +15187,7 @@ export default function NotificationsPage() {
           </div>
 
           <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
-            {section === 'tickers' ? (
+            {isHub ? null : section === 'tickers' ? (
               <>
                 {isTrigger ? (
                   <>
@@ -6088,7 +15206,7 @@ export default function NotificationsPage() {
                         )
                       }
                       title="Fetch & auto-save only tickers with at least 1 subscriber (≥4% Gemini)"
-                      className="inline-flex items-center gap-2 rounded-full border border-border/70 bg-card px-3.5 py-2 text-sm font-medium shadow-sm transition-colors hover:bg-muted/70 disabled:pointer-events-none disabled:opacity-50"
+                      className="desk-action"
                     >
                       {allTickersLoading && fetchAllMode === 'fetch_all' ? (
                         <Loader2 className="size-3.5 animate-spin" />
@@ -6099,7 +15217,7 @@ export default function NotificationsPage() {
                         ? `${allTickersProgress.completed}/${allTickersProgress.total}`
                         : 'Fetch & save all'}
                       {!(allTickersLoading && fetchAllMode === 'fetch_all') ? (
-                        <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
+                        <span className="rounded-full bg-muted/80 px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
                           {
                             filteredTickers.filter((item) => (item.subscriber_count ?? 0) > 0)
                               .length
@@ -6122,7 +15240,7 @@ export default function NotificationsPage() {
                         )
                       }
                       title="9 PM alert: fetch all → Gemini on every new/updated date → review → send Today’s digest"
-                      className="inline-flex items-center gap-2 rounded-full border border-amber-500/40 bg-amber-500/10 px-3.5 py-2 text-sm font-medium text-amber-950 shadow-sm transition-colors hover:bg-amber-500/15 disabled:pointer-events-none disabled:opacity-50 dark:text-amber-100"
+                      className="desk-action desk-action--warn"
                     >
                       {allTickersLoading && fetchAllMode === 'nine_pm' ? (
                         <Loader2 className="size-3.5 animate-spin" />
@@ -6166,7 +15284,7 @@ export default function NotificationsPage() {
               className={cn(
                 'inline-flex shrink-0 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground',
                 isTrigger
-                  ? 'size-10 rounded-full border border-border/60 bg-card shadow-sm'
+                  ? 'desk-icon-btn'
                   : 'size-9 rounded-md border border-border bg-card',
               )}
             >
@@ -6176,18 +15294,19 @@ export default function NotificationsPage() {
         </div>
       </header>
 
-      {/* Workspace: left section tabs | main | logs */}
-      <div className="flex min-h-0 flex-1">
+      {/* Workspace: left section tabs | main | logs (hidden on Home hub mock) */}
+      <div className={cn('flex min-h-0 flex-1', isHub && 'hidden')}>
         {/* LEFT vertical section tabs — collapsed by default */}
         <nav
           className={cn(
             'flex shrink-0 flex-col border-r transition-[width] duration-200 ease-out',
+            isTrigger && 'desk-sidenav border-[color:var(--desk-hairline)]',
             workspaceCollapsed
               ? isTrigger
-                ? 'w-12 bg-card/40'
+                ? 'w-12'
                 : 'w-12 bg-muted/20'
               : isTrigger
-                ? 'w-52 bg-card/40 p-3 sm:w-56 sm:p-4'
+                ? 'w-52 p-3 sm:w-56 sm:p-4'
                 : 'w-[9.5rem] bg-muted/20 p-2 sm:w-44 sm:p-3',
           )}
           aria-label="Notification sections"
@@ -6219,7 +15338,9 @@ export default function NotificationsPage() {
                 className={cn(
                   'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
                   section === 'tickers'
-                    ? 'bg-foreground text-background shadow-sm'
+                    ? isTrigger
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'bg-foreground text-background shadow-sm'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                 )}
               >
@@ -6271,11 +15392,31 @@ export default function NotificationsPage() {
                 className={cn(
                   'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
                   section === 'users'
-                    ? 'bg-foreground text-background shadow-sm'
+                    ? isTrigger
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'bg-foreground text-background shadow-sm'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                 )}
               >
                 <Users className="size-4" />
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={section === 'settings'}
+                aria-label="Settings"
+                title="Settings"
+                onClick={() => setSection('settings')}
+                className={cn(
+                  'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
+                  section === 'settings'
+                    ? isTrigger
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'bg-foreground text-background shadow-sm'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                )}
+              >
+                <Settings className="size-4" />
               </button>
             </div>
           ) : (
@@ -6283,8 +15424,9 @@ export default function NotificationsPage() {
               <div className="mb-1 flex items-center justify-between gap-1 px-2">
                 <p
                   className={cn(
-                    'text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground',
-                    isTrigger && 'px-1',
+                    isTrigger
+                      ? 'desk-section-label px-1'
+                      : 'text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground',
                   )}
                 >
                   {isTrigger ? 'Workspace' : 'Sections'}
@@ -6307,16 +15449,10 @@ export default function NotificationsPage() {
                   aria-selected={section === 'tickers'}
                   onClick={() => setSection('tickers')}
                   className={cn(
-                    'flex items-center gap-2 text-left text-sm font-medium transition-colors',
                     isTrigger
-                      ? cn(
-                          'rounded-2xl px-3 py-3',
-                          section === 'tickers'
-                            ? 'bg-foreground text-background shadow-sm'
-                            : 'text-foreground hover:bg-muted/80',
-                        )
+                      ? 'desk-nav-item'
                       : cn(
-                          'rounded-xl border px-3 py-3',
+                          'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
                           section === 'tickers'
                             ? 'border-foreground bg-foreground text-background'
                             : 'border-transparent bg-transparent text-foreground hover:bg-muted',
@@ -6326,7 +15462,11 @@ export default function NotificationsPage() {
                   <TrendingUp className="size-4 shrink-0" />
                   <span className="leading-tight">
                     {isTrigger ? 'Momentum' : 'Tickers'}
-                    <span className="block text-[11px] font-normal opacity-80">
+                    <span
+                      className={cn(
+                        isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
+                      )}
+                    >
                       {isTrigger ? 'notable moves' : 'alert'}
                     </span>
                   </span>
@@ -6377,16 +15517,10 @@ export default function NotificationsPage() {
                   aria-selected={section === 'users'}
                   onClick={() => setSection('users')}
                   className={cn(
-                    'flex items-center gap-2 text-left text-sm font-medium transition-colors',
                     isTrigger
-                      ? cn(
-                          'rounded-2xl px-3 py-3',
-                          section === 'users'
-                            ? 'bg-foreground text-background shadow-sm'
-                            : 'text-foreground hover:bg-muted/80',
-                        )
+                      ? 'desk-nav-item'
                       : cn(
-                          'rounded-xl border px-3 py-3',
+                          'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
                           section === 'users'
                             ? 'border-foreground bg-foreground text-background'
                             : 'border-transparent bg-transparent text-foreground hover:bg-muted',
@@ -6396,26 +15530,58 @@ export default function NotificationsPage() {
                   <Users className="size-4 shrink-0" />
                   <span className="leading-tight">
                     {isTrigger ? 'Audience' : 'All users'}
-                    <span className="block text-[11px] font-normal opacity-80">
+                    <span
+                      className={cn(
+                        isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
+                      )}
+                    >
                       {isTrigger ? 'devices' : 'alertable devices'}
+                    </span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={section === 'settings'}
+                  onClick={() => setSection('settings')}
+                  className={cn(
+                    isTrigger
+                      ? 'desk-nav-item'
+                      : cn(
+                          'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
+                          section === 'settings'
+                            ? 'border-foreground bg-foreground text-background'
+                            : 'border-transparent bg-transparent text-foreground hover:bg-muted',
+                        ),
+                  )}
+                >
+                  <Settings className="size-4 shrink-0" />
+                  <span className="leading-tight">
+                    Settings
+                    <span
+                      className={cn(
+                        isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
+                      )}
+                    >
+                      version · build
                     </span>
                   </span>
                 </button>
 
                 {isTrigger ? (
                   <div className="mt-auto space-y-3 pt-6">
-                    <div className="rounded-2xl border border-border/60 bg-card p-3 shadow-sm">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                        Snapshot
-                      </p>
+                    <div className="desk-panel p-3.5">
+                      <p className="desk-section-label">Snapshot</p>
                       <div className="mt-3 space-y-2 text-sm">
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-muted-foreground">Instruments</span>
                           <span className="font-semibold tabular-nums">{tickers.length}</span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-muted-foreground">Devices</span>
-                          <span className="font-semibold tabular-nums">{devices.length}</span>
+                          <span className="text-muted-foreground">Devices on</span>
+                          <span className="font-semibold tabular-nums">
+                            {devices.filter((d) => d.enabled).length}
+                          </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-muted-foreground">Universe</span>
@@ -6427,7 +15593,7 @@ export default function NotificationsPage() {
                           </p>
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-muted-foreground">Spend</span>
-                            <span className="font-semibold tabular-nums text-violet-800 dark:text-violet-200">
+                            <span className="font-semibold tabular-nums text-primary">
                               {geminiTotals?.cost_usd_display ||
                                 formatUsdCompact(geminiTotals?.cost_usd) ||
                                 '$0.000000'}
@@ -6453,6 +15619,39 @@ export default function NotificationsPage() {
                             </span>
                           </div>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => void openUsagePopup('perplexity')}
+                          className="w-full border-t border-border/50 pt-2 space-y-2 text-left transition hover:opacity-90"
+                          title="Open Perplexity daily spend"
+                        >
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                            Perplexity usage
+                          </p>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-muted-foreground">Spend</span>
+                            <span className="font-semibold tabular-nums text-sky-700 dark:text-sky-300">
+                              {perplexityTotals?.total_cost_usd_display ||
+                                formatUsdCompact(perplexityTotals?.total_cost_usd) ||
+                                '$0.000000'}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-muted-foreground">Token credits</span>
+                            <span className="font-semibold tabular-nums">
+                              {(perplexityTotals?.total_credits || 0).toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-muted-foreground">Calls</span>
+                            <span className="font-semibold tabular-nums">
+                              {(perplexityTotals?.total_calls || 0).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="text-[10px] leading-snug text-muted-foreground">
+                            Click for day-by-day breakdown
+                          </p>
+                        </button>
                         <div className="border-t border-border/50 pt-2">
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-muted-foreground">Firecrawl</span>
@@ -6505,10 +15704,341 @@ export default function NotificationsPage() {
                   ),
             )}
           >
-            {section === 'users' ? (
+            {section === 'settings' ? (
               <>
-                <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
-                  <div className="space-y-1">
+                {/* Settings form → public.app_releases (ios | android | all) */}
+                <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+                  <div className="space-y-1.5">
+                    {isTrigger ? <p className="desk-section-label">Release</p> : null}
+                    <h1
+                      className={cn(
+                        'font-semibold tracking-tight',
+                        isTrigger ? 'text-3xl sm:text-4xl' : 'text-2xl sm:text-3xl',
+                      )}
+                    >
+                      Settings
+                    </h1>
+                    <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
+                      Manage force-update and latest version/build for each platform. Saves to
+                      Supabase{' '}
+                      <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                        public.app_releases
+                      </code>{' '}
+                      (<span className="font-mono">ios</span> ·{' '}
+                      <span className="font-mono">android</span> ·{' '}
+                      <span className="font-mono">all</span>).
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      onClick={() => void loadAppSettings()}
+                      className={isTrigger ? 'desk-action h-auto border-0' : undefined}
+                    >
+                      {appSettingsLoading ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="size-3.5" />
+                      )}
+                      Reload
+                    </Button>
+                    <Button
+                      size="sm"
+                      type="button"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      onClick={() => void saveAppSettings()}
+                      className={
+                        isTrigger ? 'desk-action desk-action--primary h-auto border-0' : undefined
+                      }
+                    >
+                      {appSettingsSaving ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Save className="size-3.5" />
+                      )}
+                      Save to Supabase
+                    </Button>
+                  </div>
+                </div>
+
+                {appSettingsNeedsSchema ? (
+                  <div className="mb-4 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm text-amber-950 dark:text-amber-100">
+                    Table <code className="rounded bg-background/60 px-1 py-0.5 text-xs">app_releases</code>{' '}
+                    is missing or not readable. Confirm the table exists and RLS allows your
+                    server key, then Reload.
+                  </div>
+                ) : null}
+                {appSettingsNeedsServiceRole ? (
+                  <div className="mb-4 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm text-amber-950 dark:text-amber-100">
+                    <p className="font-medium">Save blocked by Supabase RLS</p>
+                    <p className="mt-1 leading-6">
+                      Your API is using the publishable/anon key (reads work; writes do not).
+                      Add the <strong>service_role</strong> secret to{' '}
+                      <code className="rounded bg-background/60 px-1 py-0.5 text-xs">.env.local</code>
+                      :
+                    </p>
+                    <pre className="mt-2 overflow-x-auto rounded-lg bg-background/70 px-3 py-2 text-[11px] leading-5">
+{`SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here`}
+                    </pre>
+                    <p className="mt-2 text-xs leading-5 opacity-90">
+                      Supabase Dashboard → Project Settings → API →{' '}
+                      <code className="rounded bg-background/60 px-1">service_role</code> (secret).
+                      Restart the API (<code className="rounded bg-background/60 px-1">npm run dev</code>),
+                      then Save again. Never expose this key in the browser.
+                    </p>
+                  </div>
+                ) : null}
+                {appSettingsError ? (
+                  <div className="mb-4 rounded-xl border border-destructive/35 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                    {appSettingsError}
+                  </div>
+                ) : null}
+                {appSettingsMessage ? (
+                  <div className="mb-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-800 dark:text-emerald-200">
+                    {appSettingsMessage}
+                  </div>
+                ) : null}
+
+                <div
+                  className={cn(
+                    'max-w-2xl space-y-5 rounded-2xl border border-border/70 bg-card p-5 shadow-sm',
+                    isTrigger && 'desk-panel border-0',
+                  )}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold tracking-tight">Platform release</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Editing row <span className="font-mono">id = {appReleasePlatform}</span>
+                        {appReleases.length > 0 ? (
+                          <>
+                            {' '}
+                            · {appReleases.length} row{appReleases.length === 1 ? '' : 's'} loaded
+                          </>
+                        ) : null}
+                      </p>
+                    </div>
+                    {appSettingsLoading ? (
+                      <Loader2 className="size-4 animate-spin text-muted-foreground" />
+                    ) : null}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {(['ios', 'android', 'all'] as const).map((platform) => {
+                      const hasRow = appReleases.some((r) => r.id === platform)
+                      const active = appReleasePlatform === platform
+                      return (
+                        <button
+                          key={platform}
+                          type="button"
+                          disabled={appSettingsLoading || appSettingsSaving}
+                          onClick={() => setAppReleasePlatform(platform)}
+                          className={cn(
+                            'inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors',
+                            active
+                              ? 'border-foreground bg-foreground text-background'
+                              : 'border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
+                          )}
+                        >
+                          <span className="capitalize">{platform}</span>
+                          {hasRow ? (
+                            <span
+                              className={cn(
+                                'size-1.5 rounded-full',
+                                active ? 'bg-background/80' : 'bg-emerald-500',
+                              )}
+                              title="Row exists"
+                            />
+                          ) : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="app-latest-version">Latest version</Label>
+                      <Input
+                        id="app-latest-version"
+                        value={appLatestVersion}
+                        onChange={(e) => setAppLatestVersion(e.target.value)}
+                        placeholder="e.g. 1.4.2"
+                        disabled={appSettingsLoading || appSettingsSaving}
+                        className="font-mono"
+                        autoComplete="off"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Current store / binary version (latest_version).
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="app-latest-build">Latest build</Label>
+                      <Input
+                        id="app-latest-build"
+                        value={appLatestBuild}
+                        onChange={(e) => setAppLatestBuild(e.target.value)}
+                        placeholder="e.g. 184"
+                        disabled={appSettingsLoading || appSettingsSaving}
+                        className="font-mono"
+                        autoComplete="off"
+                        inputMode="numeric"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Build number / versionCode (latest_build).
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="app-min-version">Minimum version</Label>
+                      <Input
+                        id="app-min-version"
+                        value={appMinVersion}
+                        onChange={(e) => setAppMinVersion(e.target.value)}
+                        placeholder="e.g. 1.3.0"
+                        disabled={appSettingsLoading || appSettingsSaving}
+                        className="font-mono"
+                        autoComplete="off"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Clients below this may be forced to update (min_version).
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="app-min-build">Minimum build</Label>
+                      <Input
+                        id="app-min-build"
+                        value={appMinBuild}
+                        onChange={(e) => setAppMinBuild(e.target.value)}
+                        placeholder="e.g. 150"
+                        disabled={appSettingsLoading || appSettingsSaving}
+                        className="font-mono"
+                        autoComplete="off"
+                        inputMode="numeric"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Minimum build integer (min_build).
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 rounded-xl border border-border/60 bg-muted/20 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <Label htmlFor="app-force-update" className="text-sm">
+                          Force update
+                        </Label>
+                        <p className="text-[11px] text-muted-foreground">
+                          Require clients below min version/build to update.
+                        </p>
+                      </div>
+                      <Switch
+                        id="app-force-update"
+                        checked={appForceUpdate}
+                        onCheckedChange={setAppForceUpdate}
+                        disabled={appSettingsLoading || appSettingsSaving}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <Label htmlFor="app-check-eas" className="text-sm">
+                          Check EAS update
+                        </Label>
+                        <p className="text-[11px] text-muted-foreground">
+                          Allow OTA / EAS update checks (check_eas_update).
+                        </p>
+                      </div>
+                      <Switch
+                        id="app-check-eas"
+                        checked={appCheckEasUpdate}
+                        onCheckedChange={setAppCheckEasUpdate}
+                        disabled={appSettingsLoading || appSettingsSaving}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <Label htmlFor="app-release-enabled" className="text-sm">
+                          Enabled
+                        </Label>
+                        <p className="text-[11px] text-muted-foreground">
+                          Whether this release row is active for the app.
+                        </p>
+                      </div>
+                      <Switch
+                        id="app-release-enabled"
+                        checked={appReleaseEnabled}
+                        onCheckedChange={setAppReleaseEnabled}
+                        disabled={appSettingsLoading || appSettingsSaving}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="app-release-title">Update title</Label>
+                    <Input
+                      id="app-release-title"
+                      value={appReleaseTitle}
+                      onChange={(e) => setAppReleaseTitle(e.target.value)}
+                      placeholder="Optional prompt title"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="app-release-message">Update message</Label>
+                    <Textarea
+                      id="app-release-message"
+                      value={appReleaseMessage}
+                      onChange={(e) => setAppReleaseMessage(e.target.value)}
+                      placeholder="Optional message shown when an update is required"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      rows={3}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="app-store-url">Store URL</Label>
+                    <Input
+                      id="app-store-url"
+                      value={appStoreUrl}
+                      onChange={(e) => setAppStoreUrl(e.target.value)}
+                      placeholder="https://apps.apple.com/… or Play Store link"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      className="font-mono text-xs sm:text-sm"
+                      autoComplete="off"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-4">
+                    <p className="text-xs text-muted-foreground">
+                      {appSettingsUpdatedAt
+                        ? `Last saved ${new Date(appSettingsUpdatedAt).toLocaleString()}`
+                        : appReleases.some((r) => r.id === appReleasePlatform)
+                          ? 'Loaded · not edited yet'
+                          : 'No row yet — Save will create it'}
+                    </p>
+                    <Button
+                      type="button"
+                      disabled={appSettingsLoading || appSettingsSaving}
+                      onClick={() => void saveAppSettings()}
+                    >
+                      {appSettingsSaving ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Save className="size-4" />
+                      )}
+                      Update {appReleasePlatform}
+                    </Button>
+                  </div>
+                </div>
+              </>
+            ) : section === 'users' ? (
+              <>
+                <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+                  <div className="space-y-1.5">
+                    {isTrigger ? (
+                      <p className="desk-section-label">Devices</p>
+                    ) : null}
                     <h1
                       className={cn(
                         'font-semibold tracking-tight',
@@ -6518,10 +16048,10 @@ export default function NotificationsPage() {
                       {isTrigger ? 'Audience' : 'All alertable users'}
                     </h1>
                     <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
-                      Devices registered for{' '}
-                      <strong>{notificationApp === 'trigger' ? 'Trigger' : '9AM'}</strong>.
-                      Stocks only in the ticker list. Users who requested crypto pro access show a{' '}
-                      <strong>Pro · Crypto</strong> badge above Notifications on.
+                      Spreadsheet view of{' '}
+                      <strong>{notificationApp === 'trigger' ? 'Trigger' : '9AM'}</strong>{' '}
+                      devices. Columns: status, subscribed stocks, stopped stocks. Alerts only
+                      go to devices still On / Partial.
                     </p>
                   </div>
                   <div className={cn('flex flex-wrap gap-2', isTrigger && 'gap-2.5')}>
@@ -6529,9 +16059,11 @@ export default function NotificationsPage() {
                       <Button
                         size="sm"
                         type="button"
-                        disabled={!devices.length || devicesLoading}
+                        disabled={
+                          !devices.some((d) => d.enabled) || devicesLoading
+                        }
                         onClick={() => openTriggerDigest()}
-                        className={isTrigger ? 'rounded-full px-4 shadow-sm' : undefined}
+                        className={isTrigger ? 'desk-action desk-action--primary h-auto border-0' : undefined}
                       >
                         <BellRing className="size-3.5" />
                         Alert all Trigger users
@@ -6543,7 +16075,7 @@ export default function NotificationsPage() {
                       variant="outline"
                       disabled={devicesLoading}
                       onClick={() => void loadDevices()}
-                      className={isTrigger ? 'rounded-full px-4' : undefined}
+                      className={isTrigger ? 'desk-action h-auto border-0' : undefined}
                     >
                       {devicesLoading ? (
                         <Loader2 className="size-3.5 animate-spin" />
@@ -6574,41 +16106,56 @@ export default function NotificationsPage() {
                   </div>
                 ) : null}
 
-                <div className={cn('mb-5 grid gap-3 sm:grid-cols-3', isTrigger && 'gap-4')}>
+                <div className={cn('mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4', isTrigger && 'gap-4')}>
                   <div
                     className={cn(
                       'rounded-xl border bg-card p-4 shadow-sm',
-                      isTrigger && 'rounded-3xl border-border/60 p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+                      isTrigger && 'desk-panel !rounded-2xl border-0 p-5 shadow-none',
                     )}
                   >
                     <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
-                      Alertable users
+                      Notifications on
                     </p>
-                    <p className="mt-1 text-2xl font-semibold">{devices.length}</p>
+                    <p className="mt-1 text-2xl font-semibold tabular-nums">
+                      {devices.filter((d) => d.enabled).length}
+                    </p>
                   </div>
                   <div
                     className={cn(
                       'rounded-xl border bg-card p-4 shadow-sm',
-                      isTrigger && 'rounded-3xl border-border/60 p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+                      isTrigger && 'desk-panel !rounded-2xl border-0 p-5 shadow-none',
+                    )}
+                  >
+                    <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                      Stopped
+                    </p>
+                    <p className="mt-1 text-2xl font-semibold tabular-nums text-muted-foreground">
+                      {devices.filter((d) => !d.enabled).length}
+                    </p>
+                  </div>
+                  <div
+                    className={cn(
+                      'rounded-xl border bg-card p-4 shadow-sm',
+                      isTrigger && 'desk-panel !rounded-2xl border-0 p-5 shadow-none',
                     )}
                   >
                     <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
                       Pro · Crypto
                     </p>
-                    <p className="mt-1 text-2xl font-semibold">
+                    <p className="mt-1 text-2xl font-semibold tabular-nums">
                       {devices.filter((device) => device.pro_crypto).length}
                     </p>
                   </div>
                   <div
                     className={cn(
                       'rounded-xl border bg-card p-4 shadow-sm',
-                      isTrigger && 'rounded-3xl border-border/60 p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+                      isTrigger && 'desk-panel !rounded-2xl border-0 p-5 shadow-none',
                     )}
                   >
                     <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
-                      Stock tickers
+                      Active stock tickers
                     </p>
-                    <p className="mt-1 text-2xl font-semibold">
+                    <p className="mt-1 text-2xl font-semibold tabular-nums">
                       {
                         new Set(
                           devices.flatMap((device) =>
@@ -6623,95 +16170,198 @@ export default function NotificationsPage() {
                 {devicesLoading && !devices.length ? (
                   <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed py-12 text-sm text-muted-foreground">
                     <Loader2 className="size-4 animate-spin" />
-                    Loading alertable users…
+                    Loading audience…
                   </div>
                 ) : null}
 
                 {!devicesLoading && !devices.length ? (
                   <div className="rounded-xl border border-dashed px-4 py-12 text-center">
                     <Users className="mx-auto size-6 text-muted-foreground" />
-                    <p className="mt-3 text-sm font-medium">No alertable users</p>
+                    <p className="mt-3 text-sm font-medium">No devices found</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      No enabled {notificationApp === 'trigger' ? 'Trigger' : '9AM'} push tokens
-                      were found.
+                      No {notificationApp === 'trigger' ? 'Trigger' : '9AM'} push tokens in
+                      monitored tickers.
                     </p>
                   </div>
                 ) : null}
 
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  {devices.map((device) => {
-                    const token = device.expo_push_token
-                    const maskedToken =
-                      token.length > 30 ? `${token.slice(0, 20)}…${token.slice(-8)}` : token
-                    return (
-                      <article
-                        key={deviceKey(device)}
-                        className="rounded-2xl border bg-card p-4 text-card-foreground shadow-sm"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <p className="truncate font-mono text-sm font-semibold">
-                              {device.device_id || 'Unknown device'}
-                            </p>
-                            <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">
-                              {maskedToken}
-                            </p>
-                          </div>
-                          <div className="flex shrink-0 flex-col items-end gap-2">
-                            {device.pro_crypto ? (
-                              <Badge
-                                className="gap-1 bg-violet-500/15 text-violet-900 dark:text-violet-100"
-                                title={
-                                  device.crypto_tickers?.length
-                                    ? `Crypto pro access · ${device.crypto_tickers.join(', ')}`
-                                    : 'Requested pro access for crypto'
-                                }
-                              >
-                                <Crown className="size-3" />
-                                Pro · Crypto
-                              </Badge>
-                            ) : null}
-                            <Badge className="bg-emerald-500/12 text-emerald-800 dark:text-emerald-200">
-                              Notifications on
-                            </Badge>
+                {devices.length > 0 ? (
+                  <div
+                    className={cn(
+                      'overflow-hidden rounded-xl border border-border/70 bg-card',
+                      isTrigger && 'desk-panel border-0',
+                    )}
+                  >
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[52rem] border-collapse text-left text-sm">
+                        <thead>
+                          <tr className="border-b border-border/70 bg-muted/40 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                            <th className="sticky left-0 z-10 bg-muted/95 px-3 py-2.5 font-semibold backdrop-blur">
+                              Device
+                            </th>
+                            <th className="px-3 py-2.5 font-semibold">Status</th>
+                            <th className="px-3 py-2.5 font-semibold">
+                              Subscribed
+                              <span className="ml-1 font-normal normal-case tracking-normal text-muted-foreground/80">
+                                stocks
+                              </span>
+                            </th>
+                            <th className="px-3 py-2.5 font-semibold">
+                              Stopped
+                              <span className="ml-1 font-normal normal-case tracking-normal text-muted-foreground/80">
+                                stocks
+                              </span>
+                            </th>
+                            <th className="px-3 py-2.5 font-semibold">Pro</th>
                             {notificationApp === 'trigger' ? (
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                onClick={() => openTriggerDigest(device)}
+                              <th className="px-3 py-2.5 text-right font-semibold">Action</th>
+                            ) : null}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {devices.map((device, rowIndex) => {
+                            const token = device.expo_push_token
+                            const maskedToken =
+                              token.length > 28
+                                ? `${token.slice(0, 16)}…${token.slice(-6)}`
+                                : token
+                            const status =
+                              device.subscription_status || (device.enabled ? 'on' : 'off')
+                            const isOn = status === 'on'
+                            const isPartial = status === 'partial'
+                            const isOff = status === 'off' || !device.enabled
+                            const subscribed = device.tickers || []
+                            const stopped = device.disabled_tickers || []
+                            const rowBg =
+                              rowIndex % 2 === 0 ? 'bg-background/40' : 'bg-muted/20'
+                            return (
+                              <tr
+                                key={deviceKey(device)}
+                                className={cn(
+                                  'border-b border-border/50 transition-colors hover:bg-muted/40',
+                                  rowBg,
+                                  isOff && 'opacity-75',
+                                )}
                               >
-                                <BellRing className="size-3.5" />
-                                Alert user
-                              </Button>
-                            ) : null}
-                          </div>
-                        </div>
-                        <div className="mt-4">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                            Subscribed stocks ({device.tickers?.length || 0})
-                          </p>
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            {(device.tickers || []).map((ticker) => (
-                              <Badge key={ticker} variant="secondary" className="font-mono text-[10px]">
-                                {ticker}
-                              </Badge>
-                            ))}
-                            {!device.tickers?.length ? (
-                              <span className="text-xs text-muted-foreground">No stocks</span>
-                            ) : null}
-                          </div>
-                          {device.pro_crypto && device.crypto_tickers?.length ? (
-                            <p className="mt-2 text-[11px] text-violet-800 dark:text-violet-200">
-                              Crypto pro request:{' '}
-                              <span className="font-mono">{device.crypto_tickers.join(', ')}</span>
-                            </p>
-                          ) : null}
-                        </div>
-                      </article>
-                    )
-                  })}
-                </div>
+                                <td
+                                  className={cn(
+                                    'sticky left-0 z-10 max-w-[14rem] px-3 py-2.5 align-top backdrop-blur',
+                                    rowBg,
+                                  )}
+                                >
+                                  <p className="truncate font-mono text-[13px] font-semibold tracking-tight">
+                                    {device.device_id || 'Unknown device'}
+                                  </p>
+                                  <p
+                                    className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground"
+                                    title={token}
+                                  >
+                                    {maskedToken}
+                                  </p>
+                                </td>
+                                <td className="whitespace-nowrap px-3 py-2.5 align-top">
+                                  {isOn ? (
+                                    <Badge className="bg-emerald-500/12 text-emerald-800 dark:text-emerald-200">
+                                      On
+                                    </Badge>
+                                  ) : isPartial ? (
+                                    <Badge className="bg-amber-500/15 text-amber-900 dark:text-amber-100">
+                                      Partial
+                                    </Badge>
+                                  ) : (
+                                    <Badge
+                                      variant="outline"
+                                      className="border-red-500/30 bg-red-500/10 text-red-800 dark:text-red-200"
+                                    >
+                                      Off
+                                    </Badge>
+                                  )}
+                                </td>
+                                <td className="max-w-[18rem] px-3 py-2.5 align-top">
+                                  <div className="flex items-baseline gap-1.5">
+                                    <span className="tabular-nums text-xs font-semibold text-foreground">
+                                      {subscribed.length}
+                                    </span>
+                                    {subscribed.length ? (
+                                      <span
+                                        className="min-w-0 truncate font-mono text-[11px] leading-5 text-foreground/85"
+                                        title={subscribed.join(', ')}
+                                      >
+                                        {subscribed.join(' · ')}
+                                      </span>
+                                    ) : (
+                                      <span className="text-[11px] text-muted-foreground">—</span>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="max-w-[16rem] px-3 py-2.5 align-top">
+                                  <div className="flex items-baseline gap-1.5">
+                                    <span className="tabular-nums text-xs font-semibold text-muted-foreground">
+                                      {stopped.length}
+                                    </span>
+                                    {stopped.length ? (
+                                      <span
+                                        className="min-w-0 truncate font-mono text-[11px] leading-5 text-muted-foreground line-through"
+                                        title={stopped.join(', ')}
+                                      >
+                                        {stopped.join(' · ')}
+                                      </span>
+                                    ) : (
+                                      <span className="text-[11px] text-muted-foreground">—</span>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="whitespace-nowrap px-3 py-2.5 align-top">
+                                  {device.pro_crypto ? (
+                                    <Badge
+                                      className="gap-1 bg-violet-500/15 text-violet-900 dark:text-violet-100"
+                                      title={
+                                        device.crypto_tickers?.length
+                                          ? device.crypto_tickers.join(', ')
+                                          : 'Crypto pro'
+                                      }
+                                    >
+                                      <Crown className="size-3" />
+                                      Crypto
+                                    </Badge>
+                                  ) : (
+                                    <span className="text-[11px] text-muted-foreground">—</span>
+                                  )}
+                                </td>
+                                {notificationApp === 'trigger' ? (
+                                  <td className="px-3 py-2.5 text-right align-top">
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-7 px-2.5 text-xs"
+                                      disabled={isOff}
+                                      onClick={() => openTriggerDigest(device)}
+                                      title={
+                                        isOff
+                                          ? 'Device stopped notifications — cannot alert'
+                                          : 'Send momentum digest to this device'
+                                      }
+                                    >
+                                      <BellRing className="size-3.5" />
+                                      Alert
+                                    </Button>
+                                  </td>
+                                ) : null}
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="border-t border-border/60 px-3 py-2 text-[11px] text-muted-foreground">
+                      {devices.length} device{devices.length === 1 ? '' : 's'} ·{' '}
+                      {devices.filter((d) => d.enabled).length} on ·{' '}
+                      {devices.filter((d) => d.subscription_status === 'partial').length}{' '}
+                      partial · {devices.filter((d) => !d.enabled).length} off
+                    </div>
+                  </div>
+                ) : null}
               </>
             ) : section === 'custom' ? (
               <>
@@ -6974,10 +16624,16 @@ export default function NotificationsPage() {
                       News alert
                     </h1>
                     <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
-                      Left: pick one news story · Right: pick devices · then Send
+                      Latest Yahoo Finance news for your watchlist tickers · pick a
+                      story · pick devices · Send
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      {newsTotal != null ? `${newsTotal} articles in Supabase · ` : null}
+                      {newsTotal != null
+                        ? `${newsTotal} latest articles · Yahoo Finance · ≤14 days · `
+                        : null}
+                      {tickers.length
+                        ? `${tickers.length} watchlist ticker${tickers.length === 1 ? '' : 's'} · `
+                        : null}
                       {selectedDeviceKeys.length}/{devices.length} devices selected
                     </p>
                   </div>
@@ -7059,22 +16715,25 @@ export default function NotificationsPage() {
                   {/* NEWS column */}
                   <section className="flex min-h-0 flex-col rounded-2xl border bg-card shadow-sm">
                     <div className="flex shrink-0 items-center justify-between border-b px-4 py-3">
-                      <h2 className="text-sm font-semibold">News</h2>
+                      <h2 className="text-sm font-semibold">
+                        Yahoo Finance · watchlist
+                      </h2>
                       <span className="text-xs text-muted-foreground">
                         {news.length}
-                        {newsTotal != null ? ` / ${newsTotal}` : ''} loaded
+                        {newsTotal != null ? ` / ${newsTotal}` : ''} latest
                       </span>
                     </div>
                     <div className="min-h-0 max-h-[calc(100svh-16rem)] flex-1 space-y-2 overflow-y-auto p-3">
                       {newsLoading && !news.length ? (
                         <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
                           <Loader2 className="size-4 animate-spin" />
-                          Loading news from Supabase…
+                          Fetching latest Yahoo Finance news for watchlist…
                         </div>
                       ) : null}
                       {!newsLoading && !news.length && !newsError ? (
                         <div className="rounded-xl border border-dashed px-4 py-12 text-center text-sm text-muted-foreground">
-                          No articles. Click Reload news.
+                          No recent Yahoo news for your watchlist (last 14 days).
+                          Click Reload news, or add more tickers.
                         </div>
                       ) : null}
                       {news.map((article) => {
@@ -7273,53 +16932,548 @@ export default function NotificationsPage() {
               {/* Column 1 — vertical ticker list */}
               <aside
                 className={cn(
-                  'flex w-44 shrink-0 flex-col border-r sm:w-52 md:w-56',
-                  isTrigger ? 'border-border/50 bg-card/40' : 'border-border bg-muted/15',
+                  'flex w-56 shrink-0 flex-col overflow-hidden border-r sm:w-64 md:w-72 lg:w-80',
+                  isTrigger ? 'desk-watchlist' : 'border-border bg-muted/15',
                 )}
               >
-                <div className="shrink-0 border-b border-border/60 px-3 py-2.5">
+                <div
+                  className={cn(
+                    'shrink-0 px-3 py-3',
+                    isTrigger ? 'border-b border-[color:var(--desk-hairline)]' : 'border-b border-border/60',
+                  )}
+                >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                        Stocks
+                      <p
+                        className={cn(
+                          isTrigger
+                            ? 'desk-section-label'
+                            : 'text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground',
+                        )}
+                      >
+                        Watchlist
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {listLoading && !filteredTickers.length
-                          ? 'Loading…'
-                          : `${filteredTickers.length} ticker${filteredTickers.length === 1 ? '' : 's'}`}
+                        {stocksListTab === 'extreme'
+                          ? extremeMoversLoading && !extremeMovers.length
+                            ? 'Loading Yahoo…'
+                            : `${filteredExtremeMovers.length} ${extremeDirectionTab}`
+                          : stocksListTab === 'pinned'
+                            ? `${extremePinned.length} pinned`
+                            : listLoading && !filteredTickers.length
+                              ? 'Loading…'
+                              : `${filteredTickers.length} ticker${filteredTickers.length === 1 ? '' : 's'}`}
                       </p>
                     </div>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {stocksListTab === 'extreme' ? (
                         <button
                           type="button"
-                          title={`Sort: ${TICKER_SORT_OPTIONS.find((o) => o.id === tickerSort)?.label || 'Sort'}`}
-                          aria-label="Sort tickers"
-                          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          title="Refresh extreme movers from Yahoo"
+                          aria-label="Refresh extreme movers"
+                          disabled={extremeMoversLoading}
+                          onClick={() => void loadExtremeMovers()}
+                          className="inline-flex size-8 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
                         >
-                          <ArrowUpDown className="size-3.5" />
+                          {extremeMoversLoading ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="size-3.5" />
+                          )}
                         </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-52">
-                        {TICKER_SORT_OPTIONS.map((option) => (
-                          <DropdownMenuItem
-                            key={option.id}
-                            onClick={() => setTickerSort(option.id)}
-                            className={cn(tickerSort === option.id && 'bg-muted font-medium')}
+                      ) : stocksListTab === 'users' ? (
+                        <>
+                          <button
+                            type="button"
+                            title="Sort by largest live percentage movement"
+                            aria-label="Sort by percentage movement"
+                            aria-pressed={
+                              tickerSort === 'movement' ||
+                              tickerSort === 'movement_pos_to_neg' ||
+                              tickerSort === 'movement_neg_to_pos'
+                            }
+                            onClick={() => updateTickerSort('movement')}
+                            className={cn(
+                              'inline-flex size-8 items-center justify-center rounded-lg border transition-colors',
+                              tickerSort === 'movement' ||
+                                tickerSort === 'movement_pos_to_neg' ||
+                                tickerSort === 'movement_neg_to_pos'
+                                ? isTrigger
+                                  ? 'border-primary/30 bg-primary text-primary-foreground'
+                                  : 'border-foreground bg-foreground text-background'
+                                : 'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
+                            )}
                           >
-                            {option.label}
-                          </DropdownMenuItem>
-                        ))}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                            <TrendingUp className="size-3.5" />
+                          </button>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              title={`Sort: ${TICKER_SORT_OPTIONS.find((o) => o.id === tickerSort)?.label || 'Sort'}`}
+                              aria-label="Sort tickers"
+                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                            >
+                              <ArrowUpDown className="size-3.5" />
+                            </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-52">
+                            {TICKER_SORT_OPTIONS.map((option) => (
+                              <DropdownMenuItem
+                                key={option.id}
+                                onClick={() => updateTickerSort(option.id)}
+                                className={cn(tickerSort === option.id && 'bg-muted font-medium')}
+                              >
+                                {option.label}
+                              </DropdownMenuItem>
+                            ))}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </>
+                      ) : null}
+                    </div>
                   </div>
+
+                  {/* Users · Extreme · Pinned — Extreme never writes to Users */}
+                  <div
+                    className={cn(
+                      'mt-2.5',
+                      isTrigger
+                        ? 'desk-segment'
+                        : 'grid grid-cols-3 gap-1 rounded-lg border border-border/60 bg-background/70 p-0.5',
+                    )}
+                    role="tablist"
+                    aria-label="Stocks list mode"
+                  >
+                    {(
+                      [
+                        { id: 'users' as const, label: 'Users' },
+                        { id: 'extreme' as const, label: 'Extreme' },
+                        { id: 'pinned' as const, label: 'Pinned' },
+                      ] as const
+                    ).map((tab) => (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={stocksListTab === tab.id}
+                        onClick={() => setStocksListTab(tab.id)}
+                        className={
+                          isTrigger
+                            ? undefined
+                            : cn(
+                                'rounded-md px-1.5 py-1.5 text-[10px] font-semibold transition-colors sm:text-[11px]',
+                                stocksListTab === tab.id
+                                  ? 'bg-foreground text-background shadow-sm'
+                                  : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground',
+                              )
+                        }
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                  {stocksListTab === 'extreme' ? (
+                    <div className="mt-1.5 space-y-1.5">
+                      <div
+                        className="grid grid-cols-2 gap-1 rounded-lg border border-border/60 bg-background/70 p-0.5"
+                        role="tablist"
+                        aria-label="Extreme direction"
+                      >
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={extremeDirectionTab === 'positive'}
+                          onClick={() => setExtremeDirectionTab('positive')}
+                          className={cn(
+                            'rounded-md px-1.5 py-1.5 text-[10px] font-semibold transition-colors',
+                            extremeDirectionTab === 'positive'
+                              ? isTrigger
+                                ? 'bg-[color:var(--desk-up-soft)] text-[color:var(--desk-up)] shadow-sm'
+                                : 'bg-emerald-600 text-white shadow-sm dark:bg-emerald-500'
+                              : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground',
+                          )}
+                        >
+                          Positive
+                          <span className="ml-1 tabular-nums opacity-80">
+                            {extremePositiveCount}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={extremeDirectionTab === 'negative'}
+                          onClick={() => setExtremeDirectionTab('negative')}
+                          className={cn(
+                            'rounded-md px-1.5 py-1.5 text-[10px] font-semibold transition-colors',
+                            extremeDirectionTab === 'negative'
+                              ? isTrigger
+                                ? 'bg-[color:var(--desk-down-soft)] text-[color:var(--desk-down)] shadow-sm'
+                                : 'bg-red-600 text-white shadow-sm dark:bg-red-500'
+                              : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground',
+                          )}
+                        >
+                          Negative
+                          <span className="ml-1 tabular-nums opacity-80">
+                            {extremeNegativeCount}
+                          </span>
+                        </button>
+                      </div>
+                      <p className="text-[10px] leading-snug text-muted-foreground">
+                        Yahoo top {extremeDirectionTab === 'positive' ? 'gainers' : 'losers'} ·
+                        ≥10%
+                        {extremeMoversFetchedAt
+                          ? ` · ${new Date(extremeMoversFetchedAt).toLocaleTimeString()}`
+                          : ''}
+                      </p>
+                    </div>
+                  ) : null}
+                  {stocksListTab === 'pinned' ? (
+                    <p className="mt-1.5 text-[10px] leading-snug text-muted-foreground">
+                      From Extreme · not Users
+                    </p>
+                  ) : null}
                 </div>
                 <div
-                  className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-1.5"
+                  className={cn(
+                    'min-h-0 flex-1 overflow-y-auto',
+                    isTrigger ? 'space-y-0.5 p-2' : 'space-y-0.5 p-1.5',
+                  )}
                   role="tablist"
-                  aria-label="Stock tickers"
+                  aria-label={
+                    stocksListTab === 'extreme'
+                      ? `Extreme ${extremeDirectionTab} movers`
+                      : stocksListTab === 'pinned'
+                        ? 'Pinned extreme'
+                        : 'Stock tickers'
+                  }
                   aria-orientation="vertical"
                 >
+                  {stocksListTab === 'extreme' ? (
+                    <>
+                      {extremeMoversLoading && !extremeMovers.length ? (
+                        <div className="flex items-center gap-2 px-2 py-6 text-sm text-muted-foreground">
+                          <Loader2 className="size-4 animate-spin" />
+                          Loading Yahoo…
+                        </div>
+                      ) : null}
+                      {extremeMoversError ? (
+                        <div className="space-y-2 px-2 py-3">
+                          <p className="text-xs text-destructive">{extremeMoversError}</p>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-7 w-full text-[11px]"
+                            onClick={() => void loadExtremeMovers()}
+                          >
+                            Retry
+                          </Button>
+                        </div>
+                      ) : null}
+                      {!extremeMoversLoading &&
+                      !extremeMoversError &&
+                      extremeMovers.length > 0 &&
+                      !filteredExtremeMovers.length ? (
+                        <p className="px-2 py-6 text-xs text-muted-foreground">
+                          No Yahoo top {extremeDirectionTab === 'positive' ? 'gainers' : 'losers'}{' '}
+                          with ≥10% right now.
+                        </p>
+                      ) : null}
+                      {!extremeMoversLoading && !extremeMoversError && !extremeMovers.length ? (
+                        <p className="px-2 py-6 text-xs text-muted-foreground">
+                          No Yahoo Day Gainers / Day Losers with ≥10% right now. Retry later in
+                          the session.
+                        </p>
+                      ) : null}
+                      {filteredExtremeMovers.map((item) => {
+                        const symbol = item.ticker
+                        const selected = symbol === activeTicker
+                        const isPinned = extremePinnedSet.has(symbol)
+                        const livePercent = formatLivePercent(item.regularMarketChangePercent)
+                        const livePrice = formatProviderPrice(
+                          item.regularMarketPrice,
+                          item.currency || 'USD',
+                        )
+                        const liveDown = item.regularMarketChangePercent < 0
+                        const liveUp = item.regularMarketChangePercent > 0
+                        return (
+                          <div
+                            key={symbol}
+                            className={cn(
+                              'flex w-full items-start gap-1 transition-colors',
+                              isTrigger
+                                ? cn('desk-row px-1 py-0.5', selected && 'is-selected')
+                                : cn(
+                                    'rounded-xl px-1 py-1',
+                                    selected
+                                      ? 'bg-foreground text-background'
+                                      : 'text-foreground hover:bg-muted/80',
+                                  ),
+                            )}
+                          >
+                            <button
+                              type="button"
+                              role="tab"
+                              aria-selected={selected}
+                              onClick={() => {
+                                selectTickerByUser(symbol)
+                                // Seed quote from Yahoo screener so detail shows immediately (no Users add).
+                                setLiveQuotes((prev) => ({
+                                  ...prev,
+                                  [symbol]: {
+                                    ...(prev[symbol] || {}),
+                                    symbol,
+                                    shortName: item.company_name || symbol,
+                                    regularMarketPrice: item.regularMarketPrice,
+                                    regularMarketChange: item.regularMarketChange,
+                                    regularMarketChangePercent: item.regularMarketChangePercent,
+                                    regularMarketPreviousClose: null,
+                                    currency: item.currency || 'USD',
+                                    marketState: item.marketState || null,
+                                    exchange: item.exchange || null,
+                                  },
+                                }))
+                              }}
+                              title={`${symbol} · ${livePercent || ''} · ${item.company_name} · view only`}
+                              className="flex min-w-0 flex-1 items-start gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm"
+                            >
+                              <TickerLogoMark
+                                symbol={symbol}
+                                selected={isTrigger ? false : selected}
+                                size={isTrigger ? 28 : 22}
+                                customSrc={customLogos[symbol] || null}
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className={cn('tracking-tight', isTrigger ? 'desk-sym' : 'font-semibold')}>{symbol}</span>
+                                  {livePrice ? (
+                                    <span
+                                      className={cn(
+                                        isTrigger
+                                          ? 'desk-price'
+                                          : cn(
+                                              'text-[13px] font-semibold tabular-nums leading-none',
+                                              selected ? 'text-background/85' : 'text-foreground/80',
+                                            ),
+                                      )}
+                                    >
+                                      {livePrice}
+                                    </span>
+                                  ) : null}
+                                  {livePercent ? (
+                                    <span
+                                      className={cn(
+                                        isTrigger
+                                          ? cn(
+                                              'desk-pct',
+                                              liveDown && 'desk-down',
+                                              liveUp && 'desk-up',
+                                              !liveDown && !liveUp && 'text-muted-foreground',
+                                            )
+                                          : cn(
+                                              'text-[13px] font-semibold tabular-nums leading-none',
+                                              selected
+                                                ? liveDown
+                                                  ? 'text-red-200'
+                                                  : liveUp
+                                                    ? 'text-emerald-200'
+                                                    : 'text-background/75'
+                                                : liveDown
+                                                  ? 'text-red-600 dark:text-red-400'
+                                                  : liveUp
+                                                    ? 'text-emerald-700 dark:text-emerald-400'
+                                                    : 'text-muted-foreground',
+                                            ),
+                                      )}
+                                    >
+                                      {livePercent}
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <p
+                                  className={cn(
+                                    'mt-0.5 truncate text-[10px]',
+                                    isTrigger
+                                      ? 'text-muted-foreground'
+                                      : selected
+                                        ? 'text-background/65'
+                                        : 'text-muted-foreground',
+                                  )}
+                                >
+                                  {item.company_name}
+                                </p>
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              title={isPinned ? 'Unpin' : 'Pin (goes to Pinned · not Users)'}
+                              aria-label={isPinned ? `Unpin ${symbol}` : `Pin ${symbol}`}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                togglePinExtreme(item)
+                              }}
+                              className={cn(
+                                'mt-1.5 mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors',
+                                isTrigger
+                                  ? isPinned
+                                    ? 'text-primary hover:bg-primary/10'
+                                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                                  : selected
+                                    ? 'text-background/80 hover:bg-background/15 hover:text-background'
+                                    : isPinned
+                                      ? 'text-amber-700 hover:bg-amber-500/10 dark:text-amber-300'
+                                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                              )}
+                            >
+                              <Bookmark
+                                className={cn('size-3.5', isPinned && 'fill-current')}
+                              />
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </>
+                  ) : stocksListTab === 'pinned' ? (
+                    <>
+                      {!extremePinned.length ? (
+                        <p className="px-2 py-6 text-xs text-muted-foreground">
+                          Nothing pinned yet. On Extreme, tap the bookmark — one click. Never goes
+                          to Users.
+                        </p>
+                      ) : null}
+                      {extremePinned.map((item) => {
+                        const symbol = item.ticker
+                        const selected = symbol === activeTicker
+                        const liveQuote = liveQuotes[symbol]
+                        const liveValues = currentMarketQuoteValues(liveQuote)
+                        const livePercent =
+                          formatLivePercent(liveValues.percent) ||
+                          formatLivePercent(item.change_percent ?? null)
+                        const livePrice = formatProviderPrice(
+                          liveValues.price,
+                          liveQuote?.currency || item.currency || 'USD',
+                        )
+                        const pct =
+                          liveValues.percent ??
+                          (item.change_percent != null ? item.change_percent : null)
+                        const liveDown = (pct ?? 0) < 0
+                        const liveUp = (pct ?? 0) > 0
+                        return (
+                          <div
+                            key={`${symbol}-${item.pinned_at}`}
+                            className={cn(
+                              'flex w-full items-start gap-1 transition-colors',
+                              isTrigger
+                                ? cn('desk-row px-1 py-0.5', selected && 'is-selected')
+                                : cn(
+                                    'rounded-xl px-1 py-1',
+                                    selected
+                                      ? 'bg-foreground text-background'
+                                      : 'text-foreground hover:bg-muted/80',
+                                  ),
+                            )}
+                          >
+                            <button
+                              type="button"
+                              role="tab"
+                              aria-selected={selected}
+                              onClick={() => selectTickerByUser(symbol)}
+                              title={`${symbol} · pinned`}
+                              className="flex min-w-0 flex-1 items-start gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm"
+                            >
+                              <TickerLogoMark
+                                symbol={symbol}
+                                selected={isTrigger ? false : selected}
+                                size={isTrigger ? 28 : 22}
+                                customSrc={customLogos[symbol] || null}
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className={cn('tracking-tight', isTrigger ? 'desk-sym' : 'font-semibold')}>{symbol}</span>
+                                  {livePrice ? (
+                                    <span
+                                      className={cn(
+                                        isTrigger
+                                          ? 'desk-price'
+                                          : cn(
+                                              'text-[13px] font-semibold tabular-nums leading-none',
+                                              selected ? 'text-background/85' : 'text-foreground/80',
+                                            ),
+                                      )}
+                                    >
+                                      {livePrice}
+                                    </span>
+                                  ) : null}
+                                  {livePercent ? (
+                                    <span
+                                      className={cn(
+                                        isTrigger
+                                          ? cn(
+                                              'desk-pct',
+                                              liveDown && 'desk-down',
+                                              liveUp && 'desk-up',
+                                              !liveDown && !liveUp && 'text-muted-foreground',
+                                            )
+                                          : cn(
+                                              'text-[13px] font-semibold tabular-nums leading-none',
+                                              selected
+                                                ? liveDown
+                                                  ? 'text-red-200'
+                                                  : liveUp
+                                                    ? 'text-emerald-200'
+                                                    : 'text-background/75'
+                                                : liveDown
+                                                  ? 'text-red-600 dark:text-red-400'
+                                                  : liveUp
+                                                    ? 'text-emerald-700 dark:text-emerald-400'
+                                                    : 'text-muted-foreground',
+                                            ),
+                                      )}
+                                    >
+                                      {livePercent}
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <p
+                                  className={cn(
+                                    'mt-0.5 truncate text-[10px]',
+                                    isTrigger
+                                      ? 'text-muted-foreground'
+                                      : selected
+                                        ? 'text-background/55'
+                                        : 'text-muted-foreground',
+                                  )}
+                                >
+                                  {item.company_name}
+                                </p>
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              title="Unpin"
+                              aria-label={`Unpin ${symbol}`}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                togglePinExtreme(item)
+                              }}
+                              className={cn(
+                                'mt-1.5 mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors',
+                                isTrigger
+                                  ? 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                                  : selected
+                                    ? 'text-background/80 hover:bg-background/15 hover:text-background'
+                                    : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                              )}
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </>
+                  ) : (
+                    <>
                   {listLoading && !tickers.length ? (
                     <div className="flex items-center gap-2 px-2 py-6 text-sm text-muted-foreground">
                       <Loader2 className="size-4 animate-spin" />
@@ -7340,57 +17494,110 @@ export default function NotificationsPage() {
                     const selected = item.ticker === activeTicker
                     const busy = Boolean(tabState[item.ticker]?.loading)
                     const watchers = item.subscriber_count ?? 0
+                    const liveQuote = liveQuotes[item.ticker.toUpperCase()]
+                    const liveValues = currentMarketQuoteValues(liveQuote)
+                    const livePrice = formatProviderPrice(
+                      liveValues.price,
+                      liveQuote?.currency || 'USD',
+                    )
+                    const livePercent = formatLivePercent(liveValues.percent)
+                    const liveDown = (liveValues.percent ?? 0) < 0
+                    const liveUp = (liveValues.percent ?? 0) > 0
                     return (
                       <button
                         key={item.ticker}
                         type="button"
                         role="tab"
                         aria-selected={selected}
-                        onClick={() => setActiveTicker(item.ticker)}
-                        title={
-                          item.company_name
-                            ? `${item.company_name} · ${watchers} watching`
-                            : `${item.ticker} · ${watchers} watching`
-                        }
+                        onClick={() => selectTickerByUser(item.ticker)}
+                        title={`${item.ticker} · ${watchers} watching`}
                         className={cn(
-                          'flex w-full items-start gap-2 rounded-xl px-2.5 py-2.5 text-left text-sm transition-colors',
-                          selected
-                            ? isTrigger
-                              ? 'bg-foreground text-background shadow-sm'
-                              : 'bg-foreground text-background'
-                            : 'text-foreground hover:bg-muted/80',
+                          isTrigger
+                            ? cn('desk-row overflow-hidden', selected && 'is-selected')
+                            : cn(
+                                'flex w-full min-w-0 items-start gap-2 overflow-hidden rounded-xl px-2.5 py-2.5 text-left text-sm transition-colors',
+                                selected
+                                  ? 'bg-foreground text-background'
+                                  : 'text-foreground hover:bg-muted/80',
+                              ),
                         )}
                       >
                         <TickerLogoMark
                           symbol={item.ticker}
-                          selected={selected}
-                          size={22}
+                          selected={isTrigger ? false : selected}
+                          size={isTrigger ? 28 : 22}
                           customSrc={customLogos[item.ticker] || null}
                         />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5">
-                            <span className="font-semibold tracking-tight">{item.ticker}</span>
+                        <div className="min-w-0 flex-1 overflow-hidden">
+                          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                            <span className={cn('shrink-0 tracking-tight', isTrigger ? 'desk-sym' : 'font-semibold')}>
+                              {item.ticker}
+                            </span>
+                            {livePrice ? (
+                              <span
+                                className={cn(
+                                  isTrigger
+                                    ? 'desk-price'
+                                    : cn(
+                                        'text-[13px] font-semibold tabular-nums leading-none',
+                                        selected ? 'text-background/85' : 'text-foreground/80',
+                                      ),
+                                )}
+                                title={`${liveValues.session} price from Yahoo · refreshes every 5 seconds`}
+                              >
+                                {livePrice}
+                              </span>
+                            ) : null}
+                            {livePercent ? (
+                              <span
+                                className={cn(
+                                  isTrigger
+                                    ? cn(
+                                        'desk-pct',
+                                        liveDown && 'desk-down',
+                                        liveUp && 'desk-up',
+                                        !liveDown && !liveUp && 'text-muted-foreground',
+                                      )
+                                    : cn(
+                                        'text-[13px] font-semibold tabular-nums leading-none',
+                                        selected
+                                          ? liveDown
+                                            ? 'text-red-200'
+                                            : liveUp
+                                              ? 'text-emerald-200'
+                                              : 'text-background/75'
+                                          : liveDown
+                                            ? 'text-red-600 dark:text-red-400'
+                                            : liveUp
+                                              ? 'text-emerald-700 dark:text-emerald-400'
+                                              : 'text-muted-foreground',
+                                      ),
+                                )}
+                                title={`${liveValues.session} change from Yahoo · refreshes every 5 seconds`}
+                              >
+                                {livePercent}
+                              </span>
+                            ) : null}
                             {busy ? (
                               <Loader2 className="size-3 animate-spin opacity-80" />
                             ) : null}
                           </div>
-                          {item.company_name && item.company_name !== item.ticker ? (
-                            <p
-                              className={cn(
-                                'mt-0.5 truncate text-[11px]',
-                                selected ? 'text-background/75' : 'text-muted-foreground',
-                              )}
-                            >
+                          {isTrigger && item.company_name && item.company_name !== item.ticker ? (
+                            <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
                               {item.company_name}
                             </p>
                           ) : null}
                         </div>
                         <span
                           className={cn(
-                            'mt-0.5 shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-                            selected
-                              ? 'bg-background/15 text-background'
-                              : 'bg-muted text-muted-foreground',
+                            isTrigger
+                              ? 'desk-count'
+                              : cn(
+                                  'mt-0.5 shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
+                                  selected
+                                    ? 'bg-background/15 text-background'
+                                    : 'bg-muted text-muted-foreground',
+                                ),
                           )}
                           title={`${watchers} user(s) monitoring`}
                         >
@@ -7399,12 +17606,20 @@ export default function NotificationsPage() {
                       </button>
                     )
                   })}
+                    </>
+                  )}
                 </div>
 
-                {/* Yahoo search + add — pinned under the ticker list */}
+                {/* Yahoo search + add — Users list only (real subscribers / never Extreme pin) */}
+                {stocksListTab === 'users' ? (
                 <div
                   ref={tickerSearchRef}
-                  className="relative shrink-0 border-t border-border/60 bg-background/80 p-2"
+                  className={cn(
+                    'relative shrink-0 p-2.5',
+                    isTrigger
+                      ? 'border-t border-[color:var(--desk-hairline)] bg-card/80'
+                      : 'border-t border-border/60 bg-background/80',
+                  )}
                 >
                   {tickerSearchOpen && tickerSearchQuery.trim() ? (
                     <div className="absolute inset-x-2 bottom-full z-30 mb-1 max-h-56 overflow-y-auto rounded-xl border border-border/70 bg-popover p-1 shadow-lg">
@@ -7433,7 +17648,7 @@ export default function NotificationsPage() {
                               className="min-w-0 flex-1 rounded-md px-1 py-1 text-left"
                               onClick={() => {
                                 if (inList) {
-                                  setActiveTicker(symbol)
+                                  selectTickerByUser(symbol)
                                   setTickerSearchQuery('')
                                   setTickerSearchOpen(false)
                                 } else {
@@ -7464,7 +17679,7 @@ export default function NotificationsPage() {
                                 variant="ghost"
                                 className="h-7 shrink-0 px-2 text-[10px]"
                                 onClick={() => {
-                                  setActiveTicker(symbol)
+                                  selectTickerByUser(symbol)
                                   setTickerSearchQuery('')
                                   setTickerSearchOpen(false)
                                 }}
@@ -7530,6 +17745,7 @@ export default function NotificationsPage() {
                     />
                   </div>
                 </div>
+                ) : null}
               </aside>
 
               {/* Column 2 — selected ticker data */}
@@ -7540,209 +17756,499 @@ export default function NotificationsPage() {
                 )}
               >
             {activeTicker ? (
-              <section className="space-y-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2.5">
-                      <TickerLogoMark
-                        symbol={activeTicker}
-                        size={isTrigger ? 40 : 32}
-                        customSrc={customLogos[activeTicker] || null}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          openLogoReplaceDialog(
-                            activeTicker,
-                            activeMeta?.company_name || null,
-                          )
-                        }}
-                        className="shadow-sm ring-1 ring-border/60"
-                      />
-                      <h2
-                        className={cn(
-                          'font-semibold tracking-tight',
-                          isTrigger ? 'text-2xl sm:text-3xl' : 'text-xl',
-                        )}
-                      >
-                        {activeTicker}
-                      </h2>
-                      {activeMeta?.saved_event_count ? (
-                        <span className="text-xs text-muted-foreground sm:text-sm">
-                          Saved in DB:{' '}
-                          <span className="font-medium text-foreground">
-                            {activeMeta.saved_event_count} date
-                            {activeMeta.saved_event_count === 1 ? '' : 's'}
+              <section className={cn(isTrigger ? 'space-y-4' : 'space-y-5')}>
+                {/* Ticker header card */}
+                <div className={cn(isTrigger ? 'desk-panel p-4 sm:p-5' : 'rounded-2xl border border-border/70 bg-card/40 p-4 shadow-sm sm:p-5')}>
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                    {/* Identity + quote */}
+                    <div className="min-w-0 flex-1 space-y-3.5">
+                      <div className="flex min-w-0 flex-wrap items-start gap-3 sm:gap-4">
+                        <TickerLogoMark
+                          symbol={activeTicker}
+                          size={isTrigger ? 48 : 40}
+                          customSrc={customLogos[activeTicker] || null}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            openLogoReplaceDialog(
+                              activeTicker,
+                              activeMeta?.company_name || null,
+                            )
+                          }}
+                          className="mt-0.5 shrink-0 shadow-sm ring-1 ring-border/60"
+                        />
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex min-w-0 flex-wrap items-center gap-2">
+                            <h2
+                              className={cn(
+                                'shrink-0 font-semibold tracking-tight text-foreground',
+                                isTrigger ? 'text-2xl sm:text-3xl' : 'text-xl sm:text-2xl',
+                              )}
+                            >
+                              {activeTicker}
+                            </h2>
+                            {extremePinnedSet.has(activeTicker.toUpperCase()) ? (
+                              <Badge
+                                variant="outline"
+                                className="shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-100"
+                                title={
+                                  stocksListTab === 'users' &&
+                                  (activeMeta?.subscriber_count ?? 0) > 0
+                                    ? 'Also bookmarked in Pinned · Users shows it only because real devices subscribed'
+                                    : 'Pinned from Extreme · stored in pinned_monitored_tickers · not Users'
+                                }
+                              >
+                                {stocksListTab === 'users' &&
+                                (activeMeta?.subscriber_count ?? 0) > 0
+                                  ? 'Also pinned'
+                                  : 'Pinned'}
+                              </Badge>
+                            ) : stocksListTab === 'extreme' ? (
+                              <Badge
+                                variant="outline"
+                                className="shrink-0 text-muted-foreground"
+                              >
+                                Extreme · view only
+                              </Badge>
+                            ) : null}
+                          </div>
+                          {activeCompanyName && activeCompanyName !== activeTicker ? (
+                            <p
+                              className="max-w-xl truncate text-sm text-muted-foreground"
+                              title={activeCompanyName}
+                            >
+                              {activeCompanyName}
+                            </p>
+                          ) : null}
+                        </div>
+                        {activeMarketPillItems.length ? (
+                          <div className="w-full shrink-0 sm:ml-auto sm:w-auto">
+                            <MarketDataPill
+                              items={activeMarketPillItems}
+                              lastCheckedAt={liveQuotesLastCheckedAt}
+                              currency={activeLiveQuote?.currency || 'USD'}
+                              stacked={activeMarketSession !== 'regular'}
+                            />
+                          </div>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground">
+                            <Loader2 className="size-3 animate-spin" />
+                            Yahoo quote
                           </span>
-                          {activeMeta.last_saved_at
-                            ? ` · last save ${new Date(activeMeta.last_saved_at).toLocaleString()}`
-                            : ''}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-muted-foreground sm:text-sm">
-                          Saved in DB: <span className="font-medium text-foreground">0 dates</span>
-                        </span>
-                      )}
-                      {activeMeta?.company_name && activeMeta.company_name !== activeTicker ? (
-                        <Badge
-                          variant="secondary"
-                          className={isTrigger ? 'rounded-full px-3' : undefined}
-                        >
-                          {activeMeta.company_name}
-                        </Badge>
-                      ) : null}
-                    </div>
-                    <p className="text-sm text-muted-foreground">
-                      Source:{' '}
+                        )}
+                      </div>
+
+                      {/* Fundamentals */}
                       {(() => {
-                        const source = sourceLabelForTicker({
-                          ticker: activeTicker,
-                          scrape_source:
-                            activeState.result?.scrape_source || activeMeta?.scrape_source,
-                          source_url: activeState.result?.url || activeMeta?.source_url,
-                        })
+                        const pillClass =
+                          'inline-flex max-w-[15rem] items-center gap-1.5 rounded-full border border-border/60 bg-background/80 px-2.5 py-1 text-[11px] leading-none'
+                        const labelClass =
+                          'shrink-0 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/80'
+                        const valueClass = 'min-w-0 truncate font-medium text-foreground'
+                        type FundPill = {
+                          key: string
+                          label: string
+                          title?: string
+                          node: React.ReactNode
+                        }
+                        const pills: FundPill[] = []
+
+                        const mcap = formatMarketCap(
+                          companyProfile?.marketCap,
+                          companyProfile?.currency || 'USD',
+                        )
+                        if (mcap) {
+                          pills.push({
+                            key: 'mcap',
+                            label: 'Mkt cap',
+                            title: 'Market capitalization',
+                            node: (
+                              <span className={cn(valueClass, 'tabular-nums')}>{mcap}</span>
+                            ),
+                          })
+                        }
+                        if (companyProfile?.sector) {
+                          pills.push({
+                            key: 'sector',
+                            label: 'Sector',
+                            title: companyProfile.sector,
+                            node: (
+                              <span className={valueClass}>{companyProfile.sector}</span>
+                            ),
+                          })
+                        }
+                        if (companyProfile?.industry) {
+                          pills.push({
+                            key: 'industry',
+                            label: 'Industry',
+                            title: companyProfile.industry,
+                            node: (
+                              <span className={valueClass}>{companyProfile.industry}</span>
+                            ),
+                          })
+                        }
+                        if (companyProfile?.about) {
+                          pills.push({
+                            key: 'about',
+                            label: 'About',
+                            title: 'Hover for company description',
+                            node: (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    type="button"
+                                    className="font-semibold text-sky-700 underline decoration-sky-700/35 underline-offset-2 hover:text-sky-800 dark:text-sky-300 dark:hover:text-sky-200"
+                                  >
+                                    View
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="bottom"
+                                  align="start"
+                                  sideOffset={8}
+                                  collisionPadding={16}
+                                  className="max-w-md whitespace-pre-wrap p-3 text-left text-xs leading-relaxed"
+                                >
+                                  <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide opacity-70">
+                                    About {activeCompanyName || activeTicker}
+                                  </p>
+                                  <p className="max-h-72 overflow-y-auto">
+                                    {companyProfile.about}
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            ),
+                          })
+                        }
+                        if (companyProfile?.founded) {
+                          pills.push({
+                            key: 'founded',
+                            label: 'Founded',
+                            title: 'Founded',
+                            node: (
+                              <span className={valueClass}>{companyProfile.founded}</span>
+                            ),
+                          })
+                        }
+                        const emp = formatEmployeeCount(companyProfile?.fullTimeEmployees)
+                        if (emp) {
+                          pills.push({
+                            key: 'employees',
+                            label: 'Employees',
+                            title: 'Full-time employees',
+                            node: (
+                              <span className={cn(valueClass, 'tabular-nums')}>{emp}</span>
+                            ),
+                          })
+                        }
+                        const hq = [companyProfile?.city, companyProfile?.country]
+                          .filter(Boolean)
+                          .join(', ')
+                        if (hq) {
+                          pills.push({
+                            key: 'hq',
+                            label: 'HQ',
+                            title: 'Headquarters',
+                            node: <span className={valueClass}>{hq}</span>,
+                          })
+                        }
+                        if (companyProfile?.ceo) {
+                          const ceoName = companyProfile.ceo.replace(
+                            /^Mr\.\s+|^Ms\.\s+|^Mrs\.\s+/i,
+                            '',
+                          )
+                          pills.push({
+                            key: 'ceo',
+                            label: companyProfile.ceoTitle?.toLowerCase().includes('ceo')
+                              ? 'CEO'
+                              : 'Lead',
+                            title: companyProfile.ceoTitle || 'CEO',
+                            node: <span className={valueClass}>{ceoName}</span>,
+                          })
+                        }
+                        if (companyProfile?.website) {
+                          const href = companyProfile.website.startsWith('http')
+                            ? companyProfile.website
+                            : `https://${companyProfile.website}`
+                          pills.push({
+                            key: 'website',
+                            label: 'Web',
+                            title: companyProfile.website,
+                            node: (
+                              <a
+                                href={href}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex min-w-0 items-center gap-0.5 font-semibold text-sky-700 hover:underline dark:text-sky-300"
+                              >
+                                <span className="truncate">Open</span>
+                                <ExternalLink className="size-2.5 shrink-0 opacity-70" />
+                              </a>
+                            ),
+                          })
+                        }
+
+                        if (companyProfileLoading && !companyProfile) {
+                          return (
+                            <div className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-background/80 px-2.5 py-1 text-[11px] text-muted-foreground">
+                              <Loader2 className="size-3 animate-spin" />
+                              Loading profile…
+                            </div>
+                          )
+                        }
+                        if (!pills.length) return null
+
                         return (
-                          <a
-                            className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
-                            href={source.href}
-                            target="_blank"
-                            rel="noreferrer"
+                          <div
+                            className="flex min-w-0 flex-wrap items-center gap-1.5"
+                            role="list"
+                            aria-label="Company fundamentals"
                           >
-                            {source.short}
-                            <ExternalLink className="size-3" />
-                          </a>
+                            {pills.map((pill) => (
+                              <span
+                                key={pill.key}
+                                className={pillClass}
+                                title={pill.title}
+                                role="listitem"
+                              >
+                                <span className={labelClass}>{pill.label}</span>
+                                {pill.node}
+                              </span>
+                            ))}
+                          </div>
                         )
                       })()}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {notificationApp === 'trigger' ? 'Trigger devices subscribed' : 'Devices subscribed'}:{' '}
-                      <span className="font-medium text-foreground">
-                        {activeMeta?.subscriber_count ?? 0}
-                      </span>
-                      {activeMeta?.device_ids?.length ? (
-                        <span className="text-muted-foreground">
-                          {' '}
-                          · {activeMeta.device_ids.join(', ')}
-                        </span>
-                      ) : null}
-                    </p>
-                    {(() => {
-                      const tickerUsage =
-                        activeMeta?.gemini_usage ||
-                        sumEventsGeminiUsage(storedEvents)
-                      const cost =
-                        activeMeta?.gemini_cost_usd_display ||
-                        tickerUsage.cost_usd_display ||
-                        formatUsdCompact(
-                          activeMeta?.gemini_cost_usd ?? tickerUsage.cost_usd,
-                        )
-                      const tokens =
-                        activeMeta?.gemini_total_tokens ?? tickerUsage.total_tokens ?? 0
-                      const credits =
-                        activeMeta?.gemini_credits_used ?? tickerUsage.credits_used ?? 0
-                      return (
-                        <p className="text-xs text-muted-foreground">
-                          Gemini spend:{' '}
-                          <span className="font-medium tabular-nums text-violet-800 dark:text-violet-200">
-                            {cost}
-                          </span>
-                          <span className="text-muted-foreground">
-                            {' '}
-                            · {Number(tokens).toLocaleString()} tokens ·{' '}
-                            {Number(credits).toLocaleString()} credits
-                            {tickerUsage.dates_with_gemini
-                              ? ` · ${tickerUsage.dates_with_gemini} date${
-                                  tickerUsage.dates_with_gemini === 1 ? '' : 's'
-                                }`
-                              : ''}
-                          </span>
-                        </p>
-                      )
-                    })()}
-                  </div>
 
-                  <div className={cn('flex flex-wrap items-center gap-2', isTrigger && 'gap-2.5')}>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={activeState.loading || allTickersLoading || geminiPromptRunning}
-                      onClick={() => void handleRefresh(activeTicker)}
-                      className={isTrigger ? 'rounded-full px-4' : undefined}
-                    >
-                      {activeState.loading ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <RefreshCw className="size-4" />
-                      )}
-                      {notificationApp === 'trigger' ? 'Fetch & auto-save' : 'Refresh'}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={
-                        !activeTicker ||
-                        activeState.loading ||
-                        geminiPromptRunning ||
-                        geminiBulkBusy ||
-                        Boolean(geminiBusyKey)
-                      }
-                      onClick={() => void openGeminiAutoSavePrompt()}
-                      title="Open Gemini prompt, then format & save all dates without gemini_formating"
+                      {/* Compact meta chips */}
+                      <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1.5 text-[11px] text-muted-foreground sm:text-xs">
+                        <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-1">
+                          <span className="text-muted-foreground/80">Saved</span>
+                          <span className="font-medium text-foreground">
+                            {activeMeta?.saved_event_count ?? 0}
+                          </span>
+                          <span>
+                            date{(activeMeta?.saved_event_count ?? 0) === 1 ? '' : 's'}
+                          </span>
+                          {activeMeta?.last_saved_at ? (
+                            <span
+                              className="hidden text-muted-foreground/70 sm:inline"
+                              title={new Date(activeMeta.last_saved_at).toLocaleString()}
+                            >
+                              · {new Date(activeMeta.last_saved_at).toLocaleDateString()}
+                            </span>
+                          ) : null}
+                        </span>
+                        <span className="text-border">·</span>
+                        <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-muted/50 px-2 py-1">
+                          <span className="shrink-0 text-muted-foreground/80">Source</span>
+                          {(() => {
+                            const source = sourceLabelForTicker({
+                              ticker: activeTicker,
+                              scrape_source:
+                                activeState.result?.scrape_source || activeMeta?.scrape_source,
+                              source_url: activeState.result?.url || activeMeta?.source_url,
+                            })
+                            return (
+                              <a
+                                className="inline-flex min-w-0 items-center gap-1 font-medium text-foreground underline-offset-2 hover:underline"
+                                href={source.href}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                <span className="truncate">{source.short}</span>
+                                <ExternalLink className="size-2.5 shrink-0 opacity-60" />
+                              </a>
+                            )
+                          })()}
+                        </span>
+                        <span className="text-border">·</span>
+                        {(() => {
+                          const count = activeMeta?.subscriber_count ?? 0
+                          const devices = activeMeta?.device_ids || []
+                          const label =
+                            notificationApp === 'trigger' ? 'Devices' : 'Devices'
+                          const chip = (
+                            <span className="inline-flex max-w-full items-center gap-1 rounded-md bg-muted/50 px-2 py-1">
+                              <Users className="size-3 shrink-0 opacity-60" />
+                              <span className="font-medium tabular-nums text-foreground">
+                                {count}
+                              </span>
+                              <span className="text-muted-foreground/80">{label}</span>
+                              {devices.length > 0 ? (
+                                <span className="hidden max-w-[12rem] truncate text-muted-foreground/70 sm:inline">
+                                  · {devices[0]}
+                                  {devices.length > 1 ? ` +${devices.length - 1}` : ''}
+                                </span>
+                              ) : null}
+                            </span>
+                          )
+                          if (!devices.length) return chip
+                          return (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <button type="button" className="max-w-full text-left">
+                                  {chip}
+                                </button>
+                              </TooltipTrigger>
+                              <TooltipContent
+                                side="bottom"
+                                align="start"
+                                className="max-w-sm p-2.5 text-left text-xs"
+                              >
+                                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide opacity-70">
+                                  {notificationApp === 'trigger'
+                                    ? 'Trigger devices'
+                                    : 'Subscribed devices'}
+                                </p>
+                                <ul className="max-h-48 space-y-1 overflow-y-auto font-mono text-[11px] leading-snug">
+                                  {devices.map((id) => (
+                                    <li key={id} className="break-all">
+                                      {id}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </TooltipContent>
+                            </Tooltip>
+                          )
+                        })()}
+                        <span className="text-border">·</span>
+                        {(() => {
+                          const tickerUsage =
+                            activeMeta?.gemini_usage || sumEventsGeminiUsage(storedEvents)
+                          const cost =
+                            activeMeta?.gemini_cost_usd_display ||
+                            tickerUsage.cost_usd_display ||
+                            formatUsdCompact(
+                              activeMeta?.gemini_cost_usd ?? tickerUsage.cost_usd,
+                            )
+                          const tokens =
+                            activeMeta?.gemini_total_tokens ?? tickerUsage.total_tokens ?? 0
+                          const credits =
+                            activeMeta?.gemini_credits_used ?? tickerUsage.credits_used ?? 0
+                          const dates = tickerUsage.dates_with_gemini
+                          return (
+                            <span
+                              className="desk-stat desk-stat--accent !rounded-md"
+                              title={`${Number(tokens).toLocaleString()} tokens · ${Number(credits).toLocaleString()} credits${
+                                dates
+                                  ? ` · ${dates} date${dates === 1 ? '' : 's'}`
+                                  : ''
+                              }`}
+                            >
+                              <Sparkles className="size-3 shrink-0 opacity-70" />
+                              <strong>{cost}</strong>
+                              <span className="hidden sm:inline opacity-80">
+                                Gemini
+                                {dates
+                                  ? ` · ${dates}d`
+                                  : ''}
+                              </span>
+                            </span>
+                          )
+                        })()}
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div
                       className={cn(
-                        'gap-1.5 border-violet-500/40 bg-violet-500/10 text-violet-950 hover:bg-violet-500/15 dark:text-violet-100',
-                        isTrigger && 'rounded-full px-4',
+                        'flex shrink-0 flex-wrap items-center gap-2 lg:flex-col lg:items-stretch',
+                        isTrigger && 'gap-2.5',
                       )}
                     >
-                      {geminiPromptRunning ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <Sparkles className="size-4 text-violet-600" />
-                      )}
-                      {geminiPromptRunning
-                        ? `Gemini ${geminiBulkProgress.done}/${geminiBulkProgress.total}`
-                        : 'Gemini & auto-save'}
-                    </Button>
-                    {notificationApp === 'nineam' ? (
                       <Button
                         type="button"
+                        variant="outline"
                         disabled={
-                          activeState.saving ||
-                          activeState.loading ||
-                          !events.length ||
-                          pendingSaveCount === 0
+                          activeState.loading || allTickersLoading || geminiPromptRunning
                         }
-                        onClick={() => void handleSave(activeTicker)}
+                        onClick={() => void handleRefresh(activeTicker)}
+                        className={cn(
+                          'justify-start',
+                          isTrigger && 'desk-action h-auto border-0 shadow-none',
+                        )}
                       >
-                        {activeState.saving ? (
+                        {activeState.loading ? (
                           <Loader2 className="size-4 animate-spin" />
                         ) : (
-                          <Save className="size-4" />
+                          <RefreshCw className="size-4" />
                         )}
-                        {pendingSaveCount > 0
-                          ? `Save ${pendingSaveCount} pending`
-                          : 'Save'}
+                        {notificationApp === 'trigger' ? 'Fetch & auto-save' : 'Refresh'}
                       </Button>
-                    ) : null}
-                    <Button
-                      type="button"
-                      variant="default"
-                      disabled={
-                        activeState.alerting ||
-                        activeState.loading ||
-                        (activeMeta?.subscriber_count ?? 0) === 0
-                      }
-                      onClick={() => void openMovementAlert(activeTicker)}
-                      title="Send Expo push to all enabled devices subscribed to this ticker"
-                      className={isTrigger ? 'rounded-full px-4 shadow-sm' : undefined}
-                    >
-                      {activeState.alerting ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <BellRing className="size-4" />
-                      )}
-                      Alert users
-                      {(activeMeta?.subscriber_count ?? 0) > 0
-                        ? ` (${activeMeta?.subscriber_count})`
-                        : ''}
-                    </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={
+                          !activeTicker ||
+                          activeState.loading ||
+                          geminiPromptRunning ||
+                          geminiBulkBusy ||
+                          Boolean(geminiBusyKey)
+                        }
+                        onClick={() => void openGeminiAutoSavePrompt()}
+                        title="Open Gemini prompt, then format & save all dates without gemini_formating"
+                        className={cn(
+                          isTrigger
+                            ? 'desk-action desk-action--soft h-auto justify-start gap-1.5 border-0 shadow-none'
+                            : 'justify-start gap-1.5 border-violet-500/40 bg-violet-500/10 text-violet-950 hover:bg-violet-500/15 dark:text-violet-100',
+                        )}
+                      >
+                        {geminiPromptRunning ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <Sparkles className={cn('size-4', isTrigger ? 'text-primary' : 'text-violet-600')} />
+                        )}
+                        {geminiPromptRunning
+                          ? `Gemini ${geminiBulkProgress.done}/${geminiBulkProgress.total}`
+                          : 'Gemini & auto-save'}
+                      </Button>
+                      {notificationApp === 'nineam' ? (
+                        <Button
+                          type="button"
+                          disabled={
+                            activeState.saving ||
+                            activeState.loading ||
+                            !events.length ||
+                            pendingSaveCount === 0
+                          }
+                          onClick={() => void handleSave(activeTicker)}
+                          className="justify-start"
+                        >
+                          {activeState.saving ? (
+                            <Loader2 className="size-4 animate-spin" />
+                          ) : (
+                            <Save className="size-4" />
+                          )}
+                          {pendingSaveCount > 0
+                            ? `Save ${pendingSaveCount} pending`
+                            : 'Save'}
+                        </Button>
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="default"
+                        disabled={
+                          activeState.alerting ||
+                          activeState.loading ||
+                          (activeMeta?.subscriber_count ?? 0) === 0
+                        }
+                        onClick={() => void openMovementAlert(activeTicker)}
+                        title="Send Expo push to all enabled devices subscribed to this ticker"
+                        className={cn(
+                          'justify-start',
+                          isTrigger && 'desk-action desk-action--primary h-auto border-0 shadow-none',
+                        )}
+                      >
+                        {activeState.alerting ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <BellRing className="size-4" />
+                        )}
+                        Alert users
+                        {(activeMeta?.subscriber_count ?? 0) > 0
+                          ? ` (${activeMeta?.subscriber_count})`
+                          : ''}
+                      </Button>
+                    </div>
                   </div>
                 </div>
 
@@ -7779,7 +18285,14 @@ export default function NotificationsPage() {
                 ) : null}
 
                 {activeState.result ? (
-                  <div className="grid gap-2 rounded-xl border bg-muted/30 p-3 text-sm sm:grid-cols-2 lg:grid-cols-5">
+                  <div
+                    className={cn(
+                      'grid gap-2 p-3 text-sm sm:grid-cols-2 lg:grid-cols-5',
+                      isTrigger
+                        ? 'desk-panel'
+                        : 'rounded-xl border bg-muted/30',
+                    )}
+                  >
                     <div>
                       <div className="text-xs uppercase text-muted-foreground">Credits used</div>
                       <div className="font-medium">
@@ -7821,10 +18334,23 @@ export default function NotificationsPage() {
                 ) : null}
 
                 {pendingEvents.length > 0 ? (
-                  <section className="space-y-3 rounded-2xl border border-amber-500/35 bg-amber-500/5 p-4">
+                  <section
+                    className={cn(
+                      'space-y-3 p-4',
+                      isTrigger
+                        ? 'desk-event desk-event-pending'
+                        : 'rounded-2xl border border-amber-500/35 bg-amber-500/5',
+                    )}
+                  >
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-amber-900 dark:text-amber-200">
+                        <h3
+                          className={cn(
+                            isTrigger
+                              ? 'desk-section-label text-foreground normal-case tracking-normal text-sm font-semibold'
+                              : 'text-sm font-semibold uppercase tracking-[0.12em] text-amber-900 dark:text-amber-200',
+                          )}
+                        >
                           New data · not yet saved
                         </h3>
                         <p className="mt-1 text-xs text-muted-foreground">
@@ -7861,7 +18387,7 @@ export default function NotificationsPage() {
                         </Button>
                       </div>
                     </div>
-                    <div className="space-y-12">
+                    <div className={cn(isTrigger ? 'space-y-3' : 'space-y-12')}>
                       {pendingEvents.map((event) => {
                         const change = formatChange(event.price_change || event.momentum)
                         const premarketChange = formatChange(getPremarketChange(event))
@@ -7872,7 +18398,7 @@ export default function NotificationsPage() {
                         return (
                           <article
                             key={`pending-${event.event_date}-${event.time_label || ''}`}
-                            className="space-y-3"
+                            className={cn('space-y-3', isTrigger && 'desk-event')}
                           >
                             <div className="flex flex-wrap items-start justify-between gap-2">
                               <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -7890,11 +18416,14 @@ export default function NotificationsPage() {
                                 </Badge>
                                 <button
                                   type="button"
-                                  disabled={geminiBusy}
-                                  onClick={() =>
+                                  data-event-date={event.event_date}
+                                  disabled={Boolean(geminiBusyKey) || geminiBulkBusy}
+                                  onClick={(e) => {
+                                    e.preventDefault()
+                                    e.stopPropagation()
                                     void handleGeminiSummarize(activeTicker, event, 'summary')
-                                  }
-                                  title="Structure this date's reason with Gemini"
+                                  }}
+                                  title={`Structure ${formatEventHeading(event)} (${event.event_date}) with Gemini`}
                                   className="disabled:pointer-events-none disabled:opacity-60"
                                 >
                                   {geminiBusy ? (
@@ -7995,19 +18524,46 @@ export default function NotificationsPage() {
                                     Pre-market {premarketChange.text}
                                   </Badge>
                                 ) : null}
+                                {(() => {
+                                  const afterHoursChange = formatChange(
+                                    event.after_hours_change ?? null,
+                                  )
+                                  if (!afterHoursChange && !event.after_hours_price) return null
+                                  return (
+                                    <Badge
+                                      variant="secondary"
+                                      className={cn(
+                                        'font-mono',
+                                        afterHoursChange?.negative &&
+                                          'bg-red-500/10 text-red-700 dark:text-red-300',
+                                        afterHoursChange?.positive &&
+                                          'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+                                      )}
+                                    >
+                                      {event.after_hours_price
+                                        ? `AH ${event.after_hours_price}`
+                                        : 'After-hours'}
+                                      {afterHoursChange ? ` ${afterHoursChange.text}` : ''}
+                                    </Badge>
+                                  )
+                                })()}
                               </div>
                             </div>
-                            <div className="mt-3 space-y-3 rounded-xl border border-border/60 bg-card/40 p-3">
+                            <div className={cn(
+                              'mt-3 space-y-3 p-3',
+                              isTrigger
+                                ? 'rounded-xl border border-[color:var(--desk-hairline)] bg-muted/30'
+                                : 'rounded-xl border border-border/60 bg-card/40',
+                            )}>
                               <div className="space-y-1.5">
                                 <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                                   Reason
                                 </p>
                                 <Textarea
-                                  value={
-                                    reasonDrafts[reasonDraftKey(activeTicker, event)] ??
-                                    event.summary ??
-                                    ''
-                                  }
+                                  value={reasonDisplayText(
+                                    event,
+                                    reasonDrafts[reasonDraftKey(activeTicker, event)],
+                                  )}
                                   onChange={(e) =>
                                     setReasonDrafts((prev) => ({
                                       ...prev,
@@ -8015,9 +18571,9 @@ export default function NotificationsPage() {
                                     }))
                                   }
                                   onBlur={() => void handleSaveReasonEdit(activeTicker, event)}
-                                  rows={5}
-                                  className="min-h-[6rem] resize-y text-sm leading-relaxed"
-                                  placeholder="Reason / Gemini notification text…"
+                                  rows={8}
+                                  className="min-h-[8rem] resize-y whitespace-pre-wrap text-sm leading-relaxed"
+                                  placeholder={"$TICKER +x% so far in regular trading\nLikely driver: …\nSecondary driver: …"}
                                   disabled={
                                     reasonSavingKey === reasonDraftKey(activeTicker, event)
                                   }
@@ -8028,21 +18584,16 @@ export default function NotificationsPage() {
                                   Sources
                                   {sources.length ? ` (${sources.length})` : ''}
                                 </p>
-                                <Textarea
-                                  value={
-                                    sourceDrafts[reasonDraftKey(activeTicker, event)] ??
-                                    serializeSourcesDraft(event.sources || [])
-                                  }
-                                  onChange={(e) =>
+                                <EventSourcesRow
+                                  sources={sources}
+                                  draft={sourceDrafts[reasonDraftKey(activeTicker, event)]}
+                                  onDraftChange={(value) =>
                                     setSourceDrafts((prev) => ({
                                       ...prev,
-                                      [reasonDraftKey(activeTicker, event)]: e.target.value,
+                                      [reasonDraftKey(activeTicker, event)]: value,
                                     }))
                                   }
                                   onBlur={() => void handleSaveReasonEdit(activeTicker, event)}
-                                  rows={Math.min(6, Math.max(2, sources.length || 2))}
-                                  className="min-h-[3.5rem] resize-y text-sm leading-relaxed"
-                                  placeholder={'Bloomberg\nReuters\nCNBC'}
                                   disabled={
                                     reasonSavingKey === reasonDraftKey(activeTicker, event)
                                   }
@@ -8083,9 +18634,17 @@ export default function NotificationsPage() {
                   </div>
                 ) : null}
 
-                {/* Saved dates — divider between each date (no card chrome) */}
+                {/* Saved dates timeline */}
                 {storedEvents.length > 0 ? (
-                  <div className="space-y-14">
+                  <div className={cn(isTrigger ? 'space-y-3' : 'space-y-14')}>
+                    {isTrigger ? (
+                      <div className="flex items-center justify-between gap-2 px-0.5">
+                        <p className="desk-section-label">Timeline</p>
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {storedEvents.length} saved
+                        </span>
+                      </div>
+                    ) : null}
                     {storedEvents.map((event) => {
                       const change = formatChange(event.price_change || event.momentum)
                       const premarketChange = formatChange(getPremarketChange(event))
@@ -8097,7 +18656,7 @@ export default function NotificationsPage() {
                       return (
                         <article
                           key={event.event_date + (event.time_label || '')}
-                          className="space-y-3"
+                          className={cn('space-y-3', isTrigger && 'desk-event')}
                         >
                           <div className="flex flex-wrap items-start justify-between gap-2">
                             <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -8121,11 +18680,14 @@ export default function NotificationsPage() {
                               ) : null}
                               <button
                                 type="button"
-                                disabled={geminiBusy}
-                                onClick={() =>
+                                data-event-date={event.event_date}
+                                disabled={Boolean(geminiBusyKey) || geminiBulkBusy}
+                                onClick={(e) => {
+                                  e.preventDefault()
+                                  e.stopPropagation()
                                   void handleGeminiSummarize(activeTicker, event, 'summary')
-                                }
-                                title="Structure this date's reason with Gemini"
+                                }}
+                                title={`Structure ${formatEventHeading(event)} (${event.event_date}) with Gemini`}
                                 className="disabled:pointer-events-none disabled:opacity-60"
                               >
                                 {geminiBusy ? (
@@ -8227,20 +18789,47 @@ export default function NotificationsPage() {
                                   Pre-market {premarketChange.text}
                                 </Badge>
                               ) : null}
+                              {(() => {
+                                const afterHoursChange = formatChange(
+                                  event.after_hours_change ?? null,
+                                )
+                                if (!afterHoursChange && !event.after_hours_price) return null
+                                return (
+                                  <Badge
+                                    variant="secondary"
+                                    className={cn(
+                                      'font-mono',
+                                      afterHoursChange?.negative &&
+                                        'bg-red-500/10 text-red-700 dark:text-red-300',
+                                      afterHoursChange?.positive &&
+                                        'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+                                    )}
+                                  >
+                                    {event.after_hours_price
+                                      ? `AH ${event.after_hours_price}`
+                                      : 'After-hours'}
+                                    {afterHoursChange ? ` ${afterHoursChange.text}` : ''}
+                                  </Badge>
+                                )
+                              })()}
                             </div>
                           </div>
 
-                          <div className="mt-3 space-y-3 rounded-xl border border-border/60 bg-card/40 p-3">
+                          <div className={cn(
+                              'mt-3 space-y-3 p-3',
+                              isTrigger
+                                ? 'rounded-xl border border-[color:var(--desk-hairline)] bg-muted/30'
+                                : 'rounded-xl border border-border/60 bg-card/40',
+                            )}>
                             <div className="space-y-1.5">
                               <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                                 Reason
                               </p>
                               <Textarea
-                                value={
-                                  reasonDrafts[reasonDraftKey(activeTicker, event)] ??
-                                  event.summary ??
-                                  ''
-                                }
+                                value={reasonDisplayText(
+                                  event,
+                                  reasonDrafts[reasonDraftKey(activeTicker, event)],
+                                )}
                                 onChange={(e) =>
                                   setReasonDrafts((prev) => ({
                                     ...prev,
@@ -8261,21 +18850,16 @@ export default function NotificationsPage() {
                                 Sources
                                 {sources.length ? ` (${sources.length})` : ''}
                               </p>
-                              <Textarea
-                                value={
-                                  sourceDrafts[reasonDraftKey(activeTicker, event)] ??
-                                  serializeSourcesDraft(event.sources || [])
-                                }
-                                onChange={(e) =>
+                              <EventSourcesRow
+                                sources={sources}
+                                draft={sourceDrafts[reasonDraftKey(activeTicker, event)]}
+                                onDraftChange={(value) =>
                                   setSourceDrafts((prev) => ({
                                     ...prev,
-                                    [reasonDraftKey(activeTicker, event)]: e.target.value,
+                                    [reasonDraftKey(activeTicker, event)]: value,
                                   }))
                                 }
                                 onBlur={() => void handleSaveReasonEdit(activeTicker, event)}
-                                rows={Math.min(6, Math.max(2, sources.length || 2))}
-                                className="min-h-[3.5rem] resize-y text-sm leading-relaxed"
-                                placeholder={'Bloomberg\nReuters\nCNBC'}
                                 disabled={
                                   reasonSavingKey === reasonDraftKey(activeTicker, event)
                                 }
@@ -8774,7 +19358,7 @@ export default function NotificationsPage() {
               </DialogTitle>
               <DialogDescription>
                 {geminiEditTarget
-                  ? `${geminiEditTarget.ticker} · ${formatEventHeading(geminiEditTarget.event)} · edit Likely/Secondary structure, then save to Supabase (not a push)`
+                  ? `${geminiEditTarget.ticker} · ${formatEventHeading(geminiEditTarget.event)} (${geminiEditTarget.event.event_date}) · edit Likely/Secondary structure, then save to Supabase (not a push)`
                   : 'Edit structured reason, then save (not a push)'}
                 {geminiEditModel ? ` · ${geminiEditModel}` : ''}
               </DialogDescription>
@@ -8847,7 +19431,10 @@ export default function NotificationsPage() {
           {geminiEditOriginal ? (
             <div className="rounded-xl border bg-muted/30 p-3">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                Original scrape reason
+                Source text sent to Gemini
+                {geminiEditTarget
+                  ? ` · ${formatEventHeading(geminiEditTarget.event)} (${geminiEditTarget.event.event_date})`
+                  : ''}
               </p>
               <p className="mt-1 max-h-28 overflow-y-auto whitespace-pre-line text-xs leading-relaxed text-muted-foreground">
                 {geminiEditOriginal}
@@ -8901,12 +19488,12 @@ export default function NotificationsPage() {
       >
         <DialogContent
           className={cn(
-            // ~80–90% viewport, wide 3-column sheet
-            'flex h-[82svh] max-h-[82svh] w-[min(92vw,1400px)] max-w-[92vw] flex-col gap-3 overflow-hidden p-4 sm:p-5',
+            // Full-viewport workspace for image generation
+            'flex h-[100svh] max-h-[100svh] w-[100vw] max-w-[100vw] flex-col gap-2 overflow-hidden rounded-none border-0 p-3 sm:p-4',
           )}
         >
-          <DialogHeader className="shrink-0 space-y-1">
-            <DialogTitle className="flex items-center gap-2">
+          <DialogHeader className="shrink-0 space-y-0.5 pr-8">
+            <DialogTitle className="flex items-center gap-2 text-base">
               <Share2 className="size-4" />
               Share on social media
               {socialShareCtx?.ticker ? ` · ${socialShareCtx.ticker}` : ''}
@@ -8917,9 +19504,9 @@ export default function NotificationsPage() {
                 </span>
               ) : null}
             </DialogTitle>
-            <DialogDescription>
-              Col 1: preview · Col 2: layout · Col 3: share + tweets. WhatsApp opens the desktop app
-              with tweet 1; paste the image if it does not auto-attach.
+            <DialogDescription className="text-xs">
+              Full-screen editor — preview · layout · share. WhatsApp: opens with tweet 1; paste the
+              image if needed.
             </DialogDescription>
           </DialogHeader>
 
@@ -8929,13 +19516,21 @@ export default function NotificationsPage() {
               Building image + text…
             </div>
           ) : (
-            <div className="grid min-h-0 flex-1 gap-3 overflow-hidden lg:grid-cols-3">
-              {/* COL 1 — image preview + copy/download on top-right */}
-              <div className="flex min-h-0 flex-col gap-2 overflow-y-auto rounded-xl border border-border/50 bg-muted/15 p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    Preview
-                  </p>
+            <div className="grid min-h-0 flex-1 gap-3 overflow-hidden lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+              {/* COL 1 — preview ~40% + Share to under image */}
+              <div className="flex min-h-0 flex-col gap-2 overflow-hidden rounded-xl border border-border/50 bg-muted/15 p-3">
+                <div className="flex shrink-0 items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      Preview
+                    </p>
+                    {socialShareCtx.imageWidth && socialShareCtx.imageHeight ? (
+                      <p className="text-[10px] tabular-nums text-muted-foreground">
+                        Export {socialShareCtx.imageWidth}×{socialShareCtx.imageHeight}px PNG
+                        {socialShareCtx.imageWidth >= 1920 ? ' · Full HD' : ''}
+                      </p>
+                    ) : null}
+                  </div>
                   <div className="flex shrink-0 items-center gap-1">
                     <Button
                       type="button"
@@ -8945,12 +19540,16 @@ export default function NotificationsPage() {
                       disabled={!socialShareCtx.imageBlob}
                       onClick={async () => {
                         const ok = await copyImageBlobToClipboard(socialShareCtx.imageBlob)
+                        const dim =
+                          socialShareCtx.imageWidth && socialShareCtx.imageHeight
+                            ? `${socialShareCtx.imageWidth}×${socialShareCtx.imageHeight} PNG`
+                            : 'full-resolution PNG'
                         toast({
-                          title: ok ? 'Image copied' : 'Copy failed',
+                          title: ok ? 'Full-res image copied' : 'Copy failed',
                           description: ok
-                            ? 'Paste with ⌘/Ctrl+V in the social app.'
-                            : 'Try Download image instead.',
-                          durationMs: 3500,
+                            ? `${dim} on clipboard — paste with ⌘/Ctrl+V (not the small preview).`
+                            : 'Try Download instead for a Full HD PNG file.',
+                          durationMs: 4000,
                         })
                       }}
                     >
@@ -8960,33 +19559,94 @@ export default function NotificationsPage() {
                     <Button
                       type="button"
                       size="sm"
-                      variant="outline"
+                      variant="default"
                       className="h-8 gap-1 px-2 text-xs"
                       disabled={!socialShareCtx.imageBlob}
                       onClick={() =>
-                        downloadShareImage(socialShareCtx.imageBlob, socialShareCtx.ticker)
+                        downloadShareImage(socialShareCtx.imageBlob, socialShareCtx.ticker, {
+                          width: socialShareCtx.imageWidth,
+                          height: socialShareCtx.imageHeight,
+                        })
                       }
                     >
                       <Download className="size-3.5" />
-                      Download
+                      Download HD
                     </Button>
                   </div>
                 </div>
                 {socialShareCtx.imageUrl ? (
-                  <img
-                    src={socialShareCtx.imageUrl}
-                    alt="Share preview"
-                    className="mx-auto max-h-[min(58svh,640px)] w-auto max-w-full rounded-xl border border-border/60 bg-background object-contain shadow-sm"
-                  />
+                  <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto">
+                    <img
+                      src={socialShareCtx.imageUrl}
+                      alt="Share preview"
+                      width={socialShareCtx.imageWidth ?? undefined}
+                      height={socialShareCtx.imageHeight ?? undefined}
+                      className="max-h-full w-auto max-w-full rounded-xl border border-border/60 bg-background object-contain shadow-sm"
+                    />
+                  </div>
                 ) : (
                   <div className="flex h-40 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
                     No image
                   </div>
                 )}
+
+                {/* Share to — directly under the image */}
+                <div className="shrink-0 space-y-2 border-t border-border/40 pt-2.5">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Share to
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {SOCIAL_PLATFORMS.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        disabled={Boolean(socialSharePlatformBusy)}
+                        onClick={() => void handleSocialPlatform(p.id)}
+                        title={p.hint}
+                        aria-label={p.label}
+                        className={cn(
+                          'inline-flex size-11 items-center justify-center rounded-full border border-border/70 bg-background text-foreground shadow-sm transition',
+                          'hover:bg-muted disabled:pointer-events-none disabled:opacity-50',
+                          socialSharePlatformBusy === p.id && 'ring-2 ring-foreground/30',
+                        )}
+                      >
+                        {socialSharePlatformBusy === p.id ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <SocialBrandIcon id={p.id} className="size-5" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      title="Copy tweet 1"
+                      className="inline-flex items-center gap-1 rounded-md border border-border/60 px-2 py-1 text-[11px] text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                      onClick={() =>
+                        void copyTweetText(socialShareCtx.thread.tweet1, 'Tweet 1')
+                      }
+                    >
+                      <Copy className="size-3" />
+                      Tweet 1
+                    </button>
+                    <button
+                      type="button"
+                      title="Copy tweet 2"
+                      className="inline-flex items-center gap-1 rounded-md border border-border/60 px-2 py-1 text-[11px] text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                      onClick={() =>
+                        void copyTweetText(socialShareCtx.thread.tweet2, 'Tweet 2')
+                      }
+                    >
+                      <Copy className="size-3" />
+                      Tweet 2
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              {/* COL 2 — image layout controls + editable image text */}
-              <div className="min-h-0 overflow-y-auto rounded-xl border border-border/50 bg-muted/10 p-1">
+              {/* COL 2 — image layout settings ~60% with section tabs */}
+              <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border/50 bg-background p-2 sm:p-3">
                 <ShareCardLayoutControls
                   style={shareCardStyle}
                   onChange={updateShareCardStyle}
@@ -9007,94 +19667,22 @@ export default function NotificationsPage() {
                       prev ? { ...prev, cardText: defaults } : prev,
                     )
                   }}
+                  sideImageDataUrl={shareSideImageDataUrl}
+                  onSideImageChange={setShareSideImageDataUrl}
+                  googleSearchQuery={
+                    socialShareCtx.companyName &&
+                    socialShareCtx.companyName !== socialShareCtx.ticker
+                      ? socialShareCtx.companyName
+                      : socialShareCtx.ticker
+                  }
+                  titleIdentity={{
+                    ticker: socialShareCtx.ticker,
+                    companyName: socialShareCtx.companyName,
+                  }}
                 />
-              </div>
-
-              {/* COL 3 — platforms + tweets with copy icons */}
-              <div className="flex min-h-0 flex-col gap-3 overflow-y-auto pr-1">
-                <div className="space-y-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    Share to
-                  </p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {SOCIAL_PLATFORMS.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        disabled={Boolean(socialSharePlatformBusy)}
-                        onClick={() => void handleSocialPlatform(p.id)}
-                        title={p.hint}
-                        aria-label={p.label}
-                        className={cn(
-                          'inline-flex size-12 items-center justify-center rounded-full border border-border/70 bg-background text-foreground shadow-sm transition',
-                          'hover:bg-muted disabled:pointer-events-none disabled:opacity-50',
-                          socialSharePlatformBusy === p.id && 'ring-2 ring-foreground/30',
-                        )}
-                      >
-                        {socialSharePlatformBusy === p.id ? (
-                          <Loader2 className="size-4 animate-spin" />
-                        ) : (
-                          <SocialBrandIcon id={p.id} className="size-5" />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      Tweet 1
-                    </p>
-                    <button
-                      type="button"
-                      title="Copy tweet 1"
-                      aria-label="Copy tweet 1"
-                      className="inline-flex size-7 items-center justify-center rounded-md border border-border/60 text-muted-foreground transition hover:bg-muted hover:text-foreground"
-                      onClick={() =>
-                        void copyTweetText(socialShareCtx.thread.tweet1, 'Tweet 1')
-                      }
-                    >
-                      <Copy className="size-3.5" />
-                    </button>
-                  </div>
-                  <pre className="whitespace-pre-wrap break-words rounded-lg border border-border/50 bg-muted/30 p-3 font-sans text-sm leading-relaxed">
-                    {socialShareCtx.thread.tweet1}
-                  </pre>
-                </div>
-
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      Tweet 2
-                    </p>
-                    <button
-                      type="button"
-                      title="Copy tweet 2"
-                      aria-label="Copy tweet 2"
-                      className="inline-flex size-7 items-center justify-center rounded-md border border-border/60 text-muted-foreground transition hover:bg-muted hover:text-foreground"
-                      onClick={() =>
-                        void copyTweetText(socialShareCtx.thread.tweet2, 'Tweet 2')
-                      }
-                    >
-                      <Copy className="size-3.5" />
-                    </button>
-                  </div>
-                  <pre className="whitespace-pre-wrap break-words rounded-lg border border-border/50 bg-muted/20 p-3 font-sans text-xs leading-relaxed text-muted-foreground">
-                    {socialShareCtx.thread.tweet2}
-                  </pre>
-                </div>
               </div>
             </div>
           )}
-
-          <DialogFooter className="shrink-0 border-t border-border/50 pt-3">
-            <DialogClose asChild>
-              <Button type="button" variant="outline">
-                Close
-              </Button>
-            </DialogClose>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -9258,22 +19846,14 @@ export default function NotificationsPage() {
                       variant="outline"
                       onClick={async () => {
                         if (!tweetImageBlob) return
-                        try {
-                          await navigator.clipboard.write([
-                            new ClipboardItem({ 'image/png': tweetImageBlob }),
-                          ])
-                          toast({
-                            title: 'Image copied',
-                            description: 'Paste (⌘/Ctrl+V) into the first tweet on X.',
-                            durationMs: 4000,
-                          })
-                        } catch {
-                          toast({
-                            title: 'Could not copy image',
-                            description: 'Download the image and attach it on X instead.',
-                            durationMs: 4000,
-                          })
-                        }
+                        const ok = await copyImageBlobToClipboard(tweetImageBlob)
+                        toast({
+                          title: ok ? 'Full-res image copied' : 'Could not copy image',
+                          description: ok
+                            ? 'Lossless PNG on clipboard — paste (⌘/Ctrl+V) into the first tweet on X.'
+                            : 'Download the Full HD PNG and attach it on X instead.',
+                          durationMs: 4000,
+                        })
                       }}
                     >
                       Copy image
@@ -9281,17 +19861,19 @@ export default function NotificationsPage() {
                     <Button
                       type="button"
                       size="sm"
-                      variant="outline"
+                      variant="default"
                       asChild={false}
                       onClick={() => {
-                        if (!tweetImageUrl) return
-                        const a = document.createElement('a')
-                        a.href = tweetImageUrl
-                        a.download = 'trigger-momentum.png'
-                        a.click()
+                        downloadShareImage(tweetImageBlob, tweetRenderCtx?.ticker || 'momentum', {
+                          width: shareCardStyle.canvasWidth ?? 1920,
+                          height: Math.round(
+                            (shareCardStyle.canvasWidth ?? 1920) *
+                              (shareCardStyle.aspectRatio ?? 1.05),
+                          ),
+                        })
                       }}
                     >
-                      Download image
+                      Download HD
                     </Button>
                   </div>
 
@@ -9317,6 +19899,22 @@ export default function NotificationsPage() {
                         prev ? { ...prev, cardText: defaults } : prev,
                       )
                     }}
+                    sideImageDataUrl={shareSideImageDataUrl}
+                    onSideImageChange={setShareSideImageDataUrl}
+                    googleSearchQuery={
+                      tweetRenderCtx?.companyName &&
+                      tweetRenderCtx.companyName !== tweetRenderCtx.ticker
+                        ? tweetRenderCtx.companyName
+                        : tweetRenderCtx?.ticker
+                    }
+                    titleIdentity={
+                      tweetRenderCtx
+                        ? {
+                            ticker: tweetRenderCtx.ticker,
+                            companyName: tweetRenderCtx.companyName,
+                          }
+                        : undefined
+                    }
                   />
                 </div>
               ) : null}
@@ -9392,13 +19990,30 @@ export default function NotificationsPage() {
           }
         }}
       >
-        <DialogContent className="max-h-[85svh] max-w-lg overflow-y-auto">
-          <DialogHeader>
+        <DialogContent
+          className={cn(
+            'overflow-y-auto',
+            usagePopup === 'perplexity'
+              ? 'fixed inset-0 z-50 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 flex-col rounded-none border-0 p-0 sm:max-w-none'
+              : 'max-h-[85svh] max-w-lg',
+          )}
+        >
+          <DialogHeader
+            className={cn(
+              usagePopup === 'perplexity' &&
+                'shrink-0 border-b border-border px-5 py-4 sm:px-8',
+            )}
+          >
             <DialogTitle className="flex items-center gap-2">
               {usagePopup === 'gemini' ? (
                 <>
                   <Sparkles className="size-4 text-violet-600" />
                   Gemini spend by day
+                </>
+              ) : usagePopup === 'perplexity' ? (
+                <>
+                  <Search className="size-4 text-sky-600" />
+                  Perplexity credits & cost by day
                 </>
               ) : (
                 'Firecrawl credits by day'
@@ -9407,7 +20022,9 @@ export default function NotificationsPage() {
             <DialogDescription>
               {usagePopup === 'gemini'
                 ? 'Estimated USD + tokens from structured dates in Supabase (last 30 days ET).'
-                : 'Credits used per day from scrape ledger (last 30 days). Remaining balance is live from Firecrawl.'}
+                : usagePopup === 'perplexity'
+                  ? 'App-tracked spend from each momentum research call (last 90 days ET). Token credits = total tokens. Prepaid remaining balance is only on Perplexity’s console (API does not expose it).'
+                  : 'Credits used per day from scrape ledger (last 30 days). Remaining balance is live from Firecrawl.'}
             </DialogDescription>
           </DialogHeader>
 
@@ -9423,6 +20040,12 @@ export default function NotificationsPage() {
             </div>
           ) : null}
 
+          <div
+            className={cn(
+              usagePopup === 'perplexity' &&
+                'min-h-0 flex-1 overflow-y-auto px-5 py-4 sm:px-8 sm:py-6',
+            )}
+          >
           {!usageLoading && !usageError && usagePopup === 'gemini' ? (
             <div className="space-y-3">
               <div className="rounded-xl border bg-violet-500/5 px-3 py-2 text-sm">
@@ -9461,6 +20084,115 @@ export default function NotificationsPage() {
                             {(row.total_tokens || 0).toLocaleString()}
                           </td>
                           <td className="px-3 py-2 tabular-nums text-muted-foreground">
+                            {row.calls ?? '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {!usageLoading && !usageError && usagePopup === 'perplexity' ? (
+            <div className="mx-auto w-full max-w-5xl space-y-5">
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Total cost
+                  </p>
+                  <p className="mt-1 text-2xl font-semibold tabular-nums text-sky-900 dark:text-sky-100">
+                    {perplexityUsageTotals?.total_cost_usd_display ||
+                      perplexityTotals?.total_cost_usd_display ||
+                      '$0.000000'}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    All tracked research calls
+                  </p>
+                </div>
+                <div className="rounded-2xl border bg-muted/30 px-4 py-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Token credits used
+                  </p>
+                  <p className="mt-1 text-2xl font-semibold tabular-nums">
+                    {(
+                      perplexityUsageTotals?.total_credits ??
+                      perplexityTotals?.total_credits ??
+                      0
+                    ).toLocaleString()}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    Sum of total tokens per call
+                  </p>
+                </div>
+                <div className="rounded-2xl border bg-muted/30 px-4 py-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Research calls
+                  </p>
+                  <p className="mt-1 text-2xl font-semibold tabular-nums">
+                    {(
+                      perplexityUsageTotals?.total_calls ??
+                      perplexityTotals?.total_calls ??
+                      0
+                    ).toLocaleString()}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    Last 90 days (ET)
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 px-4 py-3 text-sm text-muted-foreground">
+                <p>
+                  {perplexityUsageTotals?.balance_note ||
+                    'Remaining prepaid balance is only on Perplexity console — not available via API.'}
+                </p>
+                <a
+                  href={
+                    perplexityUsageTotals?.console_url ||
+                    'https://www.perplexity.ai/account/api/billing'
+                  }
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-1 inline-flex items-center gap-1 font-semibold text-sky-700 underline-offset-2 hover:underline dark:text-sky-300"
+                >
+                  Open Perplexity API billing
+                  <ExternalLink className="size-3.5 opacity-70" />
+                </a>
+              </div>
+
+              {perplexityDailyUsage.length === 0 ? (
+                <p className="py-12 text-center text-sm text-muted-foreground">
+                  No Perplexity usage logged yet. Run momentum research once to start tracking.
+                </p>
+              ) : (
+                <div className="overflow-hidden rounded-2xl border shadow-sm">
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-muted/50 text-[11px] uppercase tracking-wide text-muted-foreground">
+                      <tr>
+                        <th className="px-4 py-3 font-medium">Day (ET)</th>
+                        <th className="px-4 py-3 font-medium">Cost</th>
+                        <th className="px-4 py-3 font-medium">Token credits</th>
+                        <th className="px-4 py-3 font-medium">Calls</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {perplexityDailyUsage.map((row) => (
+                        <tr
+                          key={row.day}
+                          className="border-t border-border/60 hover:bg-muted/20"
+                        >
+                          <td className="px-4 py-3 font-medium tabular-nums">
+                            {row.day}
+                          </td>
+                          <td className="px-4 py-3 font-semibold tabular-nums text-sky-900 dark:text-sky-100">
+                            {row.cost_usd_display || formatUsdCompact(row.cost_usd)}
+                          </td>
+                          <td className="px-4 py-3 tabular-nums text-muted-foreground">
+                            {(row.credits_used || row.total_tokens || 0).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3 tabular-nums text-muted-foreground">
                             {row.calls ?? '—'}
                           </td>
                         </tr>
@@ -9532,8 +20264,14 @@ export default function NotificationsPage() {
               )}
             </div>
           ) : null}
+          </div>
 
-          <DialogFooter>
+          <DialogFooter
+            className={cn(
+              usagePopup === 'perplexity' &&
+                'shrink-0 border-t border-border px-5 py-3 sm:px-8',
+            )}
+          >
             <Button type="button" variant="outline" onClick={() => setUsagePopup(null)}>
               Close
             </Button>
@@ -9547,9 +20285,6 @@ export default function NotificationsPage() {
           // Don't dismiss mid-run by accident — only allow close when idle.
           if (allTickersLoading) return
           setFetchAllHitsOpen(open)
-          if (!open) {
-            setFetchAllAlertBusyKey(null)
-          }
         }}
       >
         <DialogContent className="flex max-h-[90svh] max-w-4xl flex-col gap-4 overflow-hidden">
@@ -9731,7 +20466,6 @@ export default function NotificationsPage() {
                       <div className="mt-3 space-y-3 border-t border-border/50 pt-3">
                         {row.hits.map((hit) => {
                           const hitKey = `${hit.ticker}|${hit.event.event_date}`
-                          const alertBusy = fetchAllAlertBusyKey === hitKey
                           const alertMsg = fetchAllAlertMsg[hitKey]
                           const geminiRunning =
                             hit.gemini_status === 'running' ||
@@ -9800,16 +20534,12 @@ export default function NotificationsPage() {
                                   <Button
                                     type="button"
                                     size="sm"
-                                    disabled={alertBusy || hit.subscriber_count === 0}
-                                    onClick={() => void handleFetchAllQuickAlert(hit)}
-                                    title="Send push to all subscribers"
+                                    disabled={hit.subscriber_count === 0}
+                                    onClick={() => handleFetchAllOpenAlertPicker(hit)}
+                                    title="Preview notification, choose recipients, then send"
                                   >
-                                    {alertBusy ? (
-                                      <Loader2 className="size-3.5 animate-spin" />
-                                    ) : (
-                                      <BellRing className="size-3.5" />
-                                    )}
-                                    Alert
+                                    <BellRing className="size-3.5" />
+                                    Preview &amp; send
                                     {hit.subscriber_count > 0
                                       ? ` (${hit.subscriber_count})`
                                       : ''}
@@ -9830,16 +20560,6 @@ export default function NotificationsPage() {
                                   >
                                     <Share2 className="size-3.5" />
                                     Share
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    size="sm"
-                                    variant="outline"
-                                    disabled={hit.subscriber_count === 0}
-                                    onClick={() => handleFetchAllOpenAlertPicker(hit)}
-                                    title="Open recipient picker + preview"
-                                  >
-                                    Alert…
                                   </Button>
                                 </div>
                               </div>
@@ -10107,6 +20827,9 @@ export default function NotificationsPage() {
               <p className="text-sm font-medium">Recipients</p>
               <p className="text-xs text-muted-foreground">
                 {movementAlertSelectedCount} of {movementAlertDevices.length} selected
+                {movementAlertTarget?.allRecipients
+                  ? ' · all app devices (not only ticker subscribers)'
+                  : ''}
               </p>
             </div>
             <div className="flex items-center gap-1.5">
@@ -10133,13 +20856,27 @@ export default function NotificationsPage() {
             </div>
           </div>
 
+          {movementAlertTarget?.allRecipients ? (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-snug text-amber-950 dark:text-amber-100">
+              Extreme / Pinned alert: list shows every{' '}
+              {notificationApp === 'trigger' ? 'Trigger' : '9AM'} device, even if they never
+              subscribed to {movementAlertTarget.ticker}. Nothing is pre-selected — use Select all
+              or pick devices, then send.
+            </div>
+          ) : null}
+
           <div className="min-h-0 max-h-[30svh] space-y-2 overflow-y-auto pr-1">
             {!movementAlertDevices.length ? (
               <div className="rounded-xl border border-dashed px-4 py-8 text-center">
-                <p className="text-sm font-medium">No subscribed devices</p>
+                <p className="text-sm font-medium">
+                  {movementAlertTarget?.allRecipients
+                    ? 'No alertable devices'
+                    : 'No subscribed devices'}
+                </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  No {notificationApp === 'trigger' ? 'Trigger' : '9AM'} users are subscribed to{' '}
-                  {movementAlertTarget?.ticker}.
+                  {movementAlertTarget?.allRecipients
+                    ? `No enabled ${notificationApp === 'trigger' ? 'Trigger' : '9AM'} devices with push tokens.`
+                    : `No ${notificationApp === 'trigger' ? 'Trigger' : '9AM'} users are subscribed to ${movementAlertTarget?.ticker}.`}
                 </p>
               </div>
             ) : null}
@@ -10149,6 +20886,11 @@ export default function NotificationsPage() {
               const token = device.expo_push_token
               const maskedToken =
                 token.length > 30 ? `${token.slice(0, 20)}…${token.slice(-8)}` : token
+              const watchesTarget =
+                movementAlertTarget?.ticker &&
+                (device.tickers || []).some(
+                  (item) => item.toUpperCase() === movementAlertTarget.ticker.toUpperCase(),
+                )
               return (
                 <label
                   key={key}
@@ -10179,6 +20921,19 @@ export default function NotificationsPage() {
                       <Badge variant="secondary" className="text-[10px]">
                         {notificationApp === 'trigger' ? 'Trigger' : '9AM'}
                       </Badge>
+                      {movementAlertTarget?.allRecipients ? (
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            'text-[10px]',
+                            watchesTarget
+                              ? 'border-emerald-500/40 text-emerald-800 dark:text-emerald-200'
+                              : 'text-muted-foreground',
+                          )}
+                        >
+                          {watchesTarget ? 'Subscribed' : 'Not subscribed'}
+                        </Badge>
+                      ) : null}
                     </span>
                     <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground">
                       {maskedToken}
@@ -10353,6 +21108,7 @@ export default function NotificationsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </div>
   )
 }
