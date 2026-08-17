@@ -80,8 +80,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
@@ -464,25 +462,6 @@ function formatMarketCap(value?: number | null, currency = 'USD') {
 function formatEmployeeCount(value?: number | null) {
   if (value == null || !Number.isFinite(value) || value <= 0) return null
   return value.toLocaleString()
-}
-
-function currentUsTradingSession() {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(new Date())
-  const read = (type: 'weekday' | 'hour' | 'minute') =>
-    parts.find((part) => part.type === type)?.value || ''
-  const weekday = read('weekday')
-  if (weekday === 'Sat' || weekday === 'Sun') return 'closed' as const
-  const minutes = Number(read('hour')) * 60 + Number(read('minute'))
-  if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) return 'premarket' as const
-  if (minutes >= 9 * 60 + 30 && minutes < 16 * 60) return 'regular' as const
-  if (minutes >= 16 * 60 && minutes < 20 * 60) return 'after-hours' as const
-  return 'closed' as const
 }
 
 function formatMarketTimestamp(value: string | null | undefined, timeZone: string) {
@@ -1193,25 +1172,6 @@ function measureWrappedText(
     }
   }
   return out.slice(0, maxLines)
-}
-
-/** Draw wrapped text; returns y of the last line baseline. */
-function wrapCanvasText(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  x: number,
-  y: number,
-  maxWidth: number,
-  lineHeight: number,
-  maxLines: number,
-): number {
-  const lines = measureWrappedText(ctx, text, maxWidth, maxLines)
-  let cy = y
-  for (let i = 0; i < lines.length; i += 1) {
-    ctx.fillText(lines[i], x, cy)
-    if (i < lines.length - 1) cy += lineHeight
-  }
-  return cy
 }
 
 /** One bar for the share-card line chart (regular session only). */
@@ -2363,7 +2323,6 @@ function drawShareHeroPhoto(
 const SHARE_UP_GREEN = '#228B22'
 const SHARE_DOWN_RED = '#DC2626'
 const SHARE_INK = '#111111'
-const SHARE_INK_MUTED = 'rgba(17,17,17,0.62)'
 const SHARE_INK_SOFT = 'rgba(17,17,17,0.82)'
 const SHARE_BRAND_LIGHT = 'rgba(255,255,255,0.92)'
 
@@ -2457,18 +2416,6 @@ function shareDownColorHex(shade?: number | null): string {
   const maxId = Math.max(...SHARE_DOWN_RED_SHADES.map((s) => s.id), 4)
   const id = clampShareMoveShade(shade, 2, maxId)
   return SHARE_DOWN_RED_SHADES.find((s) => s.id === id)?.hex || SHARE_DOWN_RED
-}
-
-/** Resolve % / chart color from direction + user shade prefs. */
-function shareMoveAccentHex(
-  isDown: boolean,
-  isUp: boolean,
-  shades?: { upColorShade?: number; downColorShade?: number } | null,
-  fallbackInk = SHARE_INK,
-): string {
-  if (isDown) return shareDownColorHex(shades?.downColorShade)
-  if (isUp) return shareUpColorHex(shades?.upColorShade)
-  return fallbackInk
 }
 
 /**
@@ -3441,8 +3388,7 @@ function drawMiniChart(
     const REG_OPEN = 9 * 60 + 30
     for (let di = 0; di < dayTimeline.days.length; di += 1) {
       const dayKey = dayTimeline.days[di]
-      // Mid of that day's market block in session-time space
-      const dayMidAbs = di * SHARE_SESSION_MINS + SHARE_SESSION_MINS / 2
+      // Mid of day used via visStart/visEnd below
       // Clamp to visible span for partial last day
       const dayStartAbs = di * SHARE_SESSION_MINS
       const dayEndAbs = (di + 1) * SHARE_SESSION_MINS
@@ -6039,7 +5985,9 @@ async function renderMomentumTweetImage(
     : 0
 
   // Pasted image is ONLY the full-card digital background — never a framed hero above/below header.
-  const photoPlacement = 'background' as const
+  // Keep full union so legacy layout branches type-check (runtime always background).
+  const photoPlacement = (style.photoPlacement ||
+    'background') as ShareCardStyle['photoPlacement']
   const hasPhoto = false
   // Photo metrics are design-px @ 1080 — scale to export width (only used for legacy hero slots)
   let photoHeight = Math.round(
@@ -6241,16 +6189,12 @@ async function renderMomentumTweetImage(
 
   const {
     photoTop,
-    bandTop,
     bandMidY,
     metaTop,
     chartTop,
-    contentBlockTop,
     sessionFirstY,
-    sessionLastY,
     sessionStampY,
     reasonFirstY,
-    reasonLastY,
     brandY,
   } = layout
 
@@ -6988,14 +6932,6 @@ function loadTickerSortPreference(): TickerSortMode {
   } catch {
     return 'subscribers'
   }
-}
-
-function sourceKey(source: MovementSource, index: number) {
-  return source.url || source.domain || source.title || `source-${index}`
-}
-
-function sourceLabel(source: MovementSource) {
-  return source.title || source.domain || source.url || 'Source'
 }
 
 /** Display/edit sources as names on one row (no multi-line list). */
@@ -10436,7 +10372,7 @@ export default function NotificationsPage() {
   const [tweetThread, setTweetThread] = useState<MomentumTweetThread | null>(null)
   const [tweetImageUrl, setTweetImageUrl] = useState<string | null>(null)
   const [tweetImageBlob, setTweetImageBlob] = useState<Blob | null>(null)
-  const [tweetComposerBusy, setTweetComposerBusy] = useState(false)
+  const [tweetComposerBusy] = useState(false)
   const [tweetStartBusy, setTweetStartBusy] = useState(false)
   /** Context needed to re-render share image when sliders / text edits change. */
   const [tweetRenderCtx, setTweetRenderCtx] = useState<{
@@ -11933,45 +11869,6 @@ export default function NotificationsPage() {
       })
     } finally {
       setLogoPasteBusy(false)
-    }
-  }
-
-  async function openTweetComposer(
-    ticker: string,
-    event: PriceMovementEvent,
-    companyName?: string | null,
-  ) {
-    setTweetComposerBusy(true)
-    // Keep last saved layout settings (localStorage cache)
-    const style = loadShareCardStyle()
-    setShareCardStyle(style)
-    try {
-      const resolvedCompany = await resolveShareCompanyName(ticker, companyName)
-      const thread = buildMomentumTweetThread(ticker, event, resolvedCompany)
-      setTweetThread(thread)
-      const cardText = buildShareCardTextContent(ticker, event, resolvedCompany, style)
-      setTweetRenderCtx({ ticker, event, companyName: resolvedCompany, cardText })
-      // Revoke previous object URL
-      if (tweetImageUrl) {
-        try {
-          URL.revokeObjectURL(tweetImageUrl)
-        } catch {
-          /* ignore */
-        }
-      }
-      const image = await renderMomentumTweetImage(
-        ticker,
-        event,
-        resolvedCompany,
-        style,
-        cardText,
-        shareSideImageDataUrl,
-      )
-      setTweetImageBlob(image?.blob || null)
-      setTweetImageUrl(image?.objectUrl || null)
-      setTweetComposerOpen(true)
-    } finally {
-      setTweetComposerBusy(false)
     }
   }
 
@@ -14647,16 +14544,15 @@ export default function NotificationsPage() {
     }
 
     // Always show regular session close for reference (Yahoo “At close”)
-    if (activeMarketSession !== 'regular') {
-      items.push(
-        item(
-          'At close',
-          activeLiveQuote.regularMarketPrice,
-          activeLiveQuote.regularMarketChangePercent,
-          activeLiveQuote.regularMarketTime,
-        ),
-      )
-    }
+    // (regular session early-return above — we are never 'regular' here)
+    items.push(
+      item(
+        'At close',
+        activeLiveQuote.regularMarketPrice,
+        activeLiveQuote.regularMarketChangePercent,
+        activeLiveQuote.regularMarketTime,
+      ),
+    )
     return items
   })()
 

@@ -195,6 +195,7 @@ type ActiveEpisodeRow = {
   exactMinutes?: number | null
   exactLabel?: string | null
   lastMaterialProgressAt?: string | null
+  marketSession?: string | null
 }
 
 /** Scheduled OPEN / MIDDAY / CLOSE market summary (not an episode). */
@@ -2218,9 +2219,11 @@ type MomentumStatus = {
       majorFadeAlertEnabled?: boolean
       startPushMaxAgeMs?: number
       startedStateMinDwellMs?: number
+      byClass?: Record<
+        string,
+        Record<string, number | boolean | null | undefined>
+      >
     }
-    accelerationPoints?: number
-    inactivityMinutes?: number
     testMode?: {
       enabled?: boolean
       dummyResearch?: boolean
@@ -2860,17 +2863,17 @@ function loadWatchlist(): WatchTab[] {
     if (!raw) return DEFAULT_WATCHLIST
     const parsed = JSON.parse(raw) as WatchTab[]
     if (!Array.isArray(parsed) || !parsed.length) return DEFAULT_WATCHLIST
-    return parsed
-      .map((row) => {
-        const ticker = normalizeWatchTicker(String(row.ticker || ''))
-        if (!ticker) return null
-        return {
-          ticker,
-          label: String(row.label || ticker).trim() || ticker,
-          assetClass: row.assetClass || detectAssetClass(ticker),
-        }
+    const out: WatchTab[] = []
+    for (const row of parsed) {
+      const ticker = normalizeWatchTicker(String(row?.ticker || ''))
+      if (!ticker) continue
+      out.push({
+        ticker,
+        label: String(row?.label || ticker).trim() || ticker,
+        assetClass: row?.assetClass || detectAssetClass(ticker),
       })
-      .filter((row): row is WatchTab => Boolean(row))
+    }
+    return out.length ? out : DEFAULT_WATCHLIST
   } catch {
     return DEFAULT_WATCHLIST
   }
@@ -2913,13 +2916,6 @@ function perplexityFinanceQuoteUrl(symbol: string): string {
   const s = String(symbol || '').trim()
   if (!s) return 'https://www.perplexity.ai/finance'
   return `https://www.perplexity.ai/finance/${encodeURIComponent(s)}`
-}
-
-/** Yahoo history page — best place to verify previous close prints. */
-function yahooFinanceHistoryUrl(symbol: string): string {
-  const s = String(symbol || '').trim()
-  if (!s) return 'https://finance.yahoo.com/'
-  return `https://finance.yahoo.com/quote/${encodeURIComponent(s)}/history`
 }
 
 /**
@@ -3044,7 +3040,7 @@ function fmtPct(n: number | null | undefined) {
 /** Format print by asset class (FX needs more decimals; no $ for pure pairs). */
 function fmtPrice(
   n: number | null | undefined,
-  assetClass?: string,
+  assetClass?: string | null,
   currency?: string | null,
 ) {
   if (n == null || !Number.isFinite(n)) return '—'
@@ -3200,34 +3196,6 @@ function resolveClientMarketSession(
   return 'CLOSED'
 }
 
-/** Label next to Live (…): matches Yahoo quote page wording */
-function liveSessionBracket(
-  badge: { code: string; label: string } | null | undefined,
-  marketSession?: string | null,
-  marketStateLabel?: string | null,
-): string {
-  const sess = String(marketSession || '').toUpperCase()
-  if (sess === 'PRE') return 'pre-market'
-  if (sess === 'PREPRE') return 'overnight'
-  if (sess === 'POST' || sess === 'POSTPOST') return 'after-hours'
-  if (sess === 'REGULAR') return 'regular'
-  if (sess === 'CLOSED') return 'closed'
-  if (badge?.code === 'PREPRE') return 'overnight'
-  if (badge?.code === 'POST' || badge?.code === 'POSTPOST') return 'after-hours'
-  if (badge?.code === 'PRE') return 'pre-market'
-  if (badge?.code === 'CLOSED' || badge?.code === 'CLOSE') return 'closed'
-  if (marketStateLabel) {
-    const low = marketStateLabel.toLowerCase()
-    if (/overnight|prepre/.test(low)) return 'overnight'
-    if (/after|post/.test(low)) return 'after-hours'
-    if (/pre-?market|^pre$/.test(low)) return 'pre-market'
-    if (/closed|close/.test(low)) return 'closed'
-    if (/regular/.test(low)) return 'regular'
-    return low
-  }
-  return 'live'
-}
-
 function pctColor(n: number | null | undefined) {
   if (n == null || !Number.isFinite(n)) return 'text-muted-foreground'
   if (n > 0) return 'text-emerald-600 dark:text-emerald-400'
@@ -3295,15 +3263,6 @@ function hotBlinkClass(
     return `${base} sndk-hot-blink-loop`
   }
   return base
-}
-
-/** Tab strip only: first word of company/name label (full name stays on title + hover). */
-function tabBarFirstWord(label: string | null | undefined, fallback = ''): string {
-  const raw = String(label || fallback || '').trim()
-  if (!raw) return fallback || '—'
-  // Keep slash pairs like EUR/USD as one token
-  const first = raw.split(/\s+/)[0] || raw
-  return first
 }
 
 /** Watchlist secondary name — max 2 words (full name stays on title/hover). */
@@ -3558,10 +3517,10 @@ function buildMomentumAlertCopy(opts: {
   if (windowKey === 'day') {
     timePhrase =
       exactMins != null && exactMins > 0
-        ? `in the last ${exact.exactLabel} (since previous close)`
+        ? `in the last ${exact?.exactLabel || exactLabel} (since previous close)`
         : 'vs previous regular close'
   } else if (exactMins != null) {
-    timePhrase = `in the last ${exact.exactLabel}${bucketNote}`
+    timePhrase = `in the last ${exact?.exactLabel || exactLabel}${bucketNote}`
   } else {
     timePhrase = `over the ${windowLabel} lookback`
   }
@@ -3604,20 +3563,7 @@ function PerplexityLogo({ className }: { className?: string }) {
   )
 }
 
-/** TradingView monochrome mark (Simple Icons path) */
-function TradingViewLogo({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      className={cn('inline-block size-4 shrink-0', className)}
-      aria-hidden
-    >
-      <path d="M15.67 0H8.33a.6.6 0 0 0-.58.44L.01 21.54a.6.6 0 0 0 .58.76h7.35a.6.6 0 0 0 .58-.44l2.76-9.21 2.76 9.21a.6.6 0 0 0 .58.44h7.35a.6.6 0 0 0 .58-.76L16.25.44A.6.6 0 0 0 15.67 0z" />
-    </svg>
-  )
-}
+
 
 function tradingViewSymbolUrl(ticker: string) {
   const t = String(ticker || '')
@@ -5360,7 +5306,7 @@ export function SndkMomentumPanel({
   const [mostActivesLoading, setMostActivesLoading] = useState(false)
   const [mostActivesError, setMostActivesError] = useState<string | null>(null)
   const [marketListTab, setMarketListTab] = useState<MarketListId>('watchlist')
-  const [savedTickers, setSavedTickers] = useState<WatchTab[]>([])
+  const [, setSavedTickers] = useState<WatchTab[]>([])
   /**
    * App-monitored tickers from device_monitored_tickers (enabled subscribers).
    * Categorized client-side into Stocks / Indices / Forex / Crypto / Commodities.
@@ -5372,9 +5318,7 @@ export function SndkMomentumPanel({
   const [monitoredSourceTable, setMonitoredSourceTable] = useState<string | null>(
     null,
   )
-  const [monitoredCounts, setMonitoredCounts] = useState<
-    Partial<Record<string, number>>
-  >({})
+  const [, setMonitoredCounts] = useState<Partial<Record<string, number>>>({})
   const [activeTicker, setActiveTicker] = useState(() => {
     const list = loadWatchlist()
     return loadActiveTicker(list)
@@ -5778,7 +5722,7 @@ export function SndkMomentumPanel({
   }
   const [alertResearchBusy, setAlertResearchBusy] = useState(false)
   const [alertResearchError, setAlertResearchError] = useState('')
-  const [alertPromptOpen, setAlertPromptOpen] = useState(false)
+  const [, setAlertPromptOpen] = useState(false)
   const [alertGeminiPrompt, setAlertGeminiPrompt] = useState('')
   /** Last prepare INPUT values — used to reverse-fill saved templates */
   const [alertUserMovement, setAlertUserMovement] = useState('')
@@ -5806,9 +5750,7 @@ export function SndkMomentumPanel({
       calls?: number
     }>
   >([])
-  const [alertResearchSteps, setAlertResearchSteps] = useState<ResearchStep[]>(
-    [],
-  )
+  const [, setAlertResearchSteps] = useState<ResearchStep[]>([])
   const [alertResearchMeta, setAlertResearchMeta] = useState<{
     likely_driver?: string | null
     reason?: string | null
@@ -6611,8 +6553,9 @@ export function SndkMomentumPanel({
           if (cancelled) return
           const next: Record<string, YahooLiveQuote> = {}
           for (const [key, q] of Object.entries(body.quotes || {})) {
-            next[key] = q
-            next[key.toUpperCase()] = q
+            const quote = q as YahooLiveQuote
+            next[key] = quote
+            next[key.toUpperCase()] = quote
           }
           setWatchQuotes((prev) => ({ ...prev, ...next }))
         })
@@ -6765,14 +6708,6 @@ export function SndkMomentumPanel({
     })
   }
 
-  async function saveThresholds() {
-    if (thresholdAutosaveTimer.current) {
-      clearTimeout(thresholdAutosaveTimer.current)
-      thresholdAutosaveTimer.current = null
-    }
-    await persistThresholdsNow(thresholdDraftRef.current, { closeAfter: true })
-  }
-
   async function persistPolicyNow(draft: Record<string, string>) {
     const path = '/api/momentum/episode-policy'
     const assetClass = thresholdClassKey(assetClassTab || activeAssetClass)
@@ -6840,7 +6775,7 @@ export function SndkMomentumPanel({
     }
   }
 
-  function schedulePolicyAutosave(nextDraft: Record<string, string>) {
+  function schedulePolicyAutosave(_nextDraft: Record<string, string>) {
     setPolicySaveState('saving')
     if (policyAutosaveTimer.current) clearTimeout(policyAutosaveTimer.current)
     policyAutosaveTimer.current = setTimeout(() => {
@@ -6869,9 +6804,7 @@ export function SndkMomentumPanel({
       : null
   const logs = status?.logs || []
   const sq = snap?.sessionQuote
-  const badge = snap?.sessionBadge
 
-  const marketStateFromQuote = String(tabQuote?.marketState || '').toUpperCase()
   // Yahoo marketState only (PREPRE = overnight via postMarket*)
   const sessionFromQuote = resolveClientMarketSession(
     tabQuote?.marketState,
@@ -6879,11 +6812,6 @@ export function SndkMomentumPanel({
     nowMs,
   )
   const yahooActive = resolveYahooActiveSession(tabQuote)
-  const isExtended =
-    sessionFromQuote === 'PRE' ||
-    sessionFromQuote === 'PREPRE' ||
-    sessionFromQuote === 'POST' ||
-    sessionFromQuote === 'POSTPOST'
 
   // ── Previous close = last completed session close (Yahoo) ──
   const prevClose =
@@ -6933,12 +6861,6 @@ export function SndkMomentumPanel({
     detectAssetClass(displayTicker)
   // Asset-aware last session (stocks ≠ gold ≠ bitcoin)
   const lastSessionMeta = resolveLastSessionMetaClient(displayTicker, activeAssetClass)
-  const lastSessionShortLabel =
-    snap?.lastSessionShortLabel ||
-    sq?.lastSessionShortLabel ||
-    lastSessionMeta.shortLabel
-  const lastSessionLabel =
-    snap?.lastSessionLabel || sq?.lastSessionLabel || lastSessionMeta.label
   // Time: Yahoo regularMarketTime when it is the frozen last print; else class estimate
   const prevCloseTime = (() => {
     const state = String(tabQuote?.marketState || '').toUpperCase()
@@ -6961,43 +6883,6 @@ export function SndkMomentumPanel({
   })()
   const quoteCurrency = tabQuote?.currency || null
   const yahooLiveUrl = yahooFinanceQuoteUrl(displayTicker)
-  const yahooPrevUrl = yahooFinanceHistoryUrl(displayTicker)
-  /** Direction of the *previous session* move (last close vs prior close) */
-  const prevCloseMoveDir =
-    prevClosePct == null || !Number.isFinite(prevClosePct)
-      ? null
-      : prevClosePct > 0.005
-        ? 'up'
-        : prevClosePct < -0.005
-          ? 'down'
-          : 'flat'
-
-  // Label from Yahoo marketState only
-  const sessionBracket = liveSessionBracket(
-    sessionFromQuote === 'PRE'
-      ? { code: 'PRE', label: 'Pre-market' }
-      : sessionFromQuote === 'PREPRE'
-        ? { code: 'PREPRE', label: 'Overnight' }
-        : sessionFromQuote === 'POST' || sessionFromQuote === 'POSTPOST'
-          ? { code: sessionFromQuote, label: 'After-hours' }
-          : sessionFromQuote === 'CLOSED'
-            ? { code: 'CLOSED', label: 'Market closed' }
-            : sessionFromQuote === 'REGULAR'
-              ? { code: 'REGULAR', label: 'Regular session' }
-              : badge,
-    sessionFromQuote,
-    sessionFromQuote === 'POST' || sessionFromQuote === 'POSTPOST'
-      ? 'After-hours'
-      : sessionFromQuote === 'PRE'
-        ? 'Pre-market'
-        : sessionFromQuote === 'PREPRE'
-          ? 'overnight'
-          : sessionFromQuote === 'CLOSED'
-            ? 'closed'
-            : sessionFromQuote === 'REGULAR'
-              ? 'regular'
-              : snap?.marketStateLabel || sq?.marketStateLabel || marketStateFromQuote || null,
-  )
 
   const pollMs = Math.max(5_000, Number(status?.pollIntervalMs) || 60_000)
   const lastFetchMs = status?.lastFetchAt ? Date.parse(status.lastFetchAt) : NaN
@@ -7013,9 +6898,6 @@ export function SndkMomentumPanel({
   const thrSnap = status?.config?.thresholdSnapshot
   /** Session card (PRE / Regular / Overnight / AH) always first, then 1m…1y. */
   const visibleReturnKeys: string[] = [...RETURN_KEYS_ALL]
-  const showBridgeWindows = Boolean(
-    snap?.showBridgeWindows ?? status?.config?.showBridgeWindows,
-  )
 
   /** Day / session % for a watchlist tab (batch quotes; active prefers live momentum %). */
   function tabDayPct(ticker: string): number | null {
@@ -11900,9 +11782,9 @@ export function SndkMomentumPanel({
                                   · {src.source}
                                 </span>
                               ) : null}
-                              {src.snippet ? (
+                              {'snippet' in src && src.snippet ? (
                                 <p className="mt-0.5 line-clamp-2 text-muted-foreground">
-                                  {src.snippet}
+                                  {String(src.snippet)}
                                 </p>
                               ) : null}
                             </li>
@@ -13343,9 +13225,18 @@ export function SndkMomentumPanel({
                         : ''}
                     </p>
                     {(() => {
-                      const recips =
+                      type RecipRow = {
+                        device_id?: string | null
+                        expo_push_token?: string
+                        expo_push_token_masked?: string
+                        forced?: boolean
+                        status?: string
+                        error?: string | null
+                      }
+                      const recips: RecipRow[] =
                         timelineDetail.ev.pushResult.recipients?.length
-                          ? timelineDetail.ev.pushResult.recipients
+                          ? (timelineDetail.ev.pushResult
+                              .recipients as RecipRow[])
                           : (timelineDetail.ev.pushResult.device_ids || []).map(
                               (id) => ({
                                 device_id: id,
