@@ -1,3 +1,4 @@
-# SPA fallback: serve index.html for client-side routes
-# (direct visits / refresh to /privacy, /terms, /support, etc.)
+# SPA fallback for client routes only.
+# API paths are handled by Pages Functions (articles) or a remote Node host
+# (VITE_API_BASE_URL). Do not rewrite /api/* to index.html.
 /*    /index.html   200

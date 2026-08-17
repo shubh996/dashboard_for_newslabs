@@ -29,6 +29,8 @@ dist-ssr
 # Local SEC / cache data (large)
 server/data/
 data/
+logs/
+*.log
 
 # Python venvs
 .venv*/

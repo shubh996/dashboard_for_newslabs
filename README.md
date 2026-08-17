@@ -31,14 +31,43 @@ The current SQL allows writes with the publishable key so the local dashboard ca
 
 ## Cloudflare Pages
 
-Cloudflare Pages serves the Vite build as a static site, so the local Vite proxy in [`vite.config.ts`](./vite.config.ts) does not run there. This repo includes Pages Functions for the Supabase article routes:
+Cloudflare Pages serves the Vite build as a **static site**, so the local Vite proxy in [`vite.config.ts`](./vite.config.ts) does **not** run there.
+
+### What works on Pages alone
+
+Pages Functions cover only Supabase article routes:
 
 - `GET /api/articles/saved`
 - `POST /api/articles/save`
 - `PUT /api/articles/saved/:id`
 - `DELETE /api/articles/saved/:id`
 
-Add these variables in **Cloudflare Pages > Settings > Environment variables** for Production and Preview:
+### What needs a real Node API host
+
+Momentum (`/api/momentum/*`), Yahoo, notifications, and EDGAR need the Express server in [`server/index.js`](./server/index.js). That process is long-lived (poll loop, push). It does **not** fit Cloudflare Pages Functions.
+
+If you open Momentum Studio on `*.pages.dev` without a backend, the console shows:
+
+- `POST /api/momentum/watch` → **405**
+- `POST /api/momentum/.../tick` → **405**
+
+**Fix:** deploy the Node API (Railway / Render / Fly / VPS), then set on Cloudflare Pages:
+
+```env
+VITE_API_BASE_URL=https://your-api-host.example.com
+```
+
+Rebuild/redeploy Pages after adding the variable (Vite bakes it into the bundle).
+
+Also set for the **API host** (not Pages):
+
+```env
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+# plus PERPLEXITY_*, GEMINI_*, EXPO_*, etc. from .env.example
+```
+
+Pages-only article Functions still need:
 
 ```env
 SUPABASE_URL=

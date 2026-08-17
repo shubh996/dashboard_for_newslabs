@@ -29,6 +29,7 @@ import {
   DollarSign,
   ExternalLink,
   Info,
+  LayoutDashboard,
   LineChart,
   Loader2,
   Moon,
@@ -11398,6 +11399,12 @@ export function SndkMomentumPanel({
                   Market sessions
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
+                <DropdownMenuItem className="gap-2" asChild>
+                  <a href="/momentum-studio">
+                    <LayoutDashboard className="size-3.5" strokeWidth={1.75} />
+                    Studio
+                  </a>
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2"
                   onSelect={() => {

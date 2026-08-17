@@ -3,9 +3,10 @@ import {
   BarChart3,
   Bitcoin,
   ChevronRight,
+  Cloud,
+  Code2,
   Database,
   DollarSign,
-  ExternalLink,
   LayoutDashboard,
   LineChart,
   PanelLeft,
@@ -57,6 +58,10 @@ const ASSET_ITEMS: {
 const SUPABASE_PROJECT = 'xufydubsuztxgsylzxub'
 const SUPABASE_LINKS = [
   {
+    title: 'Project home',
+    href: `https://supabase.com/dashboard/project/${SUPABASE_PROJECT}`,
+  },
+  {
     title: 'Data editor',
     href: `https://supabase.com/dashboard/project/${SUPABASE_PROJECT}/editor`,
   },
@@ -69,6 +74,29 @@ const SUPABASE_LINKS = [
     href: `https://supabase.com/dashboard/project/${SUPABASE_PROJECT}/settings/general`,
   },
 ]
+
+/** External platform links (open in new tab). */
+const PLATFORM_LINKS = [
+  {
+    title: 'GitHub',
+    tooltip: 'Source repo',
+    href: 'https://github.com/shubh996/dashboard_for_newslabs',
+    // lucide dropped brand icons (no Github export) — use Code2
+    icon: Code2,
+  },
+  {
+    title: 'Cloudflare',
+    tooltip: 'Pages deploy',
+    href: 'https://dash.cloudflare.com/6e16b40b9e538c30251f8a763797de41/pages/view/dashboard-for-newslabs',
+    icon: Cloud,
+  },
+  {
+    title: 'PostHog',
+    tooltip: 'Trigger analytics',
+    href: 'https://eu.posthog.com/project/239556/persons',
+    icon: BarChart3,
+  },
+] as const
 
 export function AppSidebar({
   studio,
@@ -225,11 +253,11 @@ export function AppSidebar({
         </SidebarGroup>
 
         <SidebarGroup>
-          <SidebarGroupLabel>Billing</SidebarGroupLabel>
+          <SidebarGroupLabel>Billing & platforms</SidebarGroupLabel>
           <SidebarMenu>
             <SidebarMenuItem>
               <SidebarMenuButton
-                tooltip="Perplexity"
+                tooltip="Perplexity usage and billing"
                 isActive={studio.view === 'perplexity'}
                 onClick={() => studio.setView('perplexity')}
               >
@@ -267,18 +295,19 @@ export function AppSidebar({
               </SidebarMenuItem>
             </Collapsible>
 
-            <SidebarMenuItem>
-              <SidebarMenuButton tooltip="PostHog" asChild>
-                <a
-                  href="https://eu.posthog.com/project/239556/persons"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  <ExternalLink />
-                  <span>PostHog</span>
-                </a>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
+            {PLATFORM_LINKS.map((link) => {
+              const Icon = link.icon
+              return (
+                <SidebarMenuItem key={link.title}>
+                  <SidebarMenuButton tooltip={link.tooltip} asChild>
+                    <a href={link.href} target="_blank" rel="noreferrer">
+                      <Icon />
+                      <span>{link.title}</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
           </SidebarMenu>
         </SidebarGroup>
       </SidebarContent>

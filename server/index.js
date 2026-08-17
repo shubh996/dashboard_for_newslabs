@@ -18,11 +18,72 @@ dotenv.config({ path: path.join(projectRoot, '.env') })
 
 const app = express()
 const port = Number(process.env.API_PORT || 3001)
+const host = String(process.env.API_HOST || '0.0.0.0')
+
+/**
+ * Browser frontend (Cloudflare Pages) and this API (Hetzner VPS) are different
+ * origins — CORS must allow the Pages host(s). Comma-separated list:
+ *   CORS_ORIGINS=https://dashboard-for-newslabs.pages.dev,https://yourdomain.com
+ * Empty / * → reflect request Origin (ok for private dashboard; lock down later).
+ */
+function parseCorsOrigins() {
+  const raw = String(process.env.CORS_ORIGINS || '').trim()
+  if (!raw || raw === '*') return null
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().replace(/\/$/, ''))
+      .filter(Boolean),
+  )
+}
+const corsOrigins = parseCorsOrigins()
+
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || '')
+  const allowAll = !corsOrigins
+  const allowed =
+    allowAll ||
+    (origin && corsOrigins.has(origin)) ||
+    // local Vite always allowed
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+
+  if (origin && allowed) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+    res.setHeader('Access-Control-Allow-Credentials', 'true')
+  } else if (allowAll) {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+  }
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+  )
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-Requested-With, X-Cron-Secret',
+  )
+  res.setHeader('Access-Control-Max-Age', '86400')
+  if (req.method === 'OPTIONS') {
+    res.status(204).end()
+    return
+  }
+  next()
+})
 
 // A politician's full disclosed-trades bundle (e.g. a prolific filer with
 // thousands of trades) can comfortably exceed a few MB of JSON once saved to
 // Supabase -- 4mb was rejecting real save payloads with a 413.
 app.use(express.json({ limit: '25mb' }))
+
+/** Liveness for Hetzner / load balancers / uptime monitors */
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'dashboard-api',
+    uptime_s: Math.floor(process.uptime()),
+    ts: new Date().toISOString(),
+  })
+})
 
 const providerConfigs = {
   'alpha-vantage': {
@@ -1286,7 +1347,7 @@ mountNotificationsRoutes(app, { getSupabase })
 // Multi-ticker momentum engine (intraday rolling moves) — debug API + poll loop
 app.use('/api/momentum', createMomentumRouter())
 
-app.listen(port, () => {
-  console.log(`News dashboard API listening on http://localhost:${port}`)
+app.listen(port, host, () => {
+  console.log(`News dashboard API listening on http://${host}:${port}`)
   startMomentumLoop()
 })
