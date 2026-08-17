@@ -33,7 +33,7 @@ This is still the **easiest** always-on path (no SSH).
 3. **Deploy from GitHub repo**
 4. Select **`shubh996/dashboard_for_newslabs`**
 5. Branch: **`main`**
-6. Railway will detect Node via `railway.toml` / `nixpacks.toml`
+6. Railway uses the **Dockerfile** (`railway.toml` → `builder = "DOCKERFILE"`).
 
 If it asks for root directory → leave **empty** (repo root).
 
@@ -41,9 +41,14 @@ If it asks for root directory → leave **empty** (repo root).
 
 | Setting | Value |
 |---------|--------|
-| **Start Command** | `npm start` |
-| **Build Command** | `npm ci --omit=dev` (already in railway.toml) |
+| **Builder** | Dockerfile (auto from `railway.toml`) |
+| **Start Command** | leave default / `node server/index.js` |
 | **Healthcheck path** | `/api/health` |
+
+### If build failed earlier with `npm ci` + `EBUSY … node_modules/.cache`
+
+That was the old Nixpacks path. Pull latest `main` (has Dockerfile) and **Redeploy**.  
+Do **not** set a custom build command of `npm ci --omit=dev` in the UI — Dockerfile handles install.
 
 Generate a public domain:
 
@@ -171,7 +176,9 @@ CRON_SECRET=<same as Railway CRON_SECRET>
 
 | Symptom | Fix |
 |---------|-----|
-| Build fails on `tsc` / vite | Ensure build is `npm ci --omit=dev` only (no `npm run build`) |
+| Build fails on `tsc` / vite | Use Dockerfile builder; do not run `npm run build` on Railway |
+| `EBUSY rmdir node_modules/.cache` | Fixed via Dockerfile + `/tmp/npm-cache`; redeploy latest `main` |
+| `EBADENGINE` Node 22.11 | Dockerfile pins **Node 22.14** |
 | App crashes / OOM | Raise memory in Railway plan; 0.5 GB is tight |
 | CORS error | Add exact Pages origin to `CORS_ORIGINS`, redeploy API |
 | Pages still hits `pages.dev/api/...` 405 | `VITE_API_BASE_URL` missing or Pages not rebuilt |

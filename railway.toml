@@ -1,21 +1,13 @@
-# Railway — always-on Node API (momentum + notifications + Yahoo)
-# Dashboard: https://railway.app → New Project → Deploy from GitHub
-#
-# Settings to set in the Railway UI (or here):
-#   Start Command:  npm start
-#   Watch paths:    optional
-#
-# Required variables: see docs/Railway_Deploy.md
+# Railway — always-on Node API (Dockerfile avoids nixpacks npm EBUSY)
+# https://railway.app → New Project → Deploy from GitHub (main)
 
 [build]
-builder = "NIXPACKS"
-# Install all deps needed to run server (yahoo-finance2, express, …)
-buildCommand = "npm ci --omit=dev"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "npm start"
-# Restart if the process exits (momentum loop lives in this process)
+startCommand = "node server/index.js"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/api/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
