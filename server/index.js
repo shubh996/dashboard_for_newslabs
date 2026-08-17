@@ -17,7 +17,10 @@ dotenv.config({ path: path.join(projectRoot, '.env.local') })
 dotenv.config({ path: path.join(projectRoot, '.env') })
 
 const app = express()
-const port = Number(process.env.API_PORT || 3001)
+// Railway / Render inject PORT; local uses API_PORT (default 3001)
+const port = Number(
+  process.env.PORT || process.env.API_PORT || 3001,
+)
 const host = String(process.env.API_HOST || '0.0.0.0')
 
 /**

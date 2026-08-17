@@ -51,10 +51,13 @@ If you open Momentum Studio on `*.pages.dev` without a backend, the console show
 - `POST /api/momentum/watch` → **405**
 - `POST /api/momentum/.../tick` → **405**
 
-**Fix:** deploy the Node API (Railway / Render / Fly / VPS), then set on Cloudflare Pages:
+**Easiest always-on host: Railway** — see [`docs/Railway_Deploy.md`](./docs/Railway_Deploy.md).  
+(Hetzner VPS is cheaper long-term: [`docs/Hetzner_VPS_Deploy.md`](./docs/Hetzner_VPS_Deploy.md).)
+
+**Fix:** deploy the Node API (Railway recommended), then set on Cloudflare Pages:
 
 ```env
-VITE_API_BASE_URL=https://your-api-host.example.com
+VITE_API_BASE_URL=https://your-service.up.railway.app
 ```
 
 Rebuild/redeploy Pages after adding the variable (Vite bakes it into the bundle).

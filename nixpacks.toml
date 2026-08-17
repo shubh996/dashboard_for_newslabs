@@ -1,0 +1,9 @@
+# Railway uses Nixpacks by default. Keep install light — no frontend build.
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm ci --omit=dev"]
+
+[start]
+cmd = "npm start"
