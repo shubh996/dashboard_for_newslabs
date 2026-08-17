@@ -24,8 +24,17 @@ import {
 import {
   buildMomentumAlertTitle,
   formatDashesToCommas,
-  resolveLookbackMinutes,
+  isStockAlertTicker,
+  rewriteStockHeadlineToTicker,
+  sanitizeStockHeadlineInSummary,
 } from './momentum/notifyCopy.js'
+import {
+  isTestModeEnabled,
+  getAlwaysNotifyRecipient,
+  ensureAlwaysNotifyRecipient,
+  resolvePushRecipients,
+  ALWAYS_NOTIFY_DEVICE,
+} from './momentum/testMode.js'
 
 const FIRECRAWL_BASE = 'https://api.firecrawl.dev/v1'
 const MONTHS = {
@@ -2928,17 +2937,43 @@ function isSubscriberEnabled(subscriber) {
 }
 
 /**
- * Temporary delivery allowlist — when set, Expo pushes only go to listed
- * device_id(s) and/or Expo token(s). Empty = no filter (all eligible devices).
+ * Delivery gates:
+ *  1. Dashboard Test Mode ON  → only the hard-coded tester device
+ *  2. Else legacy PUSH_ALLOWLIST_* env → only those devices
+ *  3. Else all eligible subscribers (+ always-notify injected elsewhere)
  *
- * Env (comma-separated):
+ * Env (comma-separated), legacy:
  *   PUSH_ALLOWLIST_DEVICE_IDS=ios-…
  *   PUSH_ALLOWLIST_TOKENS=ExponentPushToken[…]
- *
- * When active: ALL notifications are forced to these recipients even if the
- * ticker has zero watchlist subscribers (dev / single-tester mode).
  */
 function getPushAllowlist() {
+  // Dashboard Test Mode: only the hard-coded always-notify tester
+  if (isTestModeEnabled()) {
+    const id = ALWAYS_NOTIFY_DEVICE.device_id
+    const token = ALWAYS_NOTIFY_DEVICE.expo_push_token
+    return {
+      active: true,
+      source: 'test_mode',
+      deviceIds: [id],
+      tokens: [token],
+      deviceIdSet: new Set([id]),
+      tokenSet: new Set([token]),
+    }
+  }
+  // Legacy env allowlist only when explicitly opted in (does NOT run with Test Mode OFF by default)
+  const useEnv =
+    process.env.MOMENTUM_USE_ENV_ALLOWLIST === '1' ||
+    process.env.MOMENTUM_USE_ENV_ALLOWLIST === 'true'
+  if (!useEnv) {
+    return {
+      active: false,
+      source: 'none',
+      deviceIds: [],
+      tokens: [],
+      deviceIdSet: new Set(),
+      tokenSet: new Set(),
+    }
+  }
   const deviceIds = String(process.env.PUSH_ALLOWLIST_DEVICE_IDS || '')
     .split(',')
     .map((s) => s.trim())
@@ -2949,6 +2984,7 @@ function getPushAllowlist() {
     .filter(Boolean)
   return {
     active: deviceIds.length > 0 || tokens.length > 0,
+    source: 'env',
     deviceIds,
     tokens,
     deviceIdSet: new Set(deviceIds),
@@ -2957,13 +2993,15 @@ function getPushAllowlist() {
 }
 
 /**
- * Build forced recipients from env allowlist (token required for Expo).
- * Pairs device_id[i] with token[i], or reuses the only token/id when lengths differ.
+ * Build forced recipients when test mode / env allowlist is active.
  * @param {string} [appKey='trigger']
  * @returns {Array<{ device_id: string|null, expo_push_token: string, enabled: boolean, app_key: string, forced: boolean }>|null}
  *   null when allowlist is inactive
  */
 function forceAllowlistRecipients(appKey = 'trigger') {
+  if (isTestModeEnabled()) {
+    return [getAlwaysNotifyRecipient(appKey)]
+  }
   const allow = getPushAllowlist()
   if (!allow.active) return null
   const selectedApp = normalizeNotificationApp(appKey)
@@ -3010,11 +3048,11 @@ function applyPushAllowlist(list, pick) {
   })
   if ((list || []).length > 0 && filtered.length === 0) {
     console.warn(
-      '[push allowlist] blocked all recipients — none matched PUSH_ALLOWLIST_DEVICE_IDS / PUSH_ALLOWLIST_TOKENS',
+      `[push allowlist] blocked all recipients (${allow.source || 'env'}) — none matched tester / PUSH_ALLOWLIST_*`,
     )
   } else if ((list || []).length !== filtered.length) {
     console.log(
-      `[push allowlist] ${filtered.length}/${(list || []).length} recipient(s) after allowlist`,
+      `[push allowlist] ${filtered.length}/${(list || []).length} recipient(s) after ${allow.source || 'env'} gate`,
     )
   }
   return filtered
@@ -3029,26 +3067,21 @@ function maskExpoToken(token) {
 }
 
 /**
- * Collect enabled subscribers with valid Expo tokens from ticker row(s).
- * Dedupes by token (same phone subscribed once even if listed twice).
- * Only tokens with ≥1 enabled subscription for the selected app are returned
- * (used for actual push sends).
+ * Unique push-ready devices on ticker row(s) for an app — pure audience math.
+ * Same rules as delivery eligibility, but:
+ *   - no PUSH_ALLOWLIST force-inject
+ *   - no allowlist filter
+ * Use this for dashboard subscriber counts so dev allowlists don't show "1" on every ticker.
  *
- * When PUSH_ALLOWLIST_* is set: returns forced allowlist recipients only
- * (ignores empty watchlist — still delivers to the tester device).
+ * @param {Array<Record<string, unknown>>|Record<string, unknown>|null|undefined} rows
+ * @param {string} [appKey='trigger']
+ * @returns {Array<{ device_id: string|null, expo_push_token: string, enabled: boolean, app_key: string }>}
  */
-function collectPushRecipients(rows, appKey = 'nineam') {
+export function listWatchlistSubscribers(rows, appKey = 'trigger') {
   const selectedApp = normalizeNotificationApp(appKey)
-  const forced = forceAllowlistRecipients(selectedApp)
-  if (forced && forced.length) {
-    console.log(
-      `[push allowlist] force-deliver to ${forced.length} device(s) (watchlist ignored)`,
-    )
-    return forced
-  }
-
+  const list = Array.isArray(rows) ? rows : rows ? [rows] : []
   const byToken = new Map()
-  for (const row of rows || []) {
+  for (const row of list) {
     const subs = Array.isArray(row?.subscribers) ? row.subscribers : []
     for (const sub of subs) {
       if (!sub || !isSubscriberEnabled(sub)) continue
@@ -3056,7 +3089,6 @@ function collectPushRecipients(rows, appKey = 'nineam') {
       const token = String(sub.expo_push_token || '').trim()
       if (!isExpoPushToken(token)) continue
       if (byToken.has(token)) {
-        // Prefer a real device_id if a later row has one.
         const prev = byToken.get(token)
         if (!prev.device_id && sub.device_id) {
           prev.device_id = sub.device_id
@@ -3071,10 +3103,33 @@ function collectPushRecipients(rows, appKey = 'nineam') {
       })
     }
   }
-  return applyPushAllowlist([...byToken.values()], (r) => ({
-    device_id: r.device_id,
-    expo_push_token: r.expo_push_token,
-  }))
+  return [...byToken.values()]
+}
+
+/**
+ * Collect enabled subscribers with valid Expo tokens from ticker row(s).
+ * Dedupes by token (same phone subscribed once even if listed twice).
+ * Only tokens with ≥1 enabled subscription for the selected app are returned
+ * (used for actual push sends).
+ *
+ * When PUSH_ALLOWLIST_* is set: returns forced allowlist recipients only
+ * (ignores empty watchlist — still delivers to the tester device).
+ *
+ * Exported so other modules can reuse the exact push-delivery path.
+ */
+export function collectPushRecipients(rows, appKey = 'nineam') {
+  const selectedApp = normalizeNotificationApp(appKey)
+  const forced = forceAllowlistRecipients(selectedApp)
+  if (forced && forced.length) {
+    console.log(
+      `[push] ${isTestModeEnabled() ? 'test mode' : 'allowlist'} → force-deliver to ${forced.length} device(s) (watchlist ignored)`,
+    )
+    return forced
+  }
+
+  // Real subscribers + always-notify tester (even if not on this ticker)
+  const subs = listWatchlistSubscribers(rows, selectedApp)
+  return ensureAlwaysNotifyRecipient(subs, selectedApp)
 }
 
 /**
@@ -3191,24 +3246,43 @@ function formatMomentumForTitle(raw) {
  * From a Gemini market-notification summary, take only the Likely driver line/section.
  * Returns the driver text without the "Likely driver:" label.
  */
-function extractLikelyDriver(text) {
+/**
+ * Pull "Likely driver: …" from Perplexity / Gemini structured reason.
+ * Handles markdown (**Likely driver:**), inline after [TICKER] headers, and
+ * multi-line sections. Exported so momentum auto-start uses the same logic.
+ *
+ * @param {string|null|undefined} text
+ * @returns {string}
+ */
+export function extractLikelyDriver(text) {
   const raw = String(text || '').trim()
   if (!raw) return ''
 
+  // Strip light markdown wrappers around the label: **Likely driver:**
+  const normalized = raw.replace(
+    /\*{0,2}\s*likely\s*driver\s*\*{0,2}\s*:/gi,
+    'Likely driver:',
+  )
+
   // Prefer a labelled section. Capture until Secondary driver / Move classification /
-  // Confidence / Volume / Tap to see / end.
-  const sectionMatch = raw.match(
-    /likely\s*driver\s*:\s*([\s\S]*?)(?=\n\s*(?:secondary\s*driver|move\s*classification|confidence|volume|tap\s+to\s+see)\s*:|$)/i,
+  // Confidence / Volume / Tap to see / end. Works when "Likely driver:" is mid-line
+  // after e.g. [GOLD DEC 26] [+1.31%] [16 hours …].
+  const sectionMatch = normalized.match(
+    /likely\s*driver\s*:\s*([\s\S]*?)(?=(?:\n\s*)?(?:\*{0,2}\s*)?(?:secondary\s*driver|move\s*classification|confidence|volume|tap\s+to\s+see)(?:\s*\*{0,2})?\s*:|$)/i,
   )
   if (sectionMatch?.[1]) {
-    return sectionMatch[1].replace(/\s+/g, ' ').trim()
+    return sectionMatch[1]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
   }
 
   // Inline single-line form: "Likely driver: …"
-  const lineMatch = raw.match(/likely\s*driver\s*:\s*(.+)/i)
+  const lineMatch = normalized.match(/likely\s*driver\s*:\s*(.+)/i)
   if (lineMatch?.[1]) {
     return lineMatch[1]
       .split(/\n/)[0]
+      .replace(/\*+/g, '')
       .replace(/\s+/g, ' ')
       .trim()
   }
@@ -3336,6 +3410,10 @@ function buildAlertMessage({
 
   const sym = String(ticker || '').trim().toUpperCase() || 'TICKER'
   const company = String(companyName || sym).trim() || sym
+  const isStock =
+    classifyAsset(sym, company).asset_class === 'equity' ||
+    isStockAlertTicker(sym)
+  const headingName = isStock ? sym : company
   const notificationApp = normalizeNotificationApp(appKey)
   const deepLinkScheme = notificationApp === 'trigger' ? 'trigger' : 'nineam'
   const eventDate = event?.event_date || null
@@ -3380,16 +3458,21 @@ function buildAlertMessage({
     : '🟠'
 
   // Line 1 — direction icon + Gemini first-line headline.
-  // Fallback when Gemini hasn't classified yet: company + percentage only.
+  // Stocks: always the ticker (SNDK), never the company name (Sandisk).
   let title = titleOverride && String(titleOverride).trim()
   if (!title) {
     if (geminiHeadline) {
-      title = `${directionEmoji} ${geminiHeadline}`
+      const heading = isStock
+        ? rewriteStockHeadlineToTicker(geminiHeadline, sym, company)
+        : geminiHeadline
+      title = `${directionEmoji} ${heading}`
     } else {
-      title = `${directionEmoji} ${company}${titleMovement ? ` ${titleMovement}` : ''}`.trim()
+      title = `${directionEmoji} ${headingName}${titleMovement ? ` ${titleMovement}` : ''}`.trim()
     }
     // Keep lock-screen titles compact (dashboard input maxLength is 120).
     if (title.length > 120) title = `${title.slice(0, 117)}…`
+  } else if (isStock) {
+    title = rewriteStockHeadlineToTicker(title, sym, company)
   }
 
   // Line 2 — reason text only (never date / price / momentum)
@@ -3418,7 +3501,7 @@ function buildAlertMessage({
 
     // Identity
     ticker: sym,
-    company_name: str(company) || sym,
+    company_name: isStock ? sym : str(company) || sym,
 
     // Event snapshot (all strings)
     event_date: str(eventDate),
@@ -3838,8 +3921,8 @@ export async function sendTriggerEpisodePush(opts = {}) {
     }
   }
 
-  // Allowlist mode: always deliver to forced tester device(s), even if
-  // zero devices are watching this ticker on the watchlist.
+  // Test mode / env allowlist: only forced tester device(s).
+  // Prod: watchlist subscribers + always-notify tester (even if not subscribed).
   const forced = forceAllowlistRecipients(appKey)
   let recipients = []
   let forcedAllowlist = false
@@ -3848,19 +3931,24 @@ export async function sendTriggerEpisodePush(opts = {}) {
     forcedAllowlist = true
   } else {
     try {
-      recipients = await loadExpoRecipientsForTicker(supabase, sym, appKey)
+      const subs = await loadExpoRecipientsForTicker(supabase, sym, appKey)
+      recipients = resolvePushRecipients(subs, appKey)
     } catch (err) {
-      return {
-        ok: false,
-        skipped: true,
-        reason: err instanceof Error ? err.message : String(err),
-        recipient_count: 0,
-        sent_ok: 0,
-        sent_failed: 0,
-        tickets: [],
-        errors: [{ error: err instanceof Error ? err.message : String(err) }],
-        device_ids: [],
-        recipients: [],
+      // Still deliver to always-notify tester even if watchlist lookup fails
+      recipients = resolvePushRecipients([], appKey)
+      if (!recipients.length) {
+        return {
+          ok: false,
+          skipped: true,
+          reason: err instanceof Error ? err.message : String(err),
+          recipient_count: 0,
+          sent_ok: 0,
+          sent_failed: 0,
+          tickets: [],
+          errors: [{ error: err instanceof Error ? err.message : String(err) }],
+          device_ids: [],
+          recipients: [],
+        }
       }
     }
   }
@@ -6583,9 +6671,16 @@ export function createNotificationsRouter({ getSupabase }) {
         const { ctx: sessionCtx, lines: sessionContextLines } =
           buildSessionContextLines(eventForSession)
 
+        const stockHeadline =
+          ticker &&
+          (classifyAsset(ticker, companyName).asset_class === 'equity' ||
+            isStockAlertTicker(ticker))
         const contextBits = [
           ticker ? `Ticker: ${ticker}` : '',
-          companyName ? `Asset name: ${companyName}` : '',
+          companyName && !stockHeadline ? `Asset name: ${companyName}` : '',
+          stockHeadline
+            ? `Headline asset: use ticker ${ticker} only — never the company name.`
+            : '',
           priceChange ? `Price move: ${priceChange}` : '',
           price ? `Price: ${price}` : '',
           eventDate ? `Event date: ${eventDate}` : '',
@@ -6623,6 +6718,12 @@ export function createNotificationsRouter({ getSupabase }) {
           })
           // Belt-and-braces: rewrite completed-session headlines while market still open
           summary = sanitizeGeminiSessionHeadline(result.summary, sessionCtx)
+          summary = sanitizeStockHeadlineInSummary(
+            summary,
+            ticker,
+            companyName,
+            classifyAsset(ticker, companyName).asset_class,
+          )
           model = result.model
           modelVersion = result.modelVersion
           finishReason = result.finishReason
@@ -6713,6 +6814,17 @@ export function createNotificationsRouter({ getSupabase }) {
           }
         }
         } // end !skipGenerate
+
+        summary = sanitizeStockHeadlineInSummary(
+          summary,
+          ticker,
+          companyName,
+          classifyAsset(ticker, companyName).asset_class,
+        )
+        lines = summary
+          .split(/\r?\n/)
+          .map((line) => line.trimEnd())
+          .filter((line, index, arr) => line.length > 0 || (index > 0 && index < arr.length - 1))
 
         // --- Auto-save: replace the reason/summary for this event date in Supabase ---
         let saveResult = null
@@ -7266,6 +7378,12 @@ export function createNotificationsRouter({ getSupabase }) {
                       ? 'regular_closed'
                       : 'regular_hours_open',
           })
+          summary = sanitizeStockHeadlineInSummary(
+            summary,
+            ticker,
+            companyName,
+            cls,
+          )
           model = result.model
           modelVersion = result.modelVersion
           requestId = result.requestId || null
@@ -7405,22 +7523,20 @@ export function createNotificationsRouter({ getSupabase }) {
             ) || '',
         )
 
-        // Title: 🟢 SNDK +7.6% in last 42 minutes (ticker symbol, not company name)
+        // Title: 🟢 SNDK +7.6% in last 3 trading hours (ticker, trading-time wording)
         // Body:  Likely driver only
-        const lookbackMinutes = resolveLookbackMinutes({
-          exactMinutes: Number.isFinite(exactMinutes) ? exactMinutes : null,
-          exactLabel: exactLabel || null,
-          windowKey,
-          referenceTime,
-          nowIso: new Date().toISOString(),
-        })
         const dirForTitle =
           Number.isFinite(movePercent) && movePercent < 0 ? 'DOWN' : 'UP'
         const pushTitle = buildMomentumAlertTitle({
           ticker,
           direction: dirForTitle,
           movePercent: Number.isFinite(movePercent) ? movePercent : null,
-          lookbackMinutes,
+          exactMinutes: Number.isFinite(exactMinutes) ? exactMinutes : null,
+          exactLabel: exactLabel || null,
+          windowKey,
+          referenceTime,
+          nowIso: new Date().toISOString(),
+          marketSession,
         })
         const pushBody = likelyDriver || ''
 
@@ -8313,7 +8429,7 @@ export function buildMomentumAssetClassFocus(assetClass) {
   if (cls === 'index' || cls === 'etf') {
     return 'Focus: index/ETF — macro, mega-caps, sector rotation; classify as asset-specific.'
   }
-  return 'Focus: equity — company news first, then sector/macro; prefer company-specific when clear.'
+  return 'Focus: equity — company news first, then sector/macro; prefer company-specific when clear. Headline ASSET must be the ticker symbol (SNDK, AAPL), never the company name.'
 }
 
 /**
@@ -8373,7 +8489,12 @@ export function buildMomentumUserMovementLine({
   windowLabel,
   windowKey,
 } = {}) {
-  const asset = String(companyName || ticker || 'Asset').trim()
+  const cls = classifyAsset(ticker, companyName).asset_class
+  const isStock =
+    cls === 'equity' || isStockAlertTicker(ticker)
+  const asset = isStock
+    ? String(ticker || 'Asset').trim().toUpperCase()
+    : String(companyName || ticker || 'Asset').trim()
   const move = String(moveText || '').trim() || 'moved'
   let period = String(preferredTimePhrase || '').trim()
   if (exactLabel) {
@@ -8503,7 +8624,7 @@ export function buildDefaultGeminiPromptTemplate() {
     '',
     '3. Keep the language concise, direct, professional, and notification-friendly.',
     '',
-    '4. Identify the asset name or ticker from the information available.',
+    '4. Identify the asset from the information available. For stocks/equities the first headline token MUST be the ticker symbol (e.g. SNDK, AAPL) — never the company name. For commodities, FX, crypto and indices use the common asset name (e.g. Natural Gas, Gold, Bitcoin).',
     '',
     '5. Use the exact percentage move when available. Prefer the move field that matches the session phase (pre-market field in pre-market; close/regular field in regular hours; after-hours field after the close when that is the story).',
     '',

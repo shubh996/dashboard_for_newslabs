@@ -4,15 +4,24 @@
  * **day** is special: % change vs Yahoo `previousClose` (prior regular session close),
  * not a rolling N-hour window of candles.
  *
- * Overnight / weekend: Yahoo has no equity 1m bars while closed. A lookback that
- * lands in that quiet region uses the **last print before the gap** (usually Friday).
- * We must not null those windows just because wall-clock age > lookback.
+ * Lookbacks are **wall-clock** (exact clock hours/minutes), not eligible-trading walks.
+ * If Yahoo has no 1m print near the exact lookback instant (overnight hole, weekend
+ * gap, outage), that window is **null** — we do not substitute Friday’s last price
+ * for a “3h” / “8h” card. Only **bridge** windows (30h/40h/50h) may span the gap.
+ *
+ * Example Mon pre-market with bars only from 04:00 ET: 5m…2h may show; 3h+ are “—”.
  */
 import { candleAtOrBefore, firstCandleAfter } from './candles.js'
 import { MOMENTUM_WINDOWS, allReturnKeys } from './config.js'
 
-/** Fri close → Mon open is ~65.5h; allow 72h for gap-tolerant anchors. */
+/** Fri close → Mon open is ~65.5h; allow 72h for bridge-window anchors only. */
 const SESSION_GAP_MAX_EXTRA_MS = 72 * 60 * 60_000
+
+/** A data hole longer than this (no 1m bars) means the exact clock lookback is missing. */
+const DATA_HOLE_MIN_MS = 4 * 60 * 60_000
+
+/** Hist must not sit more than this before the target unless bridge/multi-day. */
+const MAX_TARGET_LAG_MS = 30 * 60_000
 
 /**
  * @param {number} current
@@ -69,7 +78,6 @@ function targetInSessionGap(candles, hist, targetMs) {
 function histAcceptable(candles, hist, asOfMs, targetMs, mins, meta) {
   const ageMs = asOfMs - hist.t
   const baseMax = mins * 60_000 + maxAgeSlackMs(mins, meta)
-  if (ageMs <= baseMax) return true
 
   // Multi-day daily bars: accept within lookback + slack (more for long horizons)
   if (meta.multiDay) {
@@ -82,18 +90,105 @@ function histAcceptable(candles, hist, asOfMs, targetMs, mins, meta) {
     return ageMs <= mins * 60_000 + daySlack
   }
 
-  // Short windows stay strict (avoid using stale bars when 1m data is simply missing)
+  // Hist must be near the *target* clock instant (exact window), not Friday when
+  // target was Sunday/Monday overnight with no Yahoo bars.
+  const lagFromTarget = targetMs - hist.t
+  if (Number.isFinite(lagFromTarget) && lagFromTarget > 0) {
+    const maxLag = Math.max(MAX_TARGET_LAG_MS, maxAgeSlackMs(mins, meta))
+    if (lagFromTarget > maxLag && !meta.bridge) {
+      return false
+    }
+  }
+
+  if (ageMs <= baseMax) return true
+
+  // Short windows stay strict
   if (mins < 120) return false
 
-  // Lookback target is in a closed-market hole after the last print (Fri → Mon).
-  // Allow up to lookback + weekend buffer so 5h…20h match 24h’s Friday anchor.
+  // Only weekend *bridge* windows may anchor across a closed-market hole
   if (
+    meta.bridge &&
     targetInSessionGap(candles, hist, targetMs) &&
     ageMs <= mins * 60_000 + SESSION_GAP_MAX_EXTRA_MS
   ) {
     return true
   }
   return false
+}
+
+/**
+ * Exact clock-hour lookback: if the target sits in a Yahoo data hole (no 1m bars
+ * between last pre-hole print and first resume), reject the window (null).
+ * Do **not** substitute Friday or pre-open — only bridge windows span gaps.
+ *
+ * @param {import('./candles.js').Candle[]} candles
+ * @param {import('./candles.js').Candle|null} hist
+ * @param {number} targetMs
+ * @param {number} asOfMs
+ * @param {number} mins
+ * @param {{ bridge?: boolean, multiDay?: boolean }} meta
+ * @returns {{
+ *   hist: import('./candles.js').Candle|null,
+ *   rejected: boolean,
+ *   holeMs: number,
+ *   reason: string|null,
+ * }}
+ */
+export function resolveLookbackHist(
+  candles,
+  hist,
+  targetMs,
+  asOfMs,
+  mins,
+  meta = {},
+) {
+  if (!hist || !candles?.length) {
+    return { hist: null, rejected: true, holeMs: 0, reason: 'NO_HIST' }
+  }
+  // Bridge / multi-day intentionally reach across weekends
+  if (meta.bridge || meta.multiDay) {
+    return { hist, rejected: false, holeMs: 0, reason: null }
+  }
+
+  const resume = firstCandleAfter(candles, hist.t)
+  if (resume && resume.t <= asOfMs) {
+    const holeMs = resume.t - hist.t
+    if (holeMs >= DATA_HOLE_MIN_MS) {
+      // Target inside the hole → cannot form an exact clock-hour window
+      if (hist.t < targetMs && targetMs < resume.t) {
+        return {
+          hist: null,
+          rejected: true,
+          holeMs,
+          reason: 'DATA_HOLE',
+        }
+      }
+      // Hist is pre-hole but target is after resume — still wrong anchor
+      if (hist.t < resume.t && targetMs >= resume.t) {
+        // Prefer candle at target (caller used candleAtOrBefore); if hist is
+        // still pre-hole, reject so we do not use Friday for a Mon target.
+        if (hist.t < resume.t - DATA_HOLE_MIN_MS / 2) {
+          const better = candleAtOrBefore(candles, targetMs)
+          if (better && better.t >= resume.t) {
+            return { hist: better, rejected: false, holeMs: 0, reason: null }
+          }
+        }
+      }
+    }
+  }
+
+  // Hist far before target without enough bars at the lookback instant
+  const lag = targetMs - hist.t
+  if (lag > Math.max(MAX_TARGET_LAG_MS, maxAgeSlackMs(mins, meta))) {
+    return {
+      hist: null,
+      rejected: true,
+      holeMs: lag,
+      reason: 'STALE_BEFORE_TARGET',
+    }
+  }
+
+  return { hist, rejected: false, holeMs: 0, reason: null }
 }
 
 /**
@@ -117,10 +212,8 @@ export function formatExactLookbackLabel(minutes) {
   const m = Math.max(0, Math.round(Number(minutes) || 0))
   if (m < 60) return `${m} minute${m === 1 ? '' : 's'}`
   if (m >= 24 * 60) {
-    const d = Math.floor(m / (24 * 60))
-    const remH = Math.floor((m % (24 * 60)) / 60)
-    if (remH === 0) return `${d} day${d === 1 ? '' : 's'}`
-    return `${d}d ${remH}h`
+    const d = Math.max(1, Math.round(m / (24 * 60)))
+    return `${d} day${d === 1 ? '' : 's'}`
   }
   const h = Math.floor(m / 60)
   const rem = m % 60
@@ -162,6 +255,7 @@ function yearStartEtMs(asOfMs) {
  * @param {number|null} previousClose
  * @param {string|null} [previousCloseTimeIso]
  * @param {import('./candles.js').Candle[]|null} [dailyCandles] optional 1d bars for multi-day windows
+ * @param {string|object|null} [symbolOrProfile] when set, lookbacks walk eligible trading minutes
  */
 export function computeRollingReturns(
   candles,
@@ -170,6 +264,7 @@ export function computeRollingReturns(
   previousClose,
   previousCloseTimeIso = null,
   dailyCandles = null,
+  symbolOrProfile = null,
 ) {
   /** @type {Record<string, number|null>} */
   const returns = {}
@@ -196,6 +291,8 @@ export function computeRollingReturns(
   const asOfIso = Number.isFinite(asOfMs) ? new Date(asOfMs).toISOString() : null
   const daily =
     Array.isArray(dailyCandles) && dailyCandles.length ? dailyCandles : null
+  // symbolOrProfile kept for API compatibility; rolling cards use wall-clock only.
+  void symbolOrProfile
 
   for (const w of MOMENTUM_WINDOWS) {
     const key = w.key
@@ -208,6 +305,8 @@ export function computeRollingReturns(
         : candles
 
     let mins = w.minutes
+    // Always wall-clock for rolling-return cards (exact clock hours).
+    // Eligible-trading walks are for inactivity expiry only — not these %.
     let target = asOfMs - mins * 60_000
     if (isYtd) {
       const y0 = yearStartEtMs(asOfMs)
@@ -217,13 +316,23 @@ export function computeRollingReturns(
       }
     }
 
-    const hist = candleAtOrBefore(series, target)
+    let hist = candleAtOrBefore(series, target)
     const meta = {
       bridge: w.bridge,
       extended: w.extended,
       multiDay,
       ytd: isYtd,
     }
+
+    const resolved = resolveLookbackHist(
+      series,
+      hist,
+      target,
+      asOfMs,
+      mins,
+      meta,
+    )
+    hist = resolved.hist
 
     // YTD: accept first daily bar on/after year start (or last before)
     const ytdOk =
@@ -235,6 +344,7 @@ export function computeRollingReturns(
 
     if (
       !hist ||
+      resolved.rejected ||
       (!isYtd && !histAcceptable(series, hist, asOfMs, target, mins, meta)) ||
       (isYtd && !ytdOk)
     ) {
@@ -263,6 +373,10 @@ export function computeRollingReturns(
             referenceTime: refIso,
             asOfTime: asOfIso,
             movePercent: move,
+            crossedClosure: false,
+            closureDurationSec: 0,
+            sessionBoundaryType: null,
+            dataHoleRejected: false,
           }
         : null
   }
@@ -425,21 +539,15 @@ export function findMaxMoveInLookbackWindow(
 }
 
 /**
- * Order keys so the meaningful “today” move is first in pre/post,
+ * Order keys so the session card (PRE / Regular / Overnight / AH) is first,
  * then short tape windows, then long bridges.
  *
  * @param {string[]} keys
  * @param {string|null|undefined} marketSession
  */
-export function orderReturnKeysForDisplay(keys, marketSession) {
+export function orderReturnKeysForDisplay(keys, _marketSession) {
   const list = [...(keys || [])]
-  const session = String(marketSession || '').toUpperCase()
-  const isExtended =
-    session === 'PRE' || session === 'POST' || session === 'CLOSED'
-
-  if (!isExtended || !list.includes('day')) return list
-
-  // Day first during pre/post — that’s the 3.5% premarket number
+  if (!list.includes('day')) return list
   return ['day', ...list.filter((k) => k !== 'day')]
 }
 
@@ -451,8 +559,9 @@ export function orderReturnKeysForDisplay(keys, marketSession) {
 export function returnKeyLabel(key, marketSession) {
   if (key !== 'day') return key
   const session = String(marketSession || '').toUpperCase()
-  if (session === 'PRE') return 'pre'
-  if (session === 'POST') return 'post'
-  if (session === 'CLOSED') return 'day'
-  return 'day'
+  if (session === 'PRE') return 'PRE'
+  if (session === 'PREPRE') return 'Overnight'
+  if (session === 'POST' || session === 'POSTPOST') return 'After-hours'
+  if (session === 'REGULAR') return 'Regular'
+  return 'Prev close'
 }

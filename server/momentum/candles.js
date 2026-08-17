@@ -6,38 +6,25 @@
  * @typedef {{ t: number, close: number, open?: number|null, high?: number|null, low?: number|null, volume?: number|null }} Candle
  */
 
+import {
+  etPartsAt,
+  etWallToUtcMs,
+  inferUsEquityMarketSession,
+} from './usEquitySession.js'
+
 function num(value) {
   const n = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(n) ? n : null
 }
 
 /**
- * Infer session from US/Eastern wall-clock minutes (fallback if Yahoo marketState missing).
+ * Infer session from America/New_York wall-clock (fallback if Yahoo marketState missing).
+ * Overnight Sun 20:00 ET is PRE; Fri 20:00 ET → Sun 20:00 ET is CLOSED.
  * @param {number} ms
  * @returns {'PRE'|'REGULAR'|'POST'|'CLOSED'}
  */
 export function inferMarketSession(ms) {
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'America/New_York',
-      hour: 'numeric',
-      minute: 'numeric',
-      hour12: false,
-      weekday: 'short',
-    }).formatToParts(new Date(ms))
-    const get = (type) => parts.find((p) => p.type === type)?.value
-    const wd = get('weekday')
-    if (wd === 'Sat' || wd === 'Sun') return 'CLOSED'
-    const hour = Number(get('hour'))
-    const minute = Number(get('minute'))
-    const mins = hour * 60 + minute
-    if (mins >= 4 * 60 && mins < 9 * 60 + 30) return 'PRE'
-    if (mins >= 9 * 60 + 30 && mins < 16 * 60) return 'REGULAR'
-    if (mins >= 16 * 60 && mins < 20 * 60) return 'POST'
-    return 'CLOSED'
-  } catch {
-    return 'REGULAR'
-  }
+  return inferUsEquityMarketSession(ms)
 }
 
 /**
@@ -67,66 +54,6 @@ export function sessionLabel(session) {
   if (session === 'POST') return 'After-hours'
   if (session === 'REGULAR') return 'Regular hours'
   return 'Market closed'
-}
-
-/**
- * Parse America/New_York wall-clock parts for a UTC ms.
- * @param {number} ms
- */
-function etPartsAt(ms) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-    weekday: 'short',
-  }).formatToParts(new Date(ms))
-  const get = (type) => parts.find((p) => p.type === type)?.value
-  let hour = Number(get('hour'))
-  if (hour === 24) hour = 0
-  return {
-    weekday: get('weekday') || '',
-    year: get('year') || '',
-    month: get('month') || '',
-    day: get('day') || '',
-    hour,
-    minute: Number(get('minute')) || 0,
-    second: Number(get('second')) || 0,
-  }
-}
-
-/**
- * Convert America/New_York Y-M-D H:M to UTC ms (handles EDT/EST).
- * @param {string} y
- * @param {string} mo
- * @param {string} d
- * @param {number} hour
- * @param {number} minute
- */
-function etWallToUtcMs(y, mo, d, hour, minute) {
-  let utc = Date.parse(
-    `${y}-${mo}-${d}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00.000Z`,
-  )
-  if (!Number.isFinite(utc)) return null
-  for (let i = 0; i < 5; i += 1) {
-    const p = etPartsAt(utc)
-    if (p.year !== y || p.month !== mo || p.day !== d) {
-      // Day slip — nudge by full days
-      const want = Date.parse(`${y}-${mo}-${d}T12:00:00.000Z`)
-      const got = Date.parse(`${p.year}-${p.month}-${p.day}T12:00:00.000Z`)
-      if (Number.isFinite(want) && Number.isFinite(got)) utc += want - got
-    }
-    const wantMin = hour * 60 + minute
-    const gotMin = p.hour * 60 + p.minute
-    const adj = (wantMin - gotMin) * 60 * 1000
-    if (adj === 0) break
-    utc += adj
-  }
-  return utc
 }
 
 /**
@@ -679,4 +606,140 @@ export function firstCandleAfter(candles, afterMs) {
     }
   }
   return best
+}
+
+/**
+ * First candle at or after `targetMs` (binary search).
+ * @param {Candle[]} candles sorted asc
+ * @param {number} targetMs
+ * @returns {Candle|null}
+ */
+export function firstCandleAtOrAfter(candles, targetMs) {
+  if (!candles.length || !Number.isFinite(targetMs)) return null
+  let lo = 0
+  let hi = candles.length - 1
+  let best = null
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    const c = candles[mid]
+    if (c.t >= targetMs) {
+      best = c
+      hi = mid - 1
+    } else {
+      lo = mid + 1
+    }
+  }
+  return best
+}
+
+/**
+ * Scheduled open of the current extended / regular session (ET wall clock).
+ * Used so PRE lookback can show “when pre-market tape started”, not Friday close.
+ *
+ * @param {string|null|undefined} marketSession  PRE | PREPRE | POST | POSTPOST | REGULAR | CLOSED
+ * @param {number} [asOfMs]
+ * @returns {{
+ *   openMs: number|null,
+ *   label: string,
+ *   shortLabel: string,
+ *   session: string,
+ * }|null}
+ */
+export function resolveSessionOpenClock(marketSession, asOfMs = Date.now()) {
+  const sess = String(marketSession || '').trim().toUpperCase()
+  const p = etPartsAt(asOfMs)
+  if (!p.year || !p.month || !p.day) return null
+
+  const y = p.year
+  const mo = p.month
+  const d = p.day
+  /** @type {number} */
+  let openMin
+  /** @type {string} */
+  let label
+  /** @type {string} */
+  let shortLabel
+
+  if (sess === 'PRE') {
+    openMin = 4 * 60 // 04:00 ET same calendar day
+    label = 'Pre-market open (4:00 AM ET)'
+    shortLabel = 'Pre open'
+  } else if (sess === 'PREPRE') {
+    openMin = 20 * 60 // 20:00 ET
+    label = 'Overnight open (8:00 PM ET)'
+    shortLabel = 'Overnight open'
+  } else if (sess === 'POST' || sess === 'POSTPOST') {
+    openMin = 16 * 60 // 16:00 ET
+    label = 'After-hours open (4:00 PM ET)'
+    shortLabel = 'AH open'
+  } else if (sess === 'REGULAR' || sess === 'OPEN') {
+    openMin = 9 * 60 + 30
+    label = 'Regular open (9:30 AM ET)'
+    shortLabel = 'RTH open'
+  } else {
+    return null
+  }
+
+  let openMs = etWallToUtcMs(y, mo, d, Math.floor(openMin / 60), openMin % 60)
+  if (openMs == null || !Number.isFinite(openMs)) return null
+  // Overnight before midnight: “today 20:00” is still in the future → use yesterday 20:00
+  if (openMs > asOfMs + 60_000) {
+    const prior = etPartsAt(asOfMs - 24 * 60 * 60_000)
+    openMs = etWallToUtcMs(
+      prior.year,
+      prior.month,
+      prior.day,
+      Math.floor(openMin / 60),
+      openMin % 60,
+    )
+  }
+  if (openMs == null || !Number.isFinite(openMs)) return null
+  return { openMs, label, shortLabel, session: sess }
+}
+
+/**
+ * First 1m print at/after the current session’s scheduled open.
+ * PRE: first bar from ~4:00 AM ET (not previous regular close).
+ *
+ * @param {Candle[]} candles sorted asc
+ * @param {string|null|undefined} marketSession
+ * @param {number} [asOfMs]
+ * @param {number} [maxLagMs] reject print if far after scheduled open (default 6h)
+ * @returns {{
+ *   price: number,
+ *   timeIso: string,
+ *   openMs: number,
+ *   label: string,
+ *   shortLabel: string,
+ *   session: string,
+ *   lagMinutes: number,
+ * }|null}
+ */
+export function resolveSessionOpenPrint(
+  candles,
+  marketSession,
+  asOfMs = Date.now(),
+  maxLagMs = 6 * 60 * 60_000,
+) {
+  const clock = resolveSessionOpenClock(marketSession, asOfMs)
+  if (!clock?.openMs) return null
+  // Prefer first print at/after open; if bar is exactly on open second, include it
+  const bar =
+    firstCandleAtOrAfter(candles, clock.openMs - 30_000) ||
+    firstCandleAfter(candles, clock.openMs - 60_000)
+  if (!bar || !Number.isFinite(bar.close)) return null
+  // Must not be before scheduled open (minus 1m slack) or way after open with no pre tape
+  if (bar.t < clock.openMs - 90_000) return null
+  if (bar.t - clock.openMs > maxLagMs) return null
+  // Session open print should not be after "now"
+  if (bar.t > asOfMs + 60_000) return null
+  return {
+    price: Number(bar.close),
+    timeIso: new Date(bar.t).toISOString(),
+    openMs: clock.openMs,
+    label: clock.label,
+    shortLabel: clock.shortLabel,
+    session: clock.session,
+    lagMinutes: Math.max(0, Math.round((bar.t - clock.openMs) / 60_000)),
+  }
 }

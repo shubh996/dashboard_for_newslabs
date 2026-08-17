@@ -3,7 +3,15 @@
  * Tune thresholds / poll interval here (or via env).
  */
 
+import fs from 'node:fs'
+import path from 'node:path'
 import { toYahooSymbol } from '../yahooClient.js'
+import { isTestModeEnabled } from './testMode.js'
+
+const THRESHOLD_STORE_PATH = path.resolve(
+  process.cwd(),
+  'data/momentum-thresholds.json',
+)
 
 /** Primary / bootstrap ticker (env MOMENTUM_TICKER). */
 export const MOMENTUM_TICKER = toYahooSymbol(
@@ -37,10 +45,25 @@ export const MOMENTUM_TICKER_GAP_MS = Math.max(
   Number(process.env.MOMENTUM_TICKER_GAP_MS || 350) || 350,
 )
 
-/** Cap how many symbols the background loop will poll. */
+/**
+ * Max tickers kept on the engine watchlist (Supabase universe).
+ * This is NOT “only poll these forever” — see MOMENTUM_POLL_PER_CYCLE.
+ * Default 200 so all Trigger-monitored symbols fit.
+ */
 export const MOMENTUM_MAX_WATCHED = Math.max(
   1,
-  Number(process.env.MOMENTUM_MAX_WATCHED || 20) || 20,
+  Number(process.env.MOMENTUM_MAX_WATCHED || 200) || 200,
+)
+
+/**
+ * How many symbols to Yahoo-fetch in a single poll cycle.
+ * Focus + active episodes always included; remaining slots rotate (round-robin)
+ * across the full watchlist so every ticker is covered over a few cycles.
+ * Default 20 keeps Yahoo load similar to the old hard cap of 20.
+ */
+export const MOMENTUM_POLL_PER_CYCLE = Math.max(
+  1,
+  Number(process.env.MOMENTUM_POLL_PER_CYCLE || 20) || 20,
 )
 
 /** Set MOMENTUM_ENGINE_ENABLED=0 to disable the auto loop. */
@@ -55,18 +78,18 @@ export const MOMENTUM_AUTO_START_RESEARCH =
 
 /**
  * Skip real Perplexity API; use dummy likely-driver for testing.
- * - MOMENTUM_DUMMY_RESEARCH=1 → always dummy
- * - MOMENTUM_DUMMY_RESEARCH=0 → always real API
- * - unset → dummy when PUSH_ALLOWLIST_* is set (single-tester mode)
+ * Priority:
+ *  1. Dashboard Test Mode ON → always dummy (no Perplexity spend)
+ *  2. MOMENTUM_DUMMY_RESEARCH=1 → force dummy
+ *  3. MOMENTUM_DUMMY_RESEARCH=0 → force real API
+ *  4. default → real Perplexity (do NOT auto-dummy from PUSH_ALLOWLIST)
  */
 export function isMomentumDummyResearchMode() {
+  if (isTestModeEnabled()) return true
   const flag = String(process.env.MOMENTUM_DUMMY_RESEARCH || '').trim()
   if (flag === '1' || flag.toLowerCase() === 'true') return true
   if (flag === '0' || flag.toLowerCase() === 'false') return false
-  const allow =
-    String(process.env.PUSH_ALLOWLIST_DEVICE_IDS || '').trim() ||
-    String(process.env.PUSH_ALLOWLIST_TOKENS || '').trim()
-  return Boolean(allow)
+  return false
 }
 
 function envThr(name, fallback) {
@@ -224,151 +247,697 @@ export const MOMENTUM_RETURN_WINDOWS = MOMENTUM_WINDOWS.map((w) => w.minutes)
  * Absolute % thresholds (both UP and DOWN).
  * windows: keyed by minutes (legacy shape for tests/env display)
  * day: change from previous regular close (not a rolling window)
- * Mutable at runtime via applyThresholdOverrides() for the Home UI.
- * Shared across all tickers (global policy for now).
+ *
+ * Per asset-class maps live in thresholdsByClass; MOMENTUM_WINDOWS /
+ * MOMENTUM_THRESHOLDS mirror the *equity* map for older callers.
  */
 export const MOMENTUM_THRESHOLDS = {
   windows: Object.fromEntries(
     MOMENTUM_WINDOWS.filter((w) => w.threshold != null).map((w) => [w.minutes, w.threshold]),
   ),
-  /**
-   * Day % = ((currentPrice - previousClose) / previousClose) * 100
-   * previousClose = Yahoo's last completed regular session close.
-   * This is NOT “last 24 hours of candles” — it's the classic day P/L vs prior close.
-   */
   day: Number(process.env.MOMENTUM_THR_DAY || 5),
 }
 
-function rebuildThresholdWindowsMap() {
+/** Asset classes with independent threshold bands */
+export const THRESHOLD_ASSET_CLASSES = [
+  'equity',
+  'commodity',
+  'forex',
+  'crypto',
+  'index',
+]
+
+/**
+ * @param {string|null|undefined} assetClass
+ * @returns {string}
+ */
+export function normalizeThresholdAssetClass(assetClass) {
+  const c = String(assetClass || 'equity').toLowerCase().trim()
+  if (c === 'indexes' || c === 'indices') return 'index'
+  if (c === 'stock' || c === 'stocks' || c === 'equity') return 'equity'
+  if (THRESHOLD_ASSET_CLASSES.includes(c)) return c
+  return 'equity'
+}
+
+/** Factory: defaults from MOMENTUM_WINDOWS + day env. */
+function buildDefaultThresholdMap() {
+  /** @type {Record<string, number|null>} */
+  const out = { day: Number(process.env.MOMENTUM_THR_DAY || 5) }
+  for (const w of MOMENTUM_WINDOWS) {
+    out[w.key] = w.threshold != null && Number(w.threshold) > 0 ? w.threshold : null
+  }
+  return out
+}
+
+/** @type {Record<string, Record<string, number|null>>} */
+const thresholdsByClass = Object.fromEntries(
+  THRESHOLD_ASSET_CLASSES.map((c) => [c, buildDefaultThresholdMap()]),
+)
+
+function cloneMap(map) {
+  return { ...(map || {}) }
+}
+
+/**
+ * Resolve threshold for a window key under an asset class.
+ * @param {string} key
+ * @param {string|null|undefined} [assetClass]
+ */
+export function getThresholdForKey(key, assetClass = 'equity') {
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const map = thresholdsByClass[cls] || thresholdsByClass.equity
+  if (Object.prototype.hasOwnProperty.call(map, key)) return map[key]
+  return null
+}
+
+/** Sync equity map onto MOMENTUM_WINDOWS + MOMENTUM_THRESHOLDS (legacy). */
+function syncLegacyEquityMirror() {
+  const equity = thresholdsByClass.equity
+  for (const w of MOMENTUM_WINDOWS) {
+    w.threshold = equity[w.key] != null ? equity[w.key] : null
+  }
+  MOMENTUM_THRESHOLDS.day =
+    equity.day != null && Number(equity.day) > 0 ? Number(equity.day) : 0
   MOMENTUM_THRESHOLDS.windows = Object.fromEntries(
     MOMENTUM_WINDOWS.filter((w) => w.threshold != null).map((w) => [w.minutes, w.threshold]),
   )
 }
 
 /**
- * Apply UI / API threshold edits. Keys: window keys ('5m','2h',…) or 'day'.
+ * Apply UI / API threshold edits for one asset class.
+ * @param {Record<string, number|null|undefined>} overrides
+ * @param {string|null|undefined} [assetClass]
+ */
+export function applyThresholdOverrides(overrides, assetClass = 'equity') {
+  if (!overrides || typeof overrides !== 'object') {
+    return getThresholdSnapshot(assetClass)
+  }
+  // Full byClass blob?
+  if (overrides.byClass && typeof overrides.byClass === 'object') {
+    for (const cls of THRESHOLD_ASSET_CLASSES) {
+      const src = overrides.byClass[cls]
+      if (src && typeof src === 'object') applyMapToClass(cls, src)
+    }
+    syncLegacyEquityMirror()
+    return getThresholdSnapshot(assetClass)
+  }
+  const cls = normalizeThresholdAssetClass(assetClass)
+  applyMapToClass(cls, overrides)
+  syncLegacyEquityMirror()
+  return getThresholdSnapshot(cls)
+}
+
+/**
+ * @param {string} cls
  * @param {Record<string, number|null|undefined>} overrides
  */
-export function applyThresholdOverrides(overrides) {
-  if (!overrides || typeof overrides !== 'object') return getThresholdSnapshot()
+function applyMapToClass(cls, overrides) {
+  const map = thresholdsByClass[cls] || (thresholdsByClass[cls] = buildDefaultThresholdMap())
   for (const w of MOMENTUM_WINDOWS) {
-    if (Object.prototype.hasOwnProperty.call(overrides, w.key)) {
-      const raw = overrides[w.key]
-      if (raw === null || raw === '' || raw === undefined) {
-        w.threshold = null
-      } else {
-        const n = Number(raw)
-        if (Number.isFinite(n) && n >= 0) w.threshold = n
-      }
+    if (!Object.prototype.hasOwnProperty.call(overrides, w.key)) continue
+    const raw = overrides[w.key]
+    if (raw === null || raw === '' || raw === undefined) {
+      map[w.key] = null
+    } else {
+      const n = Number(raw)
+      if (Number.isFinite(n) && n > 0) map[w.key] = n
+      else if (Number.isFinite(n) && n <= 0) map[w.key] = null
     }
   }
   if (Object.prototype.hasOwnProperty.call(overrides, 'day')) {
-    const n = Number(overrides.day)
-    if (Number.isFinite(n) && n >= 0) MOMENTUM_THRESHOLDS.day = n
+    const raw = overrides.day
+    if (raw !== null && raw !== '' && raw !== undefined) {
+      const n = Number(raw)
+      if (Number.isFinite(n) && n > 0) map.day = n
+      else if (Number.isFinite(n) && n <= 0) map.day = 0
+    }
   }
-  rebuildThresholdWindowsMap()
-  return getThresholdSnapshot()
 }
 
-export function getThresholdSnapshot() {
+function thresholdMapForDisk() {
+  /** @type {Record<string, Record<string, number|null>>} */
+  const byClass = {}
+  for (const cls of THRESHOLD_ASSET_CLASSES) {
+    byClass[cls] = cloneMap(thresholdsByClass[cls])
+  }
   return {
-    windows: Object.fromEntries(MOMENTUM_WINDOWS.map((w) => [w.key, w.threshold])),
-    day: MOMENTUM_THRESHOLDS.day,
+    byClass,
+    // flat equity copy for older readers
+    ...cloneMap(thresholdsByClass.equity),
+  }
+}
+
+/** Write thresholds (all classes) to disk + Supabase. */
+export function persistThresholdOverrides(overrides, assetClass = 'equity') {
+  const snapshot = applyThresholdOverrides(overrides, assetClass)
+  const map = thresholdMapForDisk()
+  try {
+    fs.mkdirSync(path.dirname(THRESHOLD_STORE_PATH), { recursive: true })
+    fs.writeFileSync(
+      THRESHOLD_STORE_PATH,
+      `${JSON.stringify(
+        { updatedAt: new Date().toISOString(), thresholds: map },
+        null,
+        2,
+      )}\n`,
+    )
+  } catch (err) {
+    console.warn(
+      '[momentum] could not persist thresholds to disk:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  void import('./persist.js')
+    .then((p) => p.saveThresholdsToSupabase(map))
+    .catch((err) => {
+      console.warn(
+        '[momentum] supabase threshold save skipped:',
+        err instanceof Error ? err.message : err,
+      )
+    })
+  return snapshot
+}
+
+function loadThresholdBlob(map) {
+  if (!map || typeof map !== 'object') return getThresholdSnapshot()
+  if (map.byClass && typeof map.byClass === 'object') {
+    return applyThresholdOverrides({ byClass: map.byClass }, 'equity')
+  }
+  // Flat legacy map → seed every class (then each class can diverge via UI)
+  for (const cls of THRESHOLD_ASSET_CLASSES) {
+    applyMapToClass(cls, map)
+  }
+  syncLegacyEquityMirror()
+  return getThresholdSnapshot('equity')
+}
+
+/** Restore last saved thresholds from disk (no-op if file missing). */
+export function loadPersistedThresholds() {
+  try {
+    if (!fs.existsSync(THRESHOLD_STORE_PATH)) return getThresholdSnapshot()
+    const raw = JSON.parse(fs.readFileSync(THRESHOLD_STORE_PATH, 'utf8'))
+    const map =
+      raw && typeof raw === 'object' && raw.thresholds && typeof raw.thresholds === 'object'
+        ? raw.thresholds
+        : raw
+    return loadThresholdBlob(map)
+  } catch (err) {
+    console.warn(
+      '[momentum] could not load persisted thresholds:',
+      err instanceof Error ? err.message : err,
+    )
+    return getThresholdSnapshot()
+  }
+}
+
+/**
+ * Prefer Supabase over local disk (call once at engine boot).
+ */
+export async function hydrateThresholdsFromSupabase() {
+  try {
+    const { loadThresholdsFromSupabase } = await import('./persist.js')
+    const map = await loadThresholdsFromSupabase()
+    if (map && typeof map === 'object' && Object.keys(map).length) {
+      const snapshot = loadThresholdBlob(map)
+      try {
+        fs.mkdirSync(path.dirname(THRESHOLD_STORE_PATH), { recursive: true })
+        fs.writeFileSync(
+          THRESHOLD_STORE_PATH,
+          `${JSON.stringify(
+            {
+              updatedAt: new Date().toISOString(),
+              thresholds: thresholdMapForDisk(),
+              source: 'supabase',
+            },
+            null,
+            2,
+          )}\n`,
+        )
+      } catch {
+        /* ignore */
+      }
+      console.log('[momentum] thresholds hydrated from Supabase (per asset class)')
+      return snapshot
+    }
+  } catch (err) {
+    console.warn(
+      '[momentum] supabase threshold hydrate failed:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return loadPersistedThresholds()
+}
+
+loadPersistedThresholds()
+
+/**
+ * @param {string|null|undefined} [assetClass]
+ */
+export function getThresholdSnapshot(assetClass = 'equity') {
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const map = thresholdsByClass[cls] || thresholdsByClass.equity
+  return {
+    assetClass: cls,
+    windows: Object.fromEntries(MOMENTUM_WINDOWS.map((w) => [w.key, map[w.key] ?? null])),
+    day: map.day ?? null,
     list: MOMENTUM_WINDOWS.map((w) => ({
       key: w.key,
       minutes: w.minutes,
-      threshold: w.threshold,
+      threshold: map[w.key] ?? null,
     })),
+    byClass: Object.fromEntries(
+      THRESHOLD_ASSET_CLASSES.map((c) => [c, cloneMap(thresholdsByClass[c])]),
+    ),
   }
 }
 
 /**
- * V1 episode / notification constants (Trigger Episode Alert Logic).
- * All tunable; do not hard-code elsewhere.
+ * V1 episode / notification policy (Trigger Episode Alert Logic).
+ * Per asset class (equity / commodity / forex / crypto / index) — same pattern
+ * as rolling-return thresholds. Mutable via Settings UI → disk + Supabase.
+ *
+ * Legacy `export let` globals mirror the *equity* map so older importers and
+ * tests keep working; engine code should use getEpisodePolicyForClass(cls).
+ *
  * @see Trigger_Episode_Alert_Notification_Logic_v1.docx
  */
 
-/** Min absolute extension (pp) beyond last_notified_episode_move_pct to push again */
-export const ACCELERATION_ALERT_DELTA_PP = Number(
-  process.env.MOMENTUM_ACCEL_POINTS ||
-    process.env.MOMENTUM_ACCEL_DELTA_PP ||
-    1.5,
+const EPISODE_POLICY_STORE_PATH = path.resolve(
+  process.cwd(),
+  'data/momentum-episode-policy.json',
 )
 
-/** @deprecated use ACCELERATION_ALERT_DELTA_PP */
-export const MOMENTUM_ACCELERATION_POINTS = ACCELERATION_ALERT_DELTA_PP
+function finiteNum(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 
-/**
- * Min new extreme (pp) beyond meaningful_extreme_move_pct to reset expiry clock.
- * Intentionally independent of acceleration push threshold.
- */
-export const MATERIAL_PROGRESS_DELTA_PP = Number(
-  process.env.MOMENTUM_MATERIAL_PROGRESS_PP || 0.5,
-)
+function clamp01(n) {
+  if (n == null) return null
+  return Math.min(1, Math.max(0, n))
+}
 
-/** Expire if no meaningful progress for this many minutes */
-export const EPISODE_INACTIVITY_EXPIRY_MIN = Number(
-  process.env.MOMENTUM_INACTIVITY_MIN || 60,
-)
-
-/**
- * Min time to remain in STARTED before silent reclassify → HOLDING.
- * Default = poll interval so a ~60s loop cannot show STARTED→HOLDING in ~14s
- * just because the UI also fired a focus tick.
- * Material acceleration / reversal / expiry still leave STARTED immediately.
- * Override: MOMENTUM_STARTED_DWELL_MS (milliseconds).
- */
-export const STARTED_STATE_MIN_DWELL_MS = Math.max(
-  0,
-  Number(
-    process.env.MOMENTUM_STARTED_DWELL_MS != null &&
-      process.env.MOMENTUM_STARTED_DWELL_MS !== ''
-      ? process.env.MOMENTUM_STARTED_DWELL_MS
-      : MOMENTUM_POLL_MS,
-  ) || MOMENTUM_POLL_MS,
-)
-
-/** @deprecated use EPISODE_INACTIVITY_EXPIRY_MIN */
-export const MOMENTUM_INACTIVITY_MINUTES = EPISODE_INACTIVITY_EXPIRY_MIN
-
-/**
- * Giveback of episode move (peak→current / peak→reference) for state labels.
- * HOLDING if giveback < HOLDING_TO_WEAKENING; enter WEAKENING at ≥ that.
- * Return to HOLDING only after ≤ WEAKENING_TO_HOLDING (hysteresis).
- */
-export const HOLDING_TO_WEAKENING_GIVEBACK = Number(
-  process.env.MOMENTUM_GIVEBACK_WEAK || 0.25,
-)
-export const WEAKENING_TO_HOLDING_GIVEBACK = Number(
-  process.env.MOMENTUM_GIVEBACK_HOLD || 0.2,
-)
-export const STRONG_WEAKENING_GIVEBACK = Number(
-  process.env.MOMENTUM_GIVEBACK_STRONG || 0.6,
-)
-
-/** Future optional major-fade push; off in V1 */
-export const MAJOR_FADE_ALERT_ENABLED =
-  process.env.MOMENTUM_MAJOR_FADE_ALERT === '1' ||
-  process.env.MOMENTUM_MAJOR_FADE_ALERT === 'true'
-
-/**
- * Snapshot of V1 episode constants for API / UI settings.
- */
-export function getEpisodePolicySnapshot() {
+/** Env / bootstrap defaults (seed every class until UI diverges). */
+function buildDefaultEpisodePolicy() {
+  const accel = Number(
+    process.env.MOMENTUM_ACCEL_POINTS ||
+      process.env.MOMENTUM_ACCEL_DELTA_PP ||
+      2,
+  )
+  const material = Number(process.env.MOMENTUM_MATERIAL_PROGRESS_PP || 0.5)
+  const inact = Number(process.env.MOMENTUM_INACTIVITY_MIN || 180)
+  const rearm = Math.max(
+    0,
+    Number(process.env.MOMENTUM_REARM_BUFFER_PP ?? 1) || 1,
+  )
+  const dwell = Math.max(
+    0,
+    Number(
+      process.env.MOMENTUM_STARTED_DWELL_MS != null &&
+        process.env.MOMENTUM_STARTED_DWELL_MS !== ''
+        ? process.env.MOMENTUM_STARTED_DWELL_MS
+        : MOMENTUM_POLL_MS,
+    ) || MOMENTUM_POLL_MS,
+  )
+  const toWeak = Number(process.env.MOMENTUM_GIVEBACK_WEAK || 0.25)
+  const toHold = Number(process.env.MOMENTUM_GIVEBACK_HOLD || 0.2)
+  const toStrong = Number(process.env.MOMENTUM_GIVEBACK_STRONG || 0.6)
+  const majorFade =
+    process.env.MOMENTUM_MAJOR_FADE_ALERT !== '0' &&
+    process.env.MOMENTUM_MAJOR_FADE_ALERT !== 'false'
+  const startAge = Math.max(
+    30_000,
+    Number(
+      process.env.MOMENTUM_START_PUSH_MAX_AGE_MS != null &&
+        process.env.MOMENTUM_START_PUSH_MAX_AGE_MS !== ''
+        ? process.env.MOMENTUM_START_PUSH_MAX_AGE_MS
+        : 5 * 60_000,
+    ) || 5 * 60_000,
+  )
   return {
-    pricePollIntervalSec: Math.round(MOMENTUM_POLL_MS / 1000),
-    accelerationAlertDeltaPp: ACCELERATION_ALERT_DELTA_PP,
-    materialProgressDeltaPp: MATERIAL_PROGRESS_DELTA_PP,
-    holdingToWeakeningGiveback: HOLDING_TO_WEAKENING_GIVEBACK,
-    weakeningToHoldingGiveback: WEAKENING_TO_HOLDING_GIVEBACK,
-    strongWeakeningGiveback: STRONG_WEAKENING_GIVEBACK,
-    episodeInactivityExpiryMin: EPISODE_INACTIVITY_EXPIRY_MIN,
-    majorFadeAlertEnabled: MAJOR_FADE_ALERT_ENABLED,
+    accelerationAlertDeltaPp: accel,
+    materialProgressDeltaPp: material,
+    holdingToWeakeningGiveback: toWeak,
+    weakeningToHoldingGiveback: toHold,
+    strongWeakeningGiveback: toStrong,
+    episodeInactivityExpiryMin: inact,
+    majorFadeAlertEnabled: majorFade,
+    rearmBufferPp: rearm,
+    startPushMaxAgeMs: startAge,
+    startedStateMinDwellMs: dwell,
   }
 }
 
-/** Ring buffer size for emitted events */
-export const MOMENTUM_MAX_EVENTS = 80
+/** @type {Record<string, ReturnType<typeof buildDefaultEpisodePolicy>>} */
+const policyByClass = Object.fromEntries(
+  THRESHOLD_ASSET_CLASSES.map((c) => [c, buildDefaultEpisodePolicy()]),
+)
+
+/**
+ * Legacy globals — always mirror equity. Prefer getEpisodePolicyForClass.
+ * @deprecated use getEpisodePolicyForClass(assetClass)
+ */
+export let ACCELERATION_ALERT_DELTA_PP =
+  policyByClass.equity.accelerationAlertDeltaPp
+/** @deprecated use getEpisodePolicyForClass */
+export let MOMENTUM_ACCELERATION_POINTS = ACCELERATION_ALERT_DELTA_PP
+/** @deprecated use getEpisodePolicyForClass */
+export let MATERIAL_PROGRESS_DELTA_PP =
+  policyByClass.equity.materialProgressDeltaPp
+/** @deprecated use getEpisodePolicyForClass */
+export let EPISODE_INACTIVITY_EXPIRY_MIN =
+  policyByClass.equity.episodeInactivityExpiryMin
+/** @deprecated use getEpisodePolicyForClass */
+export let EPISODE_REARM_BUFFER_PP = policyByClass.equity.rearmBufferPp
+/** @deprecated use getEpisodePolicyForClass */
+export let STARTED_STATE_MIN_DWELL_MS =
+  policyByClass.equity.startedStateMinDwellMs
+/** @deprecated use EPISODE_INACTIVITY_EXPIRY_MIN / getEpisodePolicyForClass */
+export let MOMENTUM_INACTIVITY_MINUTES = EPISODE_INACTIVITY_EXPIRY_MIN
+/** @deprecated use getEpisodePolicyForClass */
+export let HOLDING_TO_WEAKENING_GIVEBACK =
+  policyByClass.equity.holdingToWeakeningGiveback
+/** @deprecated use getEpisodePolicyForClass */
+export let WEAKENING_TO_HOLDING_GIVEBACK =
+  policyByClass.equity.weakeningToHoldingGiveback
+/** @deprecated use getEpisodePolicyForClass */
+export let STRONG_WEAKENING_GIVEBACK =
+  policyByClass.equity.strongWeakeningGiveback
+/** @deprecated use getEpisodePolicyForClass */
+export let MAJOR_FADE_ALERT_ENABLED =
+  policyByClass.equity.majorFadeAlertEnabled
+/** @deprecated use getEpisodePolicyForClass */
+export let START_PUSH_MAX_AGE_MS = policyByClass.equity.startPushMaxAgeMs
+
+function clonePolicy(p) {
+  return { ...(p || buildDefaultEpisodePolicy()) }
+}
+
+/** Keep export-let globals in sync with equity (tests / legacy callers). */
+function syncLegacyEpisodeGlobals() {
+  const p = policyByClass.equity || buildDefaultEpisodePolicy()
+  ACCELERATION_ALERT_DELTA_PP = p.accelerationAlertDeltaPp
+  MOMENTUM_ACCELERATION_POINTS = p.accelerationAlertDeltaPp
+  MATERIAL_PROGRESS_DELTA_PP = p.materialProgressDeltaPp
+  EPISODE_INACTIVITY_EXPIRY_MIN = p.episodeInactivityExpiryMin
+  MOMENTUM_INACTIVITY_MINUTES = p.episodeInactivityExpiryMin
+  EPISODE_REARM_BUFFER_PP = p.rearmBufferPp
+  STARTED_STATE_MIN_DWELL_MS = p.startedStateMinDwellMs
+  HOLDING_TO_WEAKENING_GIVEBACK = p.holdingToWeakeningGiveback
+  WEAKENING_TO_HOLDING_GIVEBACK = p.weakeningToHoldingGiveback
+  STRONG_WEAKENING_GIVEBACK = p.strongWeakeningGiveback
+  MAJOR_FADE_ALERT_ENABLED = p.majorFadeAlertEnabled
+  START_PUSH_MAX_AGE_MS = p.startPushMaxAgeMs
+}
+
+/**
+ * Resolve episode rules for an asset class (engine path).
+ * @param {string|null|undefined} [assetClass]
+ */
+export function getEpisodePolicyForClass(assetClass = 'equity') {
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const p = policyByClass[cls] || policyByClass.equity
+  return {
+    assetClass: cls,
+    pricePollIntervalSec: Math.round(MOMENTUM_POLL_MS / 1000),
+    ...clonePolicy(p),
+  }
+}
+
+/**
+ * Snapshot for API / UI. Includes byClass so settings can switch tabs.
+ * @param {string|null|undefined} [assetClass]
+ */
+export function getEpisodePolicySnapshot(assetClass = 'equity') {
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const forClass = getEpisodePolicyForClass(cls)
+  return {
+    ...forClass,
+    assetClass: cls,
+    byClass: Object.fromEntries(
+      THRESHOLD_ASSET_CLASSES.map((c) => [c, clonePolicy(policyByClass[c])]),
+    ),
+  }
+}
+
+/** Old V1 default was 60 wall-clock minutes. Production is 3 eligible hours. */
+function migrateLegacyInactivity(map) {
+  if (!map || typeof map !== 'object') return map
+  const v = finiteNum(
+    map.episodeInactivityExpiryMin ?? map.inactivityMinutes ?? map.inactivityMin,
+  )
+  if (v !== 60) return map
+  return {
+    ...map,
+    episodeInactivityExpiryMin: 180,
+    inactivityMinutes: 180,
+  }
+}
+
+/**
+ * Apply flat field overrides onto one class map (mutates map).
+ * @param {Record<string, unknown>} map
+ * @param {Record<string, unknown>} o
+ */
+function applyFieldsToPolicyMap(map, o) {
+  if (!map || !o || typeof o !== 'object') return map
+
+  const accel = finiteNum(
+    o.accelerationAlertDeltaPp ?? o.accelerationPoints ?? o.accelPp,
+  )
+  if (accel != null && accel > 0) map.accelerationAlertDeltaPp = accel
+
+  const mat = finiteNum(o.materialProgressDeltaPp ?? o.materialProgressPp)
+  if (mat != null && mat >= 0) map.materialProgressDeltaPp = mat
+
+  const inact = finiteNum(
+    o.episodeInactivityExpiryMin ?? o.inactivityMinutes ?? o.inactivityMin,
+  )
+  if (inact != null && inact > 0) map.episodeInactivityExpiryMin = inact
+
+  const rearm = finiteNum(o.rearmBufferPp ?? o.rearmBuffer)
+  if (rearm != null && rearm >= 0) map.rearmBufferPp = rearm
+
+  const parseGiveback = (v) => {
+    const n = finiteNum(v)
+    if (n == null) return null
+    if (n > 1) return clamp01(n / 100)
+    return clamp01(n)
+  }
+  const toWeak = parseGiveback(
+    o.holdingToWeakeningGiveback ?? o.givebackWeak ?? o.weakeningGiveback,
+  )
+  if (toWeak != null) map.holdingToWeakeningGiveback = toWeak
+
+  const toHold = parseGiveback(
+    o.weakeningToHoldingGiveback ?? o.givebackHold ?? o.holdingGiveback,
+  )
+  if (toHold != null) map.weakeningToHoldingGiveback = toHold
+
+  const toStrong = parseGiveback(
+    o.strongWeakeningGiveback ?? o.givebackStrong ?? o.strongGiveback,
+  )
+  if (toStrong != null) map.strongWeakeningGiveback = toStrong
+
+  if (
+    o.majorFadeAlertEnabled !== undefined &&
+    o.majorFadeAlertEnabled !== null &&
+    o.majorFadeAlertEnabled !== ''
+  ) {
+    const v = o.majorFadeAlertEnabled
+    map.majorFadeAlertEnabled = !(
+      v === false ||
+      v === 0 ||
+      v === '0' ||
+      String(v).toLowerCase() === 'false' ||
+      String(v).toLowerCase() === 'off'
+    )
+  }
+
+  const startAge = finiteNum(o.startPushMaxAgeMs ?? o.startPushMaxAgeMin)
+  if (startAge != null) {
+    const ms =
+      o.startPushMaxAgeMin != null && o.startPushMaxAgeMs == null
+        ? startAge * 60_000
+        : startAge < 1000
+          ? startAge * 60_000
+          : startAge
+    map.startPushMaxAgeMs = Math.max(30_000, ms)
+  }
+
+  const dwell = finiteNum(o.startedStateMinDwellMs ?? o.startedDwellMs)
+  if (dwell != null && dwell >= 0) map.startedStateMinDwellMs = dwell
+
+  // Hysteresis: hold band ≤ weak band; strong ≥ weak
+  if (map.weakeningToHoldingGiveback > map.holdingToWeakeningGiveback) {
+    map.weakeningToHoldingGiveback = map.holdingToWeakeningGiveback
+  }
+  if (map.strongWeakeningGiveback < map.holdingToWeakeningGiveback) {
+    map.strongWeakeningGiveback = map.holdingToWeakeningGiveback
+  }
+  return map
+}
+
+/**
+ * Apply UI / API episode-policy overrides (in-memory).
+ * Giveback fields accept either ratio (0–1) or percent (0–100).
+ * Pass assetClass so stocks / commodities / crypto keep independent rules.
+ *
+ * @param {Record<string, unknown>} overrides
+ * @param {string|null|undefined} [assetClass]
+ */
+export function applyEpisodePolicyOverrides(overrides, assetClass = 'equity') {
+  if (!overrides || typeof overrides !== 'object') {
+    return getEpisodePolicySnapshot(assetClass)
+  }
+  // Full byClass blob (hydrate / disk restore)
+  if (overrides.byClass && typeof overrides.byClass === 'object') {
+    for (const cls of THRESHOLD_ASSET_CLASSES) {
+      const src = overrides.byClass[cls]
+      if (src && typeof src === 'object') {
+        const map =
+          policyByClass[cls] ||
+          (policyByClass[cls] = buildDefaultEpisodePolicy())
+        applyFieldsToPolicyMap(map, migrateLegacyInactivity(src))
+      }
+    }
+    syncLegacyEpisodeGlobals()
+    return getEpisodePolicySnapshot(assetClass)
+  }
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const map =
+    policyByClass[cls] || (policyByClass[cls] = buildDefaultEpisodePolicy())
+  applyFieldsToPolicyMap(map, migrateLegacyInactivity(overrides))
+  syncLegacyEpisodeGlobals()
+  return getEpisodePolicySnapshot(cls)
+}
+
+function episodePolicyMapForDisk() {
+  return {
+    byClass: Object.fromEntries(
+      THRESHOLD_ASSET_CLASSES.map((c) => [c, clonePolicy(policyByClass[c])]),
+    ),
+    // flat equity copy for older readers
+    ...clonePolicy(policyByClass.equity),
+  }
+}
+
+/**
+ * Persist episode policy to disk + Supabase.
+ * @param {Record<string, unknown>} overrides
+ * @param {string|null|undefined} [assetClass]
+ */
+export function persistEpisodePolicy(overrides, assetClass = 'equity') {
+  const snapshot = applyEpisodePolicyOverrides(overrides || {}, assetClass)
+  const diskMap = episodePolicyMapForDisk()
+  try {
+    fs.mkdirSync(path.dirname(EPISODE_POLICY_STORE_PATH), { recursive: true })
+    fs.writeFileSync(
+      EPISODE_POLICY_STORE_PATH,
+      `${JSON.stringify(
+        { updatedAt: new Date().toISOString(), policy: diskMap },
+        null,
+        2,
+      )}\n`,
+    )
+  } catch (err) {
+    console.warn(
+      '[momentum] could not persist episode policy to disk:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  void import('./persist.js')
+    .then((p) => p.saveEpisodePolicyToSupabase(diskMap))
+    .catch((err) => {
+      console.warn(
+        '[momentum] supabase episode-policy save skipped:',
+        err instanceof Error ? err.message : err,
+      )
+    })
+  return snapshot
+}
+
+function loadEpisodePolicyBlob(map) {
+  if (!map || typeof map !== 'object') return getEpisodePolicySnapshot()
+  if (map.byClass && typeof map.byClass === 'object') {
+    return applyEpisodePolicyOverrides({ byClass: map.byClass }, 'equity')
+  }
+  // Flat legacy map → seed every class (then each can diverge via UI)
+  const migrated = migrateLegacyInactivity(map)
+  for (const cls of THRESHOLD_ASSET_CLASSES) {
+    applyFieldsToPolicyMap(
+      policyByClass[cls] || (policyByClass[cls] = buildDefaultEpisodePolicy()),
+      migrated,
+    )
+  }
+  syncLegacyEpisodeGlobals()
+  return getEpisodePolicySnapshot('equity')
+}
+
+/** Restore episode policy from local disk (no-op if missing). */
+export function loadPersistedEpisodePolicy() {
+  try {
+    if (!fs.existsSync(EPISODE_POLICY_STORE_PATH)) {
+      return getEpisodePolicySnapshot()
+    }
+    const raw = JSON.parse(fs.readFileSync(EPISODE_POLICY_STORE_PATH, 'utf8'))
+    const map =
+      raw && typeof raw === 'object' && raw.policy && typeof raw.policy === 'object'
+        ? raw.policy
+        : raw
+    return loadEpisodePolicyBlob(map)
+  } catch (err) {
+    console.warn(
+      '[momentum] could not load persisted episode policy:',
+      err instanceof Error ? err.message : err,
+    )
+    return getEpisodePolicySnapshot()
+  }
+}
+
+/** Prefer Supabase over local disk (call once at engine boot). */
+export async function hydrateEpisodePolicyFromSupabase() {
+  try {
+    const { loadEpisodePolicyFromSupabase } = await import('./persist.js')
+    const map = await loadEpisodePolicyFromSupabase()
+    if (map && typeof map === 'object' && Object.keys(map).length) {
+      const snapshot = loadEpisodePolicyBlob(map)
+      try {
+        fs.mkdirSync(path.dirname(EPISODE_POLICY_STORE_PATH), { recursive: true })
+        fs.writeFileSync(
+          EPISODE_POLICY_STORE_PATH,
+          `${JSON.stringify(
+            {
+              updatedAt: new Date().toISOString(),
+              policy: episodePolicyMapForDisk(),
+              source: 'supabase',
+            },
+            null,
+            2,
+          )}\n`,
+        )
+      } catch {
+        /* ignore */
+      }
+      console.log(
+        '[momentum] episode policy hydrated from Supabase (per asset class)',
+      )
+      return snapshot
+    }
+  } catch (err) {
+    console.warn(
+      '[momentum] supabase episode-policy hydrate failed:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return loadPersistedEpisodePolicy()
+}
+
+// Disk restore at import (Supabase hydrate runs on engine start)
+loadPersistedEpisodePolicy()
+
+/** Ring buffer size for emitted events (includes hydrated history) */
+export const MOMENTUM_MAX_EVENTS = 400
 
 /** Human label for a window key or minutes value */
 export function windowKey(minutes) {
@@ -435,7 +1004,7 @@ export function shouldShowBridgeWindows(asOfMs = Date.now(), marketSession = nul
 
 /**
  * Keys to render in the Home rolling-returns grid — max 2 rows × 7 = 14 cards.
- * UI: short windows → day-ish → multi-day (1w/10d/15d/1M) → day.
+ * UI: session/day first, then short windows → multi-day (1w/10d/15d/1M).
  * Server still *computes* full MOMENTUM_WINDOWS for detector/logs.
  *
  * @param {number} [asOfMs]
@@ -443,8 +1012,9 @@ export function shouldShowBridgeWindows(asOfMs = Date.now(), marketSession = nul
  * @returns {string[]}
  */
 export function getVisibleReturnKeys(asOfMs = Date.now(), marketSession = null) {
-  // 2 rows — short windows (incl. 10m / 45m) + multi-horizon + day
-  const keys = [
+  // Session card first (PRE / Regular / Overnight / AH / Prev close), then windows
+  return [
+    'day',
     '1m',
     '5m',
     '10m',
@@ -453,6 +1023,7 @@ export function getVisibleReturnKeys(asOfMs = Date.now(), marketSession = null) 
     '45m',
     '60m',
     '90m',
+    '2h',
     '3h',
     '6h',
     '8h',
@@ -466,22 +1037,7 @@ export function getVisibleReturnKeys(asOfMs = Date.now(), marketSession = null) 
     '6M',
     'YTD',
     '1y',
-    'day',
   ]
-
-  // Premarket / after-hours / overnight: put day first (“up 3.5% pre”)
-  const session = String(marketSession || '').toUpperCase()
-  if (
-    (session === 'PRE' ||
-      session === 'PREPRE' ||
-      session === 'POST' ||
-      session === 'POSTPOST' ||
-      session === 'CLOSED') &&
-    keys.includes('day')
-  ) {
-    return ['day', ...keys.filter((k) => k !== 'day')]
-  }
-  return keys
 }
 
 export function getWindowMetaList() {

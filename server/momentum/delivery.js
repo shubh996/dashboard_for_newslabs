@@ -16,8 +16,10 @@ import {
   sendTriggerEpisodePush,
   loadExpoRecipientsForTicker,
 } from '../notifications.js'
+import { resolvePushRecipients } from './testMode.js'
 import * as store from './store.js'
 import { isPushWorthy, buildNotificationCopy } from './notifyCopy.js'
+import { calendarAllowsHeavyWork } from './engineGate.js'
 
 function getSupabaseOrNull() {
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -55,7 +57,8 @@ export async function loadWatchlistEligibleDevices(ticker) {
 
   try {
     const recipients = await loadExpoRecipientsForTicker(supabase, symbol, 'trigger')
-    return recipients.map((r) => ({
+    // Test mode → tester only; prod → subscribers + always-notify tester
+    return resolvePushRecipients(recipients, 'trigger').map((r) => ({
       device_id: r.device_id,
       expo_push_token: r.expo_push_token,
       ticker: symbol,
@@ -67,7 +70,14 @@ export async function loadWatchlistEligibleDevices(ticker) {
       '[momentum delivery] watchlist load failed:',
       err instanceof Error ? err.message : err,
     )
-    return []
+    // Still return always-notify tester so episode alerts can reach the owner
+    return resolvePushRecipients([], 'trigger').map((r) => ({
+      device_id: r.device_id,
+      expo_push_token: r.expo_push_token,
+      ticker: symbol,
+      push_enabled: true,
+      app_key: 'trigger',
+    }))
   }
 }
 
@@ -101,6 +111,34 @@ export async function enrichEventForDelivery(event, episode = null, opts = {}) {
   const ev = { ...event }
   if (episode) ev.episode = episode
 
+  // Ensure idempotency key for push-worthy retries
+  if (!ev.idempotencyKey && (ev.episodeId || episode?.episodeId)) {
+    const epId = String(ev.episodeId || episode?.episodeId || '')
+    const cycle =
+      ev.cycleNumber != null
+        ? Number(ev.cycleNumber)
+        : 0
+    ev.idempotencyKey = `${epId}:${ev.eventType || 'EVENT'}:${Number.isFinite(cycle) ? cycle : 0}`
+  }
+
+  const symbolForGate = normTicker(String(ev.ticker || episode?.ticker || ''))
+  if (!calendarAllowsHeavyWork(symbolForGate)) {
+    ev.shouldNotify = false
+    ev.notification = ev.notification || null
+    ev.eligibleDeviceCount = 0
+    ev.eligibleDevices = []
+    ev.pushResult = {
+      ok: true,
+      skipped: true,
+      reason: 'us-equity-trigger-paused',
+      sent_ok: 0,
+      sent_failed: 0,
+      recipient_count: 0,
+    }
+    delete ev.episode
+    return ev
+  }
+
   const push = isPushWorthy(ev.eventType, ev.reason, ev.shouldNotify)
   ev.shouldNotify = push
 
@@ -109,6 +147,25 @@ export async function enrichEventForDelivery(event, episode = null, opts = {}) {
     ev.eligibleDeviceCount = 0
     ev.eligibleDevices = []
     ev.pushResult = null
+    delete ev.episode
+    return ev
+  }
+
+  // Suppress duplicate push for same episodeId + eventType + cycle
+  if (ev.idempotencyKey && !store.tryClaimPushIdempotency(ev.idempotencyKey)) {
+    ev.shouldNotify = false
+    ev.notification = ev.notification || null
+    ev.eligibleDeviceCount = 0
+    ev.eligibleDevices = []
+    ev.pushResult = {
+      ok: true,
+      skipped: true,
+      reason: 'duplicate_idempotency_key',
+      idempotencyKey: ev.idempotencyKey,
+      sent_ok: 0,
+      sent_failed: 0,
+      recipient_count: 0,
+    }
     delete ev.episode
     return ev
   }

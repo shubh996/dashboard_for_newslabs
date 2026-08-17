@@ -625,6 +625,482 @@ router.get('/extreme-movers', async (request, response) => {
   }
 })
 
+const MOST_ACTIVE_UNIVERSES = {
+  equity: [
+    ['AAPL', 'Apple'],
+    ['MSFT', 'Microsoft'],
+    ['NVDA', 'NVIDIA'],
+    ['TSLA', 'Tesla'],
+    ['AMZN', 'Amazon'],
+    ['META', 'Meta'],
+    ['GOOGL', 'Alphabet'],
+    ['AMD', 'AMD'],
+    ['INTC', 'Intel'],
+    ['BAC', 'Bank of America'],
+    ['F', 'Ford'],
+    ['PLTR', 'Palantir'],
+    ['SOFI', 'SoFi'],
+    ['NIO', 'NIO'],
+    ['SNAP', 'Snap'],
+    ['AAL', 'American Airlines'],
+    ['CCL', 'Carnival'],
+    ['NU', 'Nu Holdings'],
+    ['PFE', 'Pfizer'],
+    ['T', 'AT&T'],
+    ['WBD', 'Warner Bros'],
+    ['KVUE', 'Kenvue'],
+    ['SMCI', 'Super Micro'],
+    ['COIN', 'Coinbase'],
+  ],
+  index: [
+    ['^GSPC', 'S&P 500'],
+    ['^DJI', 'Dow Jones'],
+    ['^IXIC', 'Nasdaq'],
+    ['^RUT', 'Russell 2000'],
+    ['^VIX', 'VIX'],
+    ['^FTSE', 'FTSE 100'],
+    ['^GDAXI', 'DAX'],
+    ['^FCHI', 'CAC 40'],
+    ['^STOXX50E', 'Euro Stoxx 50'],
+    ['^N225', 'Nikkei 225'],
+    ['^HSI', 'Hang Seng'],
+    ['^AXJO', 'ASX 200'],
+    ['^BVSP', 'Bovespa'],
+    ['^KS11', 'KOSPI'],
+    ['^TWII', 'Taiwan'],
+    ['^GSPTSE', 'TSX'],
+    ['^SSMI', 'SMI'],
+    ['^BSESN', 'Sensex'],
+  ],
+  forex: [
+    ['EURUSD=X', 'EUR/USD'],
+    ['JPY=X', 'USD/JPY'],
+    ['GBPUSD=X', 'GBP/USD'],
+    ['AUDUSD=X', 'AUD/USD'],
+    ['NZDUSD=X', 'NZD/USD'],
+    ['EURJPY=X', 'EUR/JPY'],
+    ['GBPJPY=X', 'GBP/JPY'],
+    ['EURGBP=X', 'EUR/GBP'],
+    ['EURCAD=X', 'EUR/CAD'],
+    ['EURSEK=X', 'EUR/SEK'],
+    ['EURCHF=X', 'EUR/CHF'],
+    ['EURHUF=X', 'EUR/HUF'],
+    ['EURCNY=X', 'EUR/CNY'],
+    ['USDCNY=X', 'USD/CNY'],
+    ['USDHKD=X', 'USD/HKD'],
+    ['USDSGD=X', 'USD/SGD'],
+    ['USDINR=X', 'USD/INR'],
+    ['USDMXN=X', 'USD/MXN'],
+    ['USDPHP=X', 'USD/PHP'],
+    ['USDIDR=X', 'USD/IDR'],
+    ['USDTHB=X', 'USD/THB'],
+    ['USDMYR=X', 'USD/MYR'],
+    ['USDZAR=X', 'USD/ZAR'],
+    ['USDRUB=X', 'USD/RUB'],
+  ],
+  commodity: [
+    ['ES=F', 'S&P 500 Fut'],
+    ['YM=F', 'Dow Fut'],
+    ['NQ=F', 'Nasdaq Fut'],
+    ['RTY=F', 'Russell Fut'],
+    ['ZB=F', 'US Bond Fut'],
+    ['ZN=F', '10Y Note'],
+    ['ZF=F', '5Y Note'],
+    ['ZT=F', '2Y Note'],
+    ['GC=F', 'Gold'],
+    ['SI=F', 'Silver'],
+    ['PL=F', 'Platinum'],
+    ['HG=F', 'Copper'],
+    ['PA=F', 'Palladium'],
+    ['CL=F', 'Crude Oil'],
+    ['BZ=F', 'Brent'],
+    ['HO=F', 'Heating Oil'],
+    ['NG=F', 'Natural Gas'],
+    ['RB=F', 'RBOB Gasoline'],
+    ['ZC=F', 'Corn'],
+    ['ZW=F', 'Wheat'],
+    ['KE=F', 'KC Wheat'],
+    ['ZS=F', 'Soybeans'],
+    ['ZM=F', 'Soy Meal'],
+    ['ZL=F', 'Soy Oil'],
+    ['KC=F', 'Coffee'],
+    ['CT=F', 'Cotton'],
+    ['SB=F', 'Sugar'],
+    ['CC=F', 'Cocoa'],
+    ['LE=F', 'Live Cattle'],
+    ['HE=F', 'Lean Hogs'],
+    ['GF=F', 'Feeder Cattle'],
+  ],
+  crypto: [
+    ['BTC-USD', 'Bitcoin'],
+    ['ETH-USD', 'Ethereum'],
+    ['SOL-USD', 'Solana'],
+    ['XRP-USD', 'XRP'],
+    ['DOGE-USD', 'Dogecoin'],
+    ['ADA-USD', 'Cardano'],
+    ['AVAX-USD', 'Avalanche'],
+    ['LINK-USD', 'Chainlink'],
+    ['DOT-USD', 'Polkadot'],
+    ['LTC-USD', 'Litecoin'],
+    ['BCH-USD', 'Bitcoin Cash'],
+    ['SHIB-USD', 'Shiba Inu'],
+    ['NEAR-USD', 'NEAR'],
+    ['UNI-USD', 'Uniswap'],
+    ['ATOM-USD', 'Cosmos'],
+  ],
+}
+
+const mostActivesCache = new Map()
+
+function mostActiveAssetClass(raw) {
+  const c = String(raw || 'equity').trim().toLowerCase()
+  if (c === 'index' || c === 'indices' || c === 'indexes') return 'index'
+  if (c === 'forex' || c === 'fx' || c === 'currency') return 'forex'
+  if (c === 'crypto' || c === 'cryptocurrency') return 'crypto'
+  if (c === 'commodity' || c === 'commodities' || c === 'future') return 'commodity'
+  return 'equity'
+}
+
+function mapMostActiveRow(quote, assetClass, fallbackTicker, fallbackLabel) {
+  const symbol = String(quote?.symbol || fallbackTicker || '')
+    .trim()
+    .toUpperCase()
+  if (!symbol) return null
+  const volume =
+    yahooScreenerNumeric(quote?.regularMarketVolume) ??
+    yahooScreenerNumeric(quote?.averageDailyVolume3Month) ??
+    0
+  const percent = yahooScreenerNumeric(quote?.regularMarketChangePercent)
+  const price = yahooScreenerNumeric(quote?.regularMarketPrice)
+  const change = yahooScreenerNumeric(quote?.regularMarketChange)
+  return {
+    ticker: symbol,
+    symbol,
+    label:
+      String(quote?.shortName || quote?.longName || fallbackLabel || symbol).trim() ||
+      symbol,
+    longName: quote?.longName ? String(quote.longName) : null,
+    assetClass,
+    volume: Number.isFinite(volume) ? volume : 0,
+    regularMarketPrice: price,
+    regularMarketChange: change,
+    regularMarketChangePercent: Number.isFinite(percent) ? percent : null,
+    currency: quote?.currency || null,
+    exchange: quote?.fullExchangeName || quote?.exchange || null,
+    marketState: quote?.marketState || null,
+    quoteType: quote?.quoteType || null,
+  }
+}
+
+async function quoteMostActiveUniverse(assetClass) {
+  const universe = MOST_ACTIVE_UNIVERSES[assetClass] || []
+  if (!universe.length) return []
+  const symbols = universe.map(([ticker]) => toYahooSymbol(ticker) || ticker)
+  const labels = new Map(universe.map(([ticker, label]) => [ticker.toUpperCase(), label]))
+  const raw = await yahooFinance.quote(symbols, {}, { validateResult: false })
+  const rows = Array.isArray(raw) ? raw : raw ? [raw] : []
+  const bySymbol = new Map(
+    rows.map((quote) => [String(quote?.symbol || '').toUpperCase(), quote]),
+  )
+  const items = []
+  for (const [ticker, label] of universe) {
+    const key = (toYahooSymbol(ticker) || ticker).toUpperCase()
+    const quote = bySymbol.get(key) || bySymbol.get(ticker.toUpperCase()) || {}
+    const mapped = mapMostActiveRow(quote, assetClass, ticker, label)
+    if (mapped) {
+      if (!mapped.label || mapped.label === mapped.ticker) {
+        mapped.label = labels.get(ticker.toUpperCase()) || mapped.label
+      }
+      items.push(mapped)
+    }
+  }
+  return items
+}
+
+const CRYPTO_STABLES = new Set([
+  'USDT-USD',
+  'USDC-USD',
+  'FDUSD-USD',
+  'DAI-USD',
+  'TUSD-USD',
+  'USDP-USD',
+  'USDS33039-USD',
+  'USDS-USD',
+  'BUSD-USD',
+])
+
+function marketListId(raw, assetClass) {
+  const list = String(raw || '').trim().toLowerCase().replace(/-/g, '_')
+  if (
+    list === 'trending' ||
+    list === 'most_actives' ||
+    list === 'gainers' ||
+    list === 'losers' ||
+    list === 'markets'
+  ) {
+    return list
+  }
+  if (assetClass === 'equity') return 'most_actives'
+  return 'markets'
+}
+
+async function fetchYahooTrendingSymbols(count = 20) {
+  const hosts = [
+    'https://query2.finance.yahoo.com',
+    'https://query1.finance.yahoo.com',
+  ]
+  let lastError = null
+  for (const host of hosts) {
+    try {
+      const response = await fetch(
+        `${host}/v1/finance/trending/US?count=${Math.min(50, Math.max(5, count))}`,
+        { headers: YAHOO_SCREENER_HEADERS },
+      )
+      if (!response.ok) {
+        lastError = new Error(`Yahoo trending failed (${response.status})`)
+        continue
+      }
+      const body = await response.json()
+      const quotes = body?.finance?.result?.[0]?.quotes
+      if (Array.isArray(quotes) && quotes.length) {
+        return quotes
+          .map((row) => String(row?.symbol || '').trim())
+          .filter(Boolean)
+      }
+      lastError = new Error('Yahoo trending returned 0 quotes')
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
+  }
+  throw lastError || new Error('Yahoo trending failed')
+}
+
+async function quoteSymbolsAsItems(symbols, assetClass) {
+  const clean = [...new Set(symbols.map((s) => String(s || '').trim()).filter(Boolean))]
+  if (!clean.length) return []
+  const yahooSymbols = clean.map((ticker) => toYahooSymbol(ticker) || ticker)
+  const raw = await yahooFinance.quote(yahooSymbols, {}, { validateResult: false })
+  const rows = Array.isArray(raw) ? raw : raw ? [raw] : []
+  const bySymbol = new Map(
+    rows.map((quote) => [String(quote?.symbol || '').toUpperCase(), quote]),
+  )
+  const items = []
+  for (const ticker of clean) {
+    const key = (toYahooSymbol(ticker) || ticker).toUpperCase()
+    const quote = bySymbol.get(key) || bySymbol.get(ticker.toUpperCase()) || {}
+    const mapped = mapMostActiveRow(quote, assetClass, ticker)
+    if (mapped) items.push(mapped)
+  }
+  return items
+}
+
+async function loadYahooMarketList(assetClass, list, count) {
+  if (assetClass === 'equity' && list === 'trending') {
+    try {
+      const symbols = await fetchYahooTrendingSymbols(count)
+      const equityOnly = symbols.filter((s) => {
+        const u = s.toUpperCase()
+        return !u.includes('-USD') && !u.endsWith('=X') && !u.endsWith('=F')
+      })
+      return {
+        screener: 'trending_US',
+        items: await quoteSymbolsAsItems(equityOnly.slice(0, count), 'equity'),
+      }
+    } catch {
+      try {
+        const quotes = await fetchYahooPredefinedScreener('most_actives', count)
+        return {
+          screener: 'most_actives',
+          items: quotes
+            .map((quote) => mapMostActiveRow(quote, 'equity'))
+            .filter(Boolean),
+        }
+      } catch {
+        return {
+          screener: 'quoted-universe',
+          items: await quoteMostActiveUniverse('equity'),
+        }
+      }
+    }
+  }
+
+  if (assetClass === 'equity' && (list === 'gainers' || list === 'losers')) {
+    const scrId = list === 'gainers' ? 'day_gainers' : 'day_losers'
+    try {
+      const quotes = await fetchYahooPredefinedScreener(scrId, count)
+      return {
+        screener: scrId,
+        items: quotes
+          .map((quote) => mapMostActiveRow(quote, 'equity'))
+          .filter(Boolean),
+      }
+    } catch {
+      const fallback = await quoteMostActiveUniverse('equity')
+      fallback.sort((a, b) =>
+        list === 'losers'
+          ? (a.regularMarketChangePercent || 0) - (b.regularMarketChangePercent || 0)
+          : (b.regularMarketChangePercent || 0) - (a.regularMarketChangePercent || 0),
+      )
+      return { screener: 'quoted-universe', items: fallback }
+    }
+  }
+
+  if (assetClass === 'equity' && list === 'most_actives') {
+    try {
+      const quotes = await fetchYahooPredefinedScreener('most_actives', count)
+      return {
+        screener: 'most_actives',
+        items: quotes
+          .map((quote) => mapMostActiveRow(quote, 'equity'))
+          .filter(Boolean),
+      }
+    } catch {
+      return {
+        screener: 'quoted-universe',
+        items: await quoteMostActiveUniverse('equity'),
+      }
+    }
+  }
+
+  if (assetClass === 'crypto') {
+    try {
+      const quotes = await fetchYahooPredefinedScreener(
+        'all_cryptocurrencies_us',
+        Math.max(count * 3, 40),
+      )
+      const items = quotes
+        .map((quote) => mapMostActiveRow(quote, 'crypto'))
+        .filter(Boolean)
+        .filter((row) => !CRYPTO_STABLES.has(String(row.ticker || '').toUpperCase()))
+        .filter((row) => !/^\d/.test(String(row.ticker || '')))
+      items.sort(
+        (a, b) =>
+          (b.volume || 0) - (a.volume || 0) ||
+          Math.abs(b.regularMarketChangePercent || 0) -
+            Math.abs(a.regularMarketChangePercent || 0),
+      )
+      return { screener: 'all_cryptocurrencies_us', items }
+    } catch {
+      return {
+        screener: 'quoted-universe',
+        items: await quoteMostActiveUniverse('crypto'),
+      }
+    }
+  }
+
+  return {
+    screener: 'yahoo-markets',
+    items: await quoteMostActiveUniverse(assetClass),
+  }
+}
+
+/**
+ * Yahoo Markets lists for the momentum left rail.
+ *   GET /api/yahoo/market-lists?class=equity&list=most_actives|trending|gainers|losers|markets
+ *   GET /api/yahoo/most-actives?class=equity  (alias → most_actives / markets)
+ */
+async function handleYahooMarketList(request, response) {
+  try {
+    const assetClass = mostActiveAssetClass(request.query.class)
+    const list = marketListId(request.query.list, assetClass)
+    const count = Math.min(40, Math.max(5, Number(request.query.count) || 20))
+    const cacheKey = `${assetClass}:${list}:${count}`
+    const cached = mostActivesCache.get(cacheKey)
+    if (cached && Date.now() - cached.at < 60_000) {
+      response.setHeader('Cache-Control', 'public, max-age=30')
+      response.json(cached.payload)
+      return
+    }
+
+    const loaded = await loadYahooMarketList(assetClass, list, count)
+    let items = loaded.items || []
+    const rankByVolume =
+      list === 'most_actives' ||
+      (assetClass === 'crypto' && list === 'markets')
+    if (rankByVolume) {
+      items.sort(
+        (a, b) =>
+          (b.volume || 0) - (a.volume || 0) ||
+          Math.abs(b.regularMarketChangePercent || 0) -
+            Math.abs(a.regularMarketChangePercent || 0),
+      )
+    }
+    items = items.slice(0, count)
+
+    const payload = {
+      ok: true,
+      source: 'yahoo-finance',
+      class: assetClass,
+      list,
+      screener: loaded.screener,
+      fetchedAt: new Date().toISOString(),
+      count: items.length,
+      items,
+    }
+    mostActivesCache.set(cacheKey, { at: Date.now(), payload })
+    response.setHeader('Cache-Control', 'public, max-age=30')
+    response.json(payload)
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: errorMessage(error, 'Failed to fetch Yahoo market list'),
+    })
+  }
+}
+
+router.get('/market-lists', handleYahooMarketList)
+router.get('/most-actives', handleYahooMarketList)
+
+/** Tickers the user has saved into yahoo_finance_snapshots (Watchlist first tab). */
+router.get('/saved-tickers', async (_request, response) => {
+  try {
+    const supabase = getSupabase()
+    const { data, error } = await supabase
+      .from('yahoo_finance_snapshots')
+      .select('ticker, updated_at, source_metadata')
+      .order('updated_at', { ascending: false })
+      .limit(80)
+    if (error) throw error
+    const items = (data || []).map((row) => {
+      const ticker = String(row.ticker || '').trim().toUpperCase()
+      const meta =
+        row.source_metadata && typeof row.source_metadata === 'object'
+          ? row.source_metadata
+          : {}
+      return {
+        ticker,
+        label:
+          String(meta.shortName || meta.longName || meta.companyName || ticker).trim() ||
+          ticker,
+        assetClass: detectSavedAssetClass(ticker),
+        updatedAt: row.updated_at || null,
+        source: 'supabase',
+      }
+    }).filter((row) => row.ticker)
+    response.json({
+      ok: true,
+      source: 'supabase',
+      table: 'yahoo_finance_snapshots',
+      count: items.length,
+      items,
+    })
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: errorMessage(error, 'Failed to load saved Yahoo tickers'),
+    })
+  }
+})
+
+function detectSavedAssetClass(ticker) {
+  const t = String(ticker || '').toUpperCase()
+  if (t.startsWith('^')) return 'index'
+  if (t.endsWith('=X')) return 'forex'
+  if (t.endsWith('=F')) return 'commodity'
+  if (t.endsWith('-USD') || t.endsWith('-USDT')) return 'crypto'
+  return 'equity'
+}
+
 // Lightweight Yahoo-only batch used by live dashboard ticker chips.
 router.get('/quotes', async (request, response) => {
   try {

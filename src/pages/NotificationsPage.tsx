@@ -32,6 +32,8 @@ import {
   Save,
   Search,
   Settings,
+  Maximize2,
+  Minimize2,
   Share2,
   Sparkles,
   Sun,
@@ -570,6 +572,13 @@ function currentMarketQuoteValues(
 
 function yahooQuoteUrl(ticker: string) {
   return `https://finance.yahoo.com/quote/${encodeURIComponent(ticker.toUpperCase())}`
+}
+
+function perplexityFinanceUrl(ticker: string) {
+  const t = String(ticker || '').trim().toUpperCase()
+  return t
+    ? `https://www.perplexity.ai/finance/${encodeURIComponent(t)}`
+    : 'https://www.perplexity.ai/finance'
 }
 
 
@@ -3254,14 +3263,16 @@ function drawMiniChart(
     return `${h}h ${rem}m`
   }
 
-  // Chart axis: clock only — no ET/IST/UK suffix (zone only on session stamp below)
-  const formatTimestampLabel = (ms: number): string =>
-    new Date(ms).toLocaleTimeString('en-US', {
+  // Chart axis: "2:30 PM EDT" / "4:30 PM BST" / "1:00 AM IST" (zone for that instant)
+  const formatTimestampLabel = (ms: number): string => {
+    const clock = new Date(ms).toLocaleTimeString('en-US', {
       timeZone: axisTz,
       hour: 'numeric',
       minute: '2-digit',
       hour12: true,
     })
+    return withTimezoneSuffix(clock, shareTimezoneAbbrev(axisTz, ms))
+  }
 
   // Day labels need the session timeline even when time ticks are off
   let dayTimeline: ReturnType<typeof buildShareSessionTimeline> | null = null
@@ -3751,6 +3762,46 @@ function isDarkHex(hex: string): boolean {
   return L < 0.42
 }
 
+/** WCAG-ish contrast ratio between two hex colors (1–21). */
+function hexContrastRatio(hexA: string, hexB: string): number {
+  const lum = (hex: string) => {
+    const rgb = parseHexRgb(hex)
+    if (!rgb) return 0
+    const lin = (c: number) => {
+      const s = c / 255
+      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+    }
+    return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+  }
+  const L1 = lum(hexA)
+  const L2 = lum(hexB)
+  const lighter = Math.max(L1, L2)
+  const darker = Math.min(L1, L2)
+  return (lighter + 0.05) / (darker + 0.05)
+}
+
+/**
+ * Only for *corrupt* prefs on load: true white-on-white / black-on-black.
+ * Never override an explicit user pick at render time (Coffee / White / etc.).
+ */
+function ensureShareTextColorId(
+  cardColor: ShareCardColorId | undefined,
+  textColor: ShareTextColorId | undefined,
+): ShareTextColorId {
+  const card = shareCardPreset(cardColor)
+  const candidate =
+    SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === textColor)
+      ? (String(textColor) as ShareTextColorId)
+      : card.defaultText
+  const bg = shareCardBgHex(card.id)
+  const fg = shareTextFillColor(candidate)
+  // ~1.0–1.3 = effectively invisible; leave intentional low-contrast picks alone
+  if (hexContrastRatio(bg, fg) < 1.25) {
+    return card.defaultText
+  }
+  return candidate
+}
+
 function hexToRgba(hex: string, alpha: number): string {
   const rgb = parseHexRgb(hex)
   if (!rgb) return `rgba(0,0,0,${alpha})`
@@ -3891,6 +3942,11 @@ type ShareCardStyle = {
   aspectRatio: number
   /** Where the date + time is drawn when session headline is off. */
   timestampPlacement: 'footer-left' | 'price-right'
+  /**
+   * Date + time stamp on the card (under session, footer, or beside price).
+   * On by default; turn off to drop it from the image.
+   */
+  showTimestamp: boolean
   /** Legacy preference retained only so older saved settings can be migrated. */
   dateInFooter?: boolean
   /** Hero photo (replaces chart slot; chart draws below). Height in px @ 1080w. */
@@ -4088,7 +4144,7 @@ const SHARE_CHART_TIMEZONES: Array<{
   { id: 'UTC', label: 'UTC', short: 'UTC' },
 ]
 
-/** Short zone label for stamps / axis: ET, EDT, EST, GMT, BST, IST, UTC. */
+/** Short zone label for stamps / axis: EDT, EST, GMT, BST, IST, UTC. */
 function shareTimezoneAbbrev(
   tz: ShareChartTimezone | undefined,
   atMs: number = Date.now(),
@@ -4105,13 +4161,19 @@ function shareTimezoneAbbrev(
     const raw = parts.find((p) => p.type === 'timeZoneName')?.value || ''
     if (zone === 'America/New_York') {
       if (raw === 'EDT' || raw === 'EST') return raw
-      // Engines that emit GMT-4 / GMT-5
-      return 'ET'
+      // Engines that emit GMT-4 / GMT-5 / UTC−4
+      if (/GMT-4|UTC-4|UTC−4/i.test(raw)) return 'EDT'
+      if (/GMT-5|UTC-5|UTC−5/i.test(raw)) return 'EST'
+      // Last resort: July-ish → EDT else EST
+      const m = new Date(atMs).getUTCMonth()
+      return m >= 2 && m <= 9 ? 'EDT' : 'EST'
     }
     if (zone === 'Europe/London') {
       if (raw === 'BST' || raw === 'GMT') return raw
-      if (/GMT\+1/i.test(raw) || /UTC\+1/i.test(raw)) return 'BST'
-      return 'GMT'
+      if (/GMT\+1|UTC\+1|UTC\+01/i.test(raw)) return 'BST'
+      if (/GMT\+0|UTC\+0|UTC$|GMT$/i.test(raw)) return 'GMT'
+      const m = new Date(atMs).getUTCMonth()
+      return m >= 2 && m <= 9 ? 'BST' : 'GMT'
     }
     if (raw && !/^GMT[+-]/i.test(raw) && !/^UTC[+-]/i.test(raw)) return raw
   } catch {
@@ -4248,6 +4310,7 @@ const DEFAULT_SHARE_CARD_STYLE: ShareCardStyle = {
   canvasWidth: 1920, // Full HD export width (design tokens scale from 1080)
   aspectRatio: 1.05,
   timestampPlacement: 'footer-left',
+  showTimestamp: true,
   photoHeight: 360,
   photoRadius: 28,
   photoBorderWidth: 3,
@@ -4398,12 +4461,15 @@ function loadShareCardStyle(): ShareCardStyle {
     const priceColor = SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === parsed.priceColor)
       ? String(parsed.priceColor)
       : DEFAULT_SHARE_CARD_STYLE.priceColor
-    const textColor = SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === parsed.textColor)
-      ? String(parsed.textColor)
-      : DEFAULT_SHARE_CARD_STYLE.textColor
     const cardColor = SHARE_CARD_COLOR_PRESETS.some((p) => p.id === parsed.cardColor)
       ? String(parsed.cardColor)
       : DEFAULT_SHARE_CARD_STYLE.cardColor
+    const textColor = ensureShareTextColorId(
+      cardColor,
+      SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === parsed.textColor)
+        ? String(parsed.textColor)
+        : DEFAULT_SHARE_CARD_STYLE.textColor,
+    )
     const titleMode = parsed.titleMode === 'ticker' ? 'ticker' : 'company'
     const brandTone =
       parsed.brandTone === 'dark' || parsed.brandTone === 'light' ? parsed.brandTone : 'auto'
@@ -4412,6 +4478,8 @@ function loadShareCardStyle(): ShareCardStyle {
     const showSharePrice =
       parsed.showSharePrice === undefined ? true : Boolean(parsed.showSharePrice)
     const showBrand = parsed.showBrand === undefined ? true : Boolean(parsed.showBrand)
+    const showTimestamp =
+      parsed.showTimestamp === undefined ? true : Boolean(parsed.showTimestamp)
     const sessionLineTone: ShareSessionLineTone =
       parsed.sessionLineTone === 'intensity' ||
       parsed.sessionLineTone === 'breaking' ||
@@ -4743,6 +4811,7 @@ function loadShareCardStyle(): ShareCardStyle {
       showSessionHeadline,
       showSharePrice,
       showBrand,
+      showTimestamp,
       sessionLineTone,
       preferSquare,
       nameWeight,
@@ -5062,6 +5131,38 @@ function formatShareStampLabel(
   if (event.display_date) return String(event.display_date).trim()
   if (eventDate) return eventDate
   return withTimezoneSuffix(formatClock(at), abbrev)
+}
+
+function shareStampTimezone(
+  tz: ShareChartTimezone | undefined,
+): ShareChartTimezone {
+  return tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz)
+    ? tz
+    : 'America/New_York'
+}
+
+/** True when stamp is empty or still one of the auto timezone labels. */
+function isGeneratedShareStamp(event: PriceMovementEvent, stamp: string): boolean {
+  const custom = String(stamp || '').trim()
+  if (!custom) return true
+  return SHARE_CHART_TIMEZONES.some((z) => formatShareStampLabel(event, z.id) === custom)
+}
+
+/**
+ * Live-editable stamp. Hidden when style.showTimestamp is off or the user
+ * cleared the field. Timezone switches still convert until they type a custom string.
+ */
+function resolveShareStampLabel(
+  event: PriceMovementEvent,
+  style: ShareCardStyle,
+  textContent?: ShareCardTextContent | null,
+): string {
+  if (style.showTimestamp === false) return ''
+  const auto = formatShareStampLabel(event, shareStampTimezone(style.chartAxisTimezone))
+  if (!textContent || textContent.stamp === undefined) return auto
+  const custom = String(textContent.stamp).trim()
+  if (!custom) return ''
+  return isGeneratedShareStamp(event, custom) ? auto : custom
 }
 
 /**
@@ -5591,15 +5692,9 @@ async function renderMomentumTweetImage(
   let isDown = Boolean(close?.negative || (!close?.positive && premarket?.negative))
   let isUp = Boolean(close?.positive || premarket?.positive) && !isDown
 
-  // Session stamp: FULL convert of market ET time → selected zone + abbrev
-  // (e.g. 3:33 PM ET → 8:33 PM BST). Chart cutoff still uses original ET time_label.
-  const stampTz =
-    style.chartAxisTimezone &&
-    SHARE_CHART_TIMEZONES.some((z) => z.id === style.chartAxisTimezone)
-      ? style.chartAxisTimezone
-      : 'America/New_York'
-  // Always recompute from event + zone so ET/UK/IST switches fully convert the clock
-  const stampLabel = formatShareStampLabel(event, stampTz)
+  // Session stamp: custom text when edited; otherwise convert market ET → selected zone.
+  // Hidden when showTimestamp is off or the user cleared the field.
+  const stampLabel = resolveShareStampLabel(event, style, textContent)
 
   // Company name + Yahoo line (9:30 ET → stamp’s ET minute) in parallel
   const [companyLabel, chartSeriesFull] = await Promise.all([
@@ -5804,7 +5899,11 @@ async function renderMomentumTweetImage(
   // brand height scale stretches vertical metrics (draw uses ctx.scale Y)
   const brandLineH = Math.round(brandFontSize * (34 / 28) * brandHeightScale)
   const cardBg = shareCardBgHex(style.cardColor)
-  const textId = style.textColor || 'black'
+  // Honor user’s text ink pick (Coffee / White / Navy …). Do not re-force on render.
+  const textId =
+    SHARE_TEXT_COLOR_PRESETS.some((p) => p.id === style.textColor)
+      ? String(style.textColor)
+      : 'black'
   const bodyText = shareTextFillColor(textId)
   const mutedText = shareTextMutedColor(textId)
   const reasonFill = shareTextSoftColor(textId)
@@ -7181,6 +7280,7 @@ function ShareCardLayoutControls({
   onSideImageChange,
   googleSearchQuery,
   titleIdentity,
+  shareEvent,
 }: {
   style: ShareCardStyle
   onChange: (next: ShareCardStyle | ((prev: ShareCardStyle) => ShareCardStyle)) => void
@@ -7196,6 +7296,8 @@ function ShareCardLayoutControls({
   googleSearchQuery?: string
   /** Used when toggling company name ↔ ticker on the image */
   titleIdentity?: { ticker: string; companyName?: string | null }
+  /** Event used to rebuild the auto timestamp when timezone changes */
+  shareEvent?: PriceMovementEvent
 }) {
   const set = (patch: Partial<ShareCardStyle>) =>
     onChange((s) => {
@@ -7206,6 +7308,12 @@ function ShareCardLayoutControls({
   const setText = (patch: Partial<ShareCardTextContent>) => {
     if (!textContent || !onTextChange) return
     onTextChange({ ...textContent, sessionLine: textContent.sessionLine ?? '', ...patch })
+  }
+  const applyChartTimezone = (tz: ShareChartTimezone) => {
+    set({ chartAxisTimezone: tz })
+    if (!shareEvent || !textContent || !onTextChange) return
+    if (!isGeneratedShareStamp(shareEvent, textContent.stamp)) return
+    setText({ stamp: formatShareStampLabel(shareEvent, tz) })
   }
   const applyTitleMode = (mode: 'company' | 'ticker') => {
     set({ titleMode: mode })
@@ -7878,34 +7986,64 @@ function ShareCardLayoutControls({
               the event Reason field, not on the card.
             </p>
           </div>
-          <div className="grid gap-2 border-t border-border/40 pt-2 sm:grid-cols-2">
-            <div className="space-y-1">
+          <div className="space-y-1.5 border-t border-border/40 pt-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <Label htmlFor={`${idPrefix}-txt-stamp`} className="text-xs font-medium">
                 Timestamp
               </Label>
-              <Input
-                id={`${idPrefix}-txt-stamp`}
-                value={textContent.stamp}
-                onChange={(e) => setText({ stamp: e.target.value })}
-                className="h-8 text-sm"
-                placeholder="Today · 3:03 PM"
-              />
+              <div className="flex flex-wrap gap-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={style.showTimestamp !== false ? 'default' : 'outline'}
+                  className="h-7 text-[11px]"
+                  onClick={() => set({ showTimestamp: true })}
+                >
+                  Inserted
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={style.showTimestamp === false ? 'default' : 'outline'}
+                  className="h-7 text-[11px]"
+                  onClick={() => set({ showTimestamp: false })}
+                >
+                  Remove
+                </Button>
+              </div>
+            </div>
+            {style.showTimestamp !== false ? (
+              <>
+                <Input
+                  id={`${idPrefix}-txt-stamp`}
+                  value={textContent.stamp}
+                  onChange={(e) => setText({ stamp: e.target.value })}
+                  className="h-8 text-sm"
+                  placeholder="Today · 3:03 PM ET"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Edit freely. Clear the field to drop it from this image. Timezone (Chart tab)
+                  still converts until you type a custom string.
+                </p>
+              </>
+            ) : (
               <p className="text-[10px] text-muted-foreground">
-                Today → “Today · time”; older day → “5 August”.
+                Hidden on the image. Placement and font stay under the{' '}
+                <strong>Timestamp</strong> tab.
               </p>
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor={`${idPrefix}-txt-brand`} className="text-xs font-medium">
-                Track at Trigger
-              </Label>
-              <Input
-                id={`${idPrefix}-txt-brand`}
-                value={textContent.brand}
-                onChange={(e) => setText({ brand: e.target.value })}
-                className="h-8 text-sm"
-                placeholder="Track at Trigger"
-              />
-            </div>
+            )}
+          </div>
+          <div className="space-y-1 border-t border-border/40 pt-2">
+            <Label htmlFor={`${idPrefix}-txt-brand`} className="text-xs font-medium">
+              Track at Trigger
+            </Label>
+            <Input
+              id={`${idPrefix}-txt-brand`}
+              value={textContent.brand}
+              onChange={(e) => setText({ brand: e.target.value })}
+              className="h-8 text-sm"
+              placeholder="Track at Trigger"
+            />
           </div>
         </ShareLayoutSection>
       ) : null}
@@ -8169,11 +8307,16 @@ function ShareCardLayoutControls({
                         title={`${opt.label} ${opt.hex}`}
                         aria-label={`Text ${opt.label}`}
                         aria-pressed={selected}
-                        onClick={() => set({ textColor: opt.id })}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          // Explicit ink for title / session / reason / stamp / brand
+                          set({ textColor: opt.id })
+                        }}
                         className={cn(
-                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition-colors',
                           selected
-                            ? 'border-2 border-foreground shadow-sm'
+                            ? 'border-2 border-foreground bg-muted/40 shadow-sm'
                             : 'border-border/70 hover:bg-muted/50',
                         )}
                       >
@@ -8213,11 +8356,15 @@ function ShareCardLayoutControls({
                         title={`Price ${opt.label} ${opt.hex}`}
                         aria-label={`Price ${opt.label}`}
                         aria-pressed={selected}
-                        onClick={() => set({ priceColor: opt.id })}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          set({ priceColor: opt.id })
+                        }}
                         className={cn(
-                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium',
+                          'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition-colors',
                           selected
-                            ? 'border-2 border-foreground shadow-sm'
+                            ? 'border-2 border-foreground bg-muted/40 shadow-sm'
                             : 'border-border/70 hover:bg-muted/50',
                         )}
                       >
@@ -8925,36 +9072,88 @@ function ShareCardLayoutControls({
 
       {layoutTab === 'timestamp' ? (
       <ShareLayoutSection
-        title="7 · Timestamp placement"
-        hint="Only when session line is removed."
+        title="7 · Timestamp"
+        hint="Edit the date/time string, hide it, or move it when the session line is off."
       >
-        <div className="flex flex-wrap gap-2">
+        <p className="text-[10px] font-medium text-muted-foreground">Visibility</p>
+        <div className="flex flex-wrap gap-1.5">
           <Button
             type="button"
             size="sm"
-            variant={style.timestampPlacement !== 'price-right' ? 'default' : 'outline'}
-            className="h-8 text-xs"
-            disabled={style.showSessionHeadline !== false}
-            onClick={() => set({ timestampPlacement: 'footer-left' })}
+            variant={style.showTimestamp !== false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showTimestamp: true })}
           >
-            Footer left
+            Show timestamp
           </Button>
           <Button
             type="button"
             size="sm"
-            variant={style.timestampPlacement === 'price-right' ? 'default' : 'outline'}
-            className="h-8 text-xs"
-            disabled={style.showSessionHeadline !== false}
-            onClick={() => set({ timestampPlacement: 'price-right' })}
+            variant={style.showTimestamp === false ? 'default' : 'outline'}
+            className="h-7 text-[11px]"
+            onClick={() => set({ showTimestamp: false })}
           >
-            Right of share price
+            Hide timestamp
           </Button>
         </div>
-        <p className="text-[10px] text-muted-foreground">
-          {style.showSessionHeadline !== false
-            ? 'Session line is on → stamp always sits under that line.'
-            : 'Choose bottom-left, or next to the share price. Font = Timestamp slider.'}
-        </p>
+
+        {style.showTimestamp !== false && textContent && onTextChange ? (
+          <div className="space-y-1 border-t border-border/40 pt-2">
+            <Label htmlFor={`${idPrefix}-ts-stamp`} className="text-xs font-medium">
+              Timestamp text
+            </Label>
+            <Input
+              id={`${idPrefix}-ts-stamp`}
+              value={textContent.stamp}
+              onChange={(e) => setText({ stamp: e.target.value })}
+              className="h-8 text-sm"
+              placeholder="Today · 3:03 PM ET"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              Edit freely. Clear to hide on this image only. Timezone still converts until you
+              type a custom string. Reset text restores the auto clock.
+            </p>
+          </div>
+        ) : null}
+
+        {style.showTimestamp === false ? (
+          <p className="text-[10px] text-muted-foreground border-t border-border/40 pt-2">
+            Timestamp is hidden. Turn “Show” to edit the text and placement.
+          </p>
+        ) : (
+          <>
+            <p className="text-[10px] font-medium text-muted-foreground border-t border-border/40 pt-2">
+              Placement
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={style.timestampPlacement !== 'price-right' ? 'default' : 'outline'}
+                className="h-8 text-xs"
+                disabled={style.showSessionHeadline !== false}
+                onClick={() => set({ timestampPlacement: 'footer-left' })}
+              >
+                Footer left
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={style.timestampPlacement === 'price-right' ? 'default' : 'outline'}
+                className="h-8 text-xs"
+                disabled={style.showSessionHeadline !== false}
+                onClick={() => set({ timestampPlacement: 'price-right' })}
+              >
+                Right of share price
+              </Button>
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              {style.showSessionHeadline !== false
+                ? 'Session line is on → stamp always sits under that line.'
+                : 'Choose bottom-left, or next to the share price. Font = Timestamp slider.'}
+            </p>
+          </>
+        )}
       </ShareLayoutSection>
       ) : null}
 
@@ -9669,7 +9868,7 @@ function ShareCardLayoutControls({
                     : 'outline'
                 }
                 className="h-7 px-2 text-[11px]"
-                onClick={() => set({ chartAxisTimezone: z.id })}
+                onClick={() => applyChartTimezone(z.id)}
                 title={z.label}
               >
                 {z.short}
@@ -10140,7 +10339,15 @@ export default function NotificationsPage() {
   const { theme, toggleTheme } = useTheme()
   const { toast } = useBottomToast()
   /** Header tabs: Home first (default) · Trigger · 9AM */
-  const [appTab, setAppTab] = useState<AppSwitcherTab>('hub')
+  const [appTab, setAppTab] = useState<AppSwitcherTab>(() => {
+    try {
+      const app = new URLSearchParams(window.location.search).get('app')
+      if (app === 'nineam' || app === 'trigger') return app
+    } catch {
+      /* ignore */
+    }
+    return 'hub'
+  })
   /** Active push product when not on Home hub */
   const notificationApp: NotificationApp =
     appTab === 'nineam' || appTab === 'trigger' ? appTab : 'trigger'
@@ -10436,6 +10643,9 @@ export default function NotificationsPage() {
   const [reasonSavingKey, setReasonSavingKey] = useState<string | null>(null)
   /** Multi-platform share sheet for a date card */
   const [socialShareOpen, setSocialShareOpen] = useState(false)
+  /** Full-viewport lightbox for the share-card preview image */
+  const [socialSharePreviewFullscreen, setSocialSharePreviewFullscreen] =
+    useState(false)
   const [socialShareBusy, setSocialShareBusy] = useState(false)
   const [socialSharePlatformBusy, setSocialSharePlatformBusy] = useState<string | null>(
     null,
@@ -11888,6 +12098,20 @@ export default function NotificationsPage() {
     socialShareCtx?.cardText,
     shareSideImageDataUrl,
   ])
+
+  // Full-screen share preview: Esc closes lightbox (keeps share editor open)
+  useEffect(() => {
+    if (!socialSharePreviewFullscreen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSocialSharePreviewFullscreen(false)
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [socialSharePreviewFullscreen])
 
   async function copyTweetText(text: string, label: string) {
     try {
@@ -14899,98 +15123,10 @@ export default function NotificationsPage() {
                 void addMonitoredTicker(symbol, label || symbol)
               }
             }}
-            appSwitcher={
-              <div className="flex h-7 shrink-0 items-center gap-0.5 border-0 bg-transparent p-0 shadow-none">
-                <div
-                  className="flex h-7 items-center gap-0.5"
-                  role="tablist"
-                  aria-label="App"
-                >
-                  {(
-                    [
-                      {
-                        id: 'hub' as const,
-                        label: 'Home',
-                        icon: <LayoutGrid className="size-3.5" />,
-                      },
-                      {
-                        id: 'trigger' as const,
-                        label: 'Trigger',
-                        icon: <Zap className="size-3.5" />,
-                      },
-                      {
-                        id: 'nineam' as const,
-                        label: '9AM',
-                        icon: (
-                          <span className="text-[11px] font-bold leading-none">
-                            9
-                          </span>
-                        ),
-                      },
-                    ] as const
-                  ).map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={appTab === tab.id}
-                      title={tab.label}
-                      onClick={() => setAppTab(tab.id)}
-                      className={cn(
-                        'inline-flex size-7 items-center justify-center rounded-full border-0 bg-transparent shadow-none transition-colors',
-                        appTab === tab.id
-                          ? 'text-foreground'
-                          : 'text-muted-foreground hover:text-foreground',
-                      )}
-                    >
-                      {tab.icon}
-                    </button>
-                  ))}
-                </div>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      title="Settings"
-                      aria-label="Settings"
-                      className="inline-flex size-7 items-center justify-center rounded-full border-0 bg-transparent text-muted-foreground shadow-none transition-colors hover:text-foreground"
-                    >
-                      <Settings className="size-3.5" strokeWidth={1.75} />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="center"
-                    side="top"
-                    sideOffset={8}
-                    className="min-w-[11rem]"
-                  >
-                    <DropdownMenuLabel className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      Settings
-                    </DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onSelect={(e) => {
-                        e.preventDefault()
-                        toggleTheme()
-                      }}
-                      className="gap-2"
-                    >
-                      {theme === 'dark' ? (
-                        <Sun className="size-3.5" strokeWidth={1.75} />
-                      ) : (
-                        <Moon className="size-3.5" strokeWidth={1.75} />
-                      )}
-                      <span className="flex-1">
-                        {theme === 'dark' ? 'Light mode' : 'Dark mode'}
-                      </span>
-                      <span className="text-[10px] text-muted-foreground">
-                        {theme === 'dark' ? 'On' : 'Off'}
-                      </span>
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            }
+            onOpenTriggerApp={() => setAppTab('trigger')}
+            onOpenNineAmApp={() => setAppTab('nineam')}
+            theme={theme}
+            onToggleTheme={toggleTheme}
           />
         </div>
       ) : null}
@@ -17819,6 +17955,28 @@ export default function NotificationsPage() {
                               {activeCompanyName}
                             </p>
                           ) : null}
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-0.5">
+                            <a
+                              href={yahooQuoteUrl(activeTicker)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[12px] font-medium text-foreground underline-offset-2 hover:underline"
+                              title={`Open ${activeTicker} on Yahoo Finance`}
+                            >
+                              Yahoo Finance
+                              <ExternalLink className="size-3 opacity-60" />
+                            </a>
+                            <a
+                              href={perplexityFinanceUrl(activeTicker)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[12px] font-medium text-foreground underline-offset-2 hover:underline"
+                              title={`Open ${activeTicker} on Perplexity Finance`}
+                            >
+                              Perplexity Finance
+                              <ExternalLink className="size-3 opacity-60" />
+                            </a>
+                          </div>
                         </div>
                         {activeMarketPillItems.length ? (
                           <div className="w-full shrink-0 sm:ml-auto sm:w-auto">
@@ -19010,8 +19168,27 @@ export default function NotificationsPage() {
 
                 {section === 'tickers' && activeMeta ? (
                   <div className="rounded-2xl border border-border/60 bg-background/70 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
-                    <span className="font-medium text-foreground">Stock</span>
-                    {' · Perplexity Finance'}
+                    <span className="font-medium text-foreground">
+                      {activeTicker}
+                    </span>
+                    {' · '}
+                    <a
+                      href={yahooQuoteUrl(activeTicker)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-foreground underline-offset-2 hover:underline"
+                    >
+                      Yahoo Finance
+                    </a>
+                    {' · '}
+                    <a
+                      href={perplexityFinanceUrl(activeTicker)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-foreground underline-offset-2 hover:underline"
+                    >
+                      Perplexity Finance
+                    </a>
                     {activeMeta.last_saved_at
                       ? ` · last save ${new Date(activeMeta.last_saved_at).toLocaleString()}`
                       : ''}
@@ -19471,6 +19648,7 @@ export default function NotificationsPage() {
         onOpenChange={(open) => {
           setSocialShareOpen(open)
           if (!open) {
+            setSocialSharePreviewFullscreen(false)
             setSocialShareCtx((prev) => {
               if (prev?.imageUrl) {
                 try {
@@ -19488,15 +19666,24 @@ export default function NotificationsPage() {
       >
         <DialogContent
           className={cn(
-            // Full-viewport workspace for image generation
-            'flex h-[100svh] max-h-[100svh] w-[100vw] max-w-[100vw] flex-col gap-2 overflow-hidden rounded-none border-0 p-3 sm:p-4',
+            // True full-screen: override Dialog defaults (sm:max-w-sm, top-1/2 translate, rounded)
+            'fixed inset-0 top-0 left-0 z-50 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none',
+            'translate-x-0 translate-y-0 flex-col gap-2 overflow-hidden rounded-none border-0 p-0',
+            'bg-background shadow-none ring-0 sm:max-w-none',
+            'data-open:zoom-in-100 data-closed:zoom-out-100',
           )}
         >
-          <DialogHeader className="shrink-0 space-y-0.5 pr-8">
+          <DialogHeader className="shrink-0 space-y-0.5 border-b border-border/60 px-4 py-3 pr-12 sm:px-5">
             <DialogTitle className="flex items-center gap-2 text-base">
               <Share2 className="size-4" />
               Share on social media
               {socialShareCtx?.ticker ? ` · ${socialShareCtx.ticker}` : ''}
+              <Badge
+                variant="secondary"
+                className="h-5 rounded-full px-1.5 text-[10px] font-semibold"
+              >
+                Full screen
+              </Badge>
               {shareImageRerendering ? (
                 <span className="inline-flex items-center gap-1 text-xs font-normal text-muted-foreground">
                   <Loader2 className="size-3 animate-spin" />
@@ -19511,14 +19698,14 @@ export default function NotificationsPage() {
           </DialogHeader>
 
           {socialShareBusy || !socialShareCtx ? (
-            <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
+            <div className="flex min-h-0 flex-1 items-center justify-center gap-2 px-4 text-sm text-muted-foreground sm:px-5">
               <Loader2 className="size-4 animate-spin" />
               Building image + text…
             </div>
           ) : (
-            <div className="grid min-h-0 flex-1 gap-3 overflow-hidden lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
-              {/* COL 1 — preview ~40% + Share to under image */}
-              <div className="flex min-h-0 flex-col gap-2 overflow-hidden rounded-xl border border-border/50 bg-muted/15 p-3">
+            <div className="grid min-h-0 flex-1 gap-3 overflow-hidden p-3 sm:p-4 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)]">
+              {/* COL 1 — large live preview + Share to */}
+              <div className="flex min-h-0 flex-col gap-2 overflow-hidden rounded-xl border border-border/50 bg-muted/20 p-3">
                 <div className="flex shrink-0 items-center justify-between gap-2">
                   <div className="min-w-0">
                     <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -19532,6 +19719,18 @@ export default function NotificationsPage() {
                     ) : null}
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-1 px-2 text-xs"
+                      disabled={!socialShareCtx.imageUrl}
+                      onClick={() => setSocialSharePreviewFullscreen(true)}
+                      title="View preview full screen"
+                    >
+                      <Maximize2 className="size-3.5" />
+                      Full screen
+                    </Button>
                     <Button
                       type="button"
                       size="sm"
@@ -19575,17 +19774,35 @@ export default function NotificationsPage() {
                   </div>
                 </div>
                 {socialShareCtx.imageUrl ? (
-                  <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto">
+                  <button
+                    type="button"
+                    onClick={() => setSocialSharePreviewFullscreen(true)}
+                    className="relative flex min-h-[min(52vh,560px)] flex-1 cursor-zoom-in items-center justify-center overflow-auto rounded-lg p-3 text-left"
+                    style={{
+                      // Checker so white / pale cards don't disappear into a white panel
+                      backgroundImage:
+                        'linear-gradient(45deg, #e4e4e7 25%, transparent 25%), linear-gradient(-45deg, #e4e4e7 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #e4e4e7 75%), linear-gradient(-45deg, transparent 75%, #e4e4e7 75%)',
+                      backgroundSize: '16px 16px',
+                      backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0',
+                      backgroundColor: '#f4f4f5',
+                    }}
+                    title="Click for full screen"
+                  >
                     <img
                       src={socialShareCtx.imageUrl}
                       alt="Share preview"
-                      width={socialShareCtx.imageWidth ?? undefined}
-                      height={socialShareCtx.imageHeight ?? undefined}
-                      className="max-h-full w-auto max-w-full rounded-xl border border-border/60 bg-background object-contain shadow-sm"
+                      // Do NOT set HTML width/height to export pixels (1920×…) —
+                      // that collapses flex layout and leaves a tiny card in empty space.
+                      className="pointer-events-none h-auto max-h-[min(62vh,720px)] w-auto max-w-full rounded-xl border border-black/10 object-contain shadow-lg"
+                      style={{ maxWidth: '100%', height: 'auto' }}
                     />
-                  </div>
+                    <span className="absolute bottom-3 right-3 inline-flex items-center gap-1 rounded-full bg-black/55 px-2 py-1 text-[10px] font-semibold text-white backdrop-blur-sm">
+                      <Maximize2 className="size-3" />
+                      Full screen
+                    </span>
+                  </button>
                 ) : (
-                  <div className="flex h-40 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
+                  <div className="flex min-h-[240px] flex-1 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
                     No image
                   </div>
                 )}
@@ -19679,12 +19896,121 @@ export default function NotificationsPage() {
                     ticker: socialShareCtx.ticker,
                     companyName: socialShareCtx.companyName,
                   }}
+                  shareEvent={socialShareCtx.event}
                 />
               </div>
             </div>
           )}
         </DialogContent>
       </Dialog>
+
+      {/* Share-card preview — true full-screen lightbox (above editor) */}
+      {socialShareOpen &&
+      socialSharePreviewFullscreen &&
+      socialShareCtx?.imageUrl ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Share card full screen preview"
+          className="fixed inset-0 z-[200] flex flex-col bg-black/92 text-white"
+          onClick={() => setSocialSharePreviewFullscreen(false)}
+        >
+          <div
+            className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold tracking-tight">
+                Full screen preview
+                {socialShareCtx.ticker ? ` · ${socialShareCtx.ticker}` : ''}
+              </p>
+              {socialShareCtx.imageWidth && socialShareCtx.imageHeight ? (
+                <p className="text-[11px] tabular-nums text-white/60">
+                  Export {socialShareCtx.imageWidth}×
+                  {socialShareCtx.imageHeight}px
+                  {socialShareCtx.imageWidth >= 1920 ? ' · Full HD' : ''}
+                  {' · Esc or click outside to close'}
+                </p>
+              ) : (
+                <p className="text-[11px] text-white/60">
+                  Esc or click outside to close
+                </p>
+              )}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1 border-white/20 bg-white/10 px-2 text-xs text-white hover:bg-white/20 hover:text-white"
+                disabled={!socialShareCtx.imageBlob}
+                onClick={async () => {
+                  const ok = await copyImageBlobToClipboard(
+                    socialShareCtx.imageBlob,
+                  )
+                  toast({
+                    title: ok ? 'Full-res image copied' : 'Copy failed',
+                    description: ok
+                      ? 'Paste with ⌘/Ctrl+V'
+                      : 'Try Download HD instead',
+                    durationMs: 3500,
+                  })
+                }}
+              >
+                <Copy className="size-3.5" />
+                Copy
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                className="h-8 gap-1 px-2 text-xs"
+                disabled={!socialShareCtx.imageBlob}
+                onClick={() =>
+                  downloadShareImage(
+                    socialShareCtx.imageBlob,
+                    socialShareCtx.ticker,
+                    {
+                      width: socialShareCtx.imageWidth,
+                      height: socialShareCtx.imageHeight,
+                    },
+                  )
+                }
+              >
+                <Download className="size-3.5" />
+                Download HD
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1 border-white/20 bg-white/10 px-2 text-xs text-white hover:bg-white/20 hover:text-white"
+                onClick={() => setSocialSharePreviewFullscreen(false)}
+              >
+                <Minimize2 className="size-3.5" />
+                Exit
+              </Button>
+            </div>
+          </div>
+          <div
+            className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4 sm:p-6"
+            style={{
+              backgroundImage:
+                'linear-gradient(45deg, #2a2a2e 25%, transparent 25%), linear-gradient(-45deg, #2a2a2e 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2a2a2e 75%), linear-gradient(-45deg, transparent 75%, #2a2a2e 75%)',
+              backgroundSize: '20px 20px',
+              backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0',
+              backgroundColor: '#18181b',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img
+              src={socialShareCtx.imageUrl}
+              alt="Share card full screen"
+              className="h-auto max-h-[calc(100svh-5.5rem)] w-auto max-w-[min(100%,96vw)] rounded-2xl border border-white/10 object-contain shadow-2xl"
+              style={{ maxWidth: '100%', height: 'auto' }}
+            />
+          </div>
+        </div>
+      ) : null}
 
       <Dialog
         open={logoReplaceOpen}
@@ -19834,11 +20160,23 @@ export default function NotificationsPage() {
                       </span>
                     ) : null}
                   </div>
-                  <img
-                    src={tweetImageUrl}
-                    alt="Tweet share card"
-                    className="mx-auto max-h-[420px] w-auto max-w-full rounded-xl border border-border/60 shadow-sm"
-                  />
+                  <div
+                    className="flex justify-center rounded-xl p-3"
+                    style={{
+                      backgroundImage:
+                        'linear-gradient(45deg, #e4e4e7 25%, transparent 25%), linear-gradient(-45deg, #e4e4e7 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #e4e4e7 75%), linear-gradient(-45deg, transparent 75%, #e4e4e7 75%)',
+                      backgroundSize: '16px 16px',
+                      backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0',
+                      backgroundColor: '#f4f4f5',
+                    }}
+                  >
+                    <img
+                      src={tweetImageUrl}
+                      alt="Tweet share card"
+                      className="mx-auto h-auto max-h-[min(52vh,520px)] w-auto max-w-full rounded-xl border border-black/10 object-contain shadow-lg"
+                      style={{ maxWidth: '100%', height: 'auto' }}
+                    />
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     <Button
                       type="button"
@@ -19915,6 +20253,7 @@ export default function NotificationsPage() {
                           }
                         : undefined
                     }
+                    shareEvent={tweetRenderCtx?.event}
                   />
                 </div>
               ) : null}

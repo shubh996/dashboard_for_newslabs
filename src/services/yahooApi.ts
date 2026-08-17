@@ -298,6 +298,101 @@ export type YahooExtremeMoversResponse = {
   movers: YahooExtremeMover[]
 }
 
+export type YahooMostActiveItem = {
+  ticker: string
+  symbol: string
+  label: string
+  longName?: string | null
+  assetClass: string
+  volume: number
+  regularMarketPrice: number | null
+  regularMarketChange: number | null
+  regularMarketChangePercent: number | null
+  currency?: string | null
+  exchange?: string | null
+  marketState?: string | null
+  quoteType?: string | null
+}
+
+export type YahooMostActivesResponse = {
+  ok?: boolean
+  source: 'yahoo-finance'
+  class: string
+  screener?: string | null
+  fetchedAt: string
+  count: number
+  items: YahooMostActiveItem[]
+}
+
+/** Most-active names for a momentum asset-class tab. */
+export function fetchYahooMostActives(
+  assetClass: string,
+  options?: { count?: number; list?: string; signal?: AbortSignal },
+) {
+  const params = new URLSearchParams({ class: assetClass })
+  if (options?.count != null) params.set('count', String(options.count))
+  if (options?.list) params.set('list', options.list)
+  return getJson<YahooMostActivesResponse>(`/api/yahoo/market-lists?${params}`, {
+    cache: 'no-store',
+    signal: options?.signal,
+  })
+}
+
+export type YahooSavedTickerItem = {
+  ticker: string
+  label: string
+  assetClass: string
+  updatedAt?: string | null
+  source?: string
+}
+
+export function fetchYahooSavedTickers(signal?: AbortSignal) {
+  return getJson<{
+    ok?: boolean
+    table?: string
+    count?: number
+    items: YahooSavedTickerItem[]
+  }>('/api/yahoo/saved-tickers', { cache: 'no-store', signal })
+}
+
+/**
+ * Trigger-app monitored tickers (device_monitored_tickers with enabled subscribers).
+ * This is the dashboard Watchlist source of truth — not momentum_research_*.
+ */
+export type MomentumMonitoredTickerItem = {
+  ticker: string
+  label: string
+  assetClass: string
+  subscriberCount?: number
+  updatedAt?: string | null
+  source?: string
+  table?: string
+}
+
+export function fetchMomentumMonitoredTickers(options?: {
+  assetClass?: string
+  app?: string
+  signal?: AbortSignal
+}) {
+  const params = new URLSearchParams()
+  if (options?.assetClass) params.set('assetClass', String(options.assetClass))
+  if (options?.app) params.set('app', String(options.app))
+  const qs = params.toString()
+  return getJson<{
+    ok?: boolean
+    table?: string
+    app?: string
+    assetClass?: string
+    count?: number
+    byClass?: Record<string, number>
+    items: MomentumMonitoredTickerItem[]
+    error?: string
+  }>(`/api/momentum/monitored-tickers${qs ? `?${qs}` : ''}`, {
+    cache: 'no-store',
+    signal: options?.signal,
+  })
+}
+
 /** Big equities with extreme same-day % moves (default ≥10%, market cap ≥ $1B). */
 export function fetchYahooExtremeMovers(options?: {
   minPercent?: number

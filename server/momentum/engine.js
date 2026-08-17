@@ -10,8 +10,12 @@ import {
   MOMENTUM_ENGINE_ENABLED,
   MOMENTUM_MAX_WATCHED,
   MOMENTUM_POLL_MS,
+  MOMENTUM_POLL_PER_CYCLE,
   MOMENTUM_TICKER,
+  MOMENTUM_TICKER_GAP_MS,
   getVisibleReturnKeys,
+  hydrateThresholdsFromSupabase,
+  hydrateEpisodePolicyFromSupabase,
   shouldShowBridgeWindows,
 } from './config.js'
 import {
@@ -19,17 +23,48 @@ import {
   inferMarketSession,
   normalizeYahooChart,
   resolveMarketSession,
+  resolveSessionOpenPrint,
 } from './candles.js'
+import {
+  isUsEquityTriggerOpen,
+  usEquitySessionId,
+} from './usEquitySession.js'
+import {
+  calendarAllowsHeavyWork,
+  evaluateSymbolGate,
+  isMarketGateEnabled,
+} from './engineGate.js'
+import { extractQuoteTimestampMs } from './freshness.js'
+import { resolveLifecycle } from './lifecycle.js'
+import {
+  clearSleep,
+  enterFullMarketClose,
+  enterMaintenanceSleep,
+  getSleepRecord,
+  isEngineAsleep,
+  kickWakeScheduler,
+  registerPauseData,
+  reconcileWatchlistSleep,
+  schedulePendingClose,
+  startWakeScheduler,
+  stopWakeScheduler,
+} from './wakeScheduler.js'
 import {
   computeRollingReturns,
   findMaxMoveInLookbackWindow,
   strongestInLastHourWindows,
   strongestMomentum,
 } from './returns.js'
-import { findThresholdCrosses } from './detector.js'
-import { advanceEpisode } from './episode.js'
+import { findEpisodeThresholdCrosses, findThresholdCrosses } from './detector.js'
+import { advanceEpisode, forceStartEpisodeFromWindow } from './episode.js'
 import { deliverEpisodeEvents } from './delivery.js'
 import { handleAutoStartResearchAlerts } from './autoStartAlert.js'
+import { hydrateTicker, persistTick } from './persist.js'
+import { runDailyDigestCycle, isDailyDigestEnabled } from './dailyDigest.js'
+import {
+  runMarketSessionBulletinCycle,
+  isMarketBulletinEnabled,
+} from './marketSessionBulletin.js'
 import * as store from './store.js'
 
 const yahooFinance = new YahooFinance({
@@ -40,6 +75,120 @@ let timer = null
 /** @type {Set<string>} */
 const inFlight = new Set()
 let cycleRunning = false
+/** Yahoo "delisted / no data" cooldown so one bad symbol does not spam every cycle */
+const UNRESOLVABLE_COOLDOWN_MS = 30 * 60_000
+/** @type {Map<string, number>} */
+const unresolvableUntil = new Map()
+
+function isUnresolvableYahooError(error) {
+  const msg = String(
+    error instanceof Error ? error.message : error || '',
+  ).toLowerCase()
+  return (
+    msg.includes('delisted') ||
+    msg.includes('no data found') ||
+    msg.includes('invalid symbol') ||
+    msg.includes('quote not found')
+  )
+}
+
+function markUnresolvable(symbol, ms = UNRESOLVABLE_COOLDOWN_MS) {
+  const key = toYahooSymbol(symbol) || symbol
+  unresolvableUntil.set(key, Date.now() + ms)
+}
+
+function isOnUnresolvableCooldown(symbol) {
+  const key = toYahooSymbol(symbol) || symbol
+  const until = unresolvableUntil.get(key)
+  if (!until) return false
+  if (Date.now() >= until) {
+    unresolvableUntil.delete(key)
+    return false
+  }
+  return true
+}
+/** Last time we refreshed watchlist from device_monitored_tickers */
+let lastMonitoredSyncMs = 0
+const MONITORED_SYNC_MIN_MS = 5 * 60_000
+/** Round-robin cursor over non-priority watchlist tickers */
+let pollCursor = 0
+/** @type {string[]} */
+let lastCycleTickers = []
+
+/**
+ * Build this cycle’s poll set:
+ *  1) focus tab (if any)
+ *  2) every ticker with an ACTIVE episode
+ *  3) round-robin batch of the rest (up to MOMENTUM_POLL_PER_CYCLE total)
+ *
+ * Universe can be large (all Supabase monitored); per-cycle Yahoo load stays bounded.
+ * @param {string[]} watched
+ * @param {string|null|undefined} focus
+ * @returns {string[]}
+ */
+export function selectTickersForPollCycle(watched, focus) {
+  const all = []
+  for (const t of watched || []) {
+    const k = store.normalizeMomentumTicker(t)
+    if (
+      k &&
+      !all.includes(k) &&
+      calendarAllowsHeavyWork(k) &&
+      !isEngineAsleep(k)
+    ) {
+      all.push(k)
+    }
+  }
+
+  /** @type {Set<string>} */
+  const priority = new Set()
+  const focusKey = focus ? store.normalizeMomentumTicker(focus) : ''
+  if (
+    focusKey &&
+    calendarAllowsHeavyWork(focusKey) &&
+    !isEngineAsleep(focusKey)
+  ) {
+    priority.add(focusKey)
+  }
+  for (const ep of store.listActiveEpisodes()) {
+    const t = store.normalizeMomentumTicker(ep.ticker)
+    if (t && calendarAllowsHeavyWork(t) && !isEngineAsleep(t)) priority.add(t)
+  }
+  // Active episodes always poll even if briefly missing from watched
+  for (const t of priority) {
+    if (!all.includes(t)) all.push(t)
+  }
+  if (!all.length) return []
+
+  const priorityList = [...priority]
+  const rest = all.filter((t) => !priority.has(t))
+  const budget = Math.max(1, MOMENTUM_POLL_PER_CYCLE)
+  const slotsForRest = Math.max(0, budget - priorityList.length)
+
+  /** @type {string[]} */
+  let batch = []
+  if (rest.length && slotsForRest > 0) {
+    if (rest.length <= slotsForRest) {
+      batch = rest
+    } else {
+      for (let i = 0; i < slotsForRest; i += 1) {
+        const idx = (pollCursor + i) % rest.length
+        batch.push(rest[idx])
+      }
+      pollCursor = (pollCursor + slotsForRest) % rest.length
+    }
+  }
+
+  /** @type {string[]} */
+  const ordered = []
+  const push = (t) => {
+    if (t && !ordered.includes(t)) ordered.push(t)
+  }
+  if (focusKey) push(focusKey)
+  for (const t of priorityList) push(t)
+  for (const t of batch) push(t)
+  return ordered
+}
 
 /**
  * Fetch recent 1-minute candles + live quote (pre / regular / post).
@@ -55,16 +204,21 @@ export async function fetchIntradayCandles(ticker) {
   const period1d = new Date(period2.getTime() - 400 * 24 * 60 * 60 * 1000)
 
   const [chartRaw, chartDailyRaw, quoteRaw] = await Promise.all([
-    yahooFinance.chart(
-      symbol,
-      {
-        period1: period1m,
-        period2,
-        interval: '1m',
-        includePrePost: true,
-      },
-      { validateResult: false },
-    ),
+    yahooFinance
+      .chart(
+        symbol,
+        {
+          period1: period1m,
+          period2,
+          interval: '1m',
+          includePrePost: true,
+        },
+        { validateResult: false },
+      )
+      .catch((err) => {
+        if (isUnresolvableYahooError(err)) markUnresolvable(symbol)
+        throw err
+      }),
     yahooFinance
       .chart(
         symbol,
@@ -127,6 +281,9 @@ export function evaluateMomentumFromCandles({
   episode = null,
   nowIso = new Date().toISOString(),
   dailyCandles = null,
+  useEligibleTradingTime = false,
+  lifecycleState = null,
+  marketProfile = null,
 }) {
   const symbol = store.normalizeMomentumTicker(ticker) || MOMENTUM_TICKER
   const price =
@@ -158,6 +315,7 @@ export function evaluateMomentumFromCandles({
       previousClose,
       prevCloseTime,
       dailyCandles,
+      useEligibleTradingTime ? symbol : null,
     )
   const strongest = strongestMomentum(returns)
   const strongestLastHourWindows = strongestInLastHourWindows(returns)
@@ -167,7 +325,13 @@ export function evaluateMomentumFromCandles({
     asOf,
     60,
   )
-  const hits = findThresholdCrosses(returns)
+  const assetClass = sessionQuote?.assetClass ?? 'equity'
+  const hits = findThresholdCrosses(returns, assetClass)
+
+  // First 1m print of this session (PRE 4:00 AM ET, POST 4:00 PM ET, …)
+  // UI PRE lookback uses this time so users see “when pre-market started”, not Friday close.
+  // Day % / soft-start still use previousClose above.
+  const sessionOpen = resolveSessionOpenPrint(candles, session, asOf)
 
   const snapshot = {
     ticker: symbol,
@@ -179,7 +343,7 @@ export function evaluateMomentumFromCandles({
     lastSessionKind: sessionQuote?.lastSessionKind ?? null,
     lastSessionLabel: sessionQuote?.lastSessionLabel ?? null,
     lastSessionShortLabel: sessionQuote?.lastSessionShortLabel ?? null,
-    assetClass: sessionQuote?.assetClass ?? null,
+    assetClass,
     // Pre / regular / post from Yahoo quote (UI extended-hours display)
     sessionQuote: sessionQuote || null,
     regularPrice: sessionQuote?.regular?.price ?? null,
@@ -188,6 +352,18 @@ export function evaluateMomentumFromCandles({
     isExtendedHours: Boolean(sessionQuote?.isExtendedHours),
     showExtendedBadge: Boolean(sessionQuote?.showExtendedBadge),
     sessionBadge: sessionQuote?.badge ?? null,
+    /** First print at/after session open (pre 4am / AH 4pm / overnight 8pm) */
+    sessionOpen: sessionOpen
+      ? {
+          price: sessionOpen.price,
+          time: sessionOpen.timeIso,
+          openMs: sessionOpen.openMs,
+          label: sessionOpen.label,
+          shortLabel: sessionOpen.shortLabel,
+          session: sessionOpen.session,
+          lagMinutes: sessionOpen.lagMinutes,
+        }
+      : null,
     // All rolling keys (1m…50h) + day (vs previous close) — see MOMENTUM_WINDOWS
     returns: { ...returns },
     references,
@@ -222,7 +398,13 @@ export function evaluateMomentumFromCandles({
   const activeEpisode =
     episode !== undefined ? episode : store.getActiveEpisode(symbol)
 
-  const { episode: nextEpisode, events, logs } = advanceEpisode({
+  const suppressStart = store.hasRestartGate(symbol)
+  const {
+    episode: nextEpisode,
+    events,
+    logs,
+    closedEpisode = null,
+  } = advanceEpisode({
     ticker: symbol,
     episode: activeEpisode,
     returns,
@@ -232,12 +414,50 @@ export function evaluateMomentumFromCandles({
     referenceTime: refTime,
     references,
     referenceTimes,
+    exactLookbacks,
     marketSession: session,
     nowIso,
-    assetClass: sessionQuote?.assetClass ?? null,
+    assetClass,
+    suppressStart,
+    lifecycleState,
+    marketProfile,
   })
 
-  return { ok: true, snapshot, events, logs, episode: nextEpisode }
+  if (suppressStart && findEpisodeThresholdCrosses(returns, assetClass).length === 0) {
+    store.clearRestartGate(symbol)
+    logs.push(
+      `[${symbol} MOMENTUM] restart gate cleared — ≤24h / 1D is quiet after manual end`,
+    )
+  }
+
+  if (nextEpisode && !nextEpisode.episodeNo) {
+    // Per-ticker sequence: SNDK #001 independent of AAPL #001
+    nextEpisode.episodeNo = store.allocateEpisodeNo(symbol)
+  }
+  for (const ev of events || []) {
+    // Never re-stamp events that already belong to a closed/prior episode.
+    if (ev.episodeId) {
+      if (ev.episodeNo == null && closedEpisode?.episodeId === ev.episodeId) {
+        ev.episodeNo = closedEpisode.episodeNo ?? null
+      } else if (ev.episodeNo == null && nextEpisode?.episodeId === ev.episodeId) {
+        ev.episodeNo = nextEpisode.episodeNo ?? null
+      }
+      continue
+    }
+    if (nextEpisode) {
+      ev.episodeId = nextEpisode.episodeId
+      if (ev.episodeNo == null) ev.episodeNo = nextEpisode.episodeNo
+    }
+  }
+
+  return {
+    ok: true,
+    snapshot,
+    events,
+    logs,
+    episode: nextEpisode,
+    closedEpisode: closedEpisode || null,
+  }
 }
 
 function fmtPct(n) {
@@ -365,6 +585,63 @@ export async function runMomentumTick(opts = {}) {
   if (!symbol) {
     return { ok: false, error: 'ticker required' }
   }
+  const preLife = resolveLifecycle(symbol, Date.now())
+  if (isMarketGateEnabled() && preLife.isFullClosed) {
+    const { closed, rec } = enterFullMarketClose(symbol)
+    store.pushLog(
+      symbol,
+      'info',
+      `FULL_CLOSED · episodes ended · sleep until ${rec?.nextExpectedOpenUtc || 'next open'}`,
+      source,
+    )
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'market-full-close',
+      ticker: symbol,
+      closedEpisode: closed?.closedEpisode || null,
+      sleep: rec,
+    }
+  }
+  if (isMarketGateEnabled() && preLife.isMaintenance) {
+    const rec = enterMaintenanceSleep(symbol)
+    store.pushLog(
+      symbol,
+      'info',
+      `MAINTENANCE · heavy work off · wake ${rec?.nextExpectedOpenUtc || ''}`,
+      source,
+    )
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'market-maintenance',
+      ticker: symbol,
+      sleep: rec,
+    }
+  }
+  if (source !== 'wake' && isEngineAsleep(symbol)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'engine-asleep',
+      ticker: symbol,
+      sleep: getSleepRecord(symbol),
+    }
+  }
+  if (isOnUnresolvableCooldown(symbol)) {
+    store.pushLog(
+      symbol,
+      'warn',
+      `Tick skipped — Yahoo has no data for ${symbol} (cooldown)`,
+      source,
+    )
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'unresolvable-cooldown',
+      ticker: symbol,
+    }
+  }
   if (inFlight.has(symbol)) {
     store.pushLog(symbol, 'warn', 'Tick skipped — already running', source)
     return { ok: false, skipped: true, reason: 'tick already running', ticker: symbol }
@@ -378,6 +655,8 @@ export async function runMomentumTick(opts = {}) {
     source,
   )
   try {
+    // Restore past episodes + max episode_no before evaluate/start.
+    await hydrateTicker(symbol)
     store.pushLog(
       symbol,
       'info',
@@ -389,6 +668,7 @@ export async function runMomentumTick(opts = {}) {
       previousClose,
       currentPrice,
       meta,
+      quote,
       sessionQuote,
       dailyCandles,
     } = await fetchIntradayCandles(symbol)
@@ -420,6 +700,77 @@ export async function runMomentumTick(opts = {}) {
       },
     )
 
+    const quoteTs = extractQuoteTimestampMs(
+      quote,
+      sessionQuote,
+      candles.length ? candles[candles.length - 1].t : null,
+    )
+    const marketGate = evaluateSymbolGate({
+      symbol,
+      nowUtc: Date.now(),
+      quoteTimestampUtc: quoteTs,
+    })
+    const life = resolveLifecycle(
+      symbol,
+      Date.now(),
+      marketGate.freshnessState,
+    )
+    if (life.isFullClosed) {
+      const { closed, rec } = enterFullMarketClose(symbol)
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'market-full-close',
+        ticker: symbol,
+        closedEpisode: closed?.closedEpisode || null,
+        sleep: rec,
+        marketGate,
+      }
+    }
+    if (life.isMaintenance) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'market-maintenance',
+        ticker: symbol,
+        sleep: enterMaintenanceSleep(symbol),
+        marketGate,
+      }
+    }
+    if (marketGate.engineGate !== 'RUN') {
+      store.pushLog(
+        symbol,
+        marketGate.engineGate === 'CONFLICT' ? 'warn' : 'info',
+        `Engine ${marketGate.engineGate} · ${marketGate.calendarState}/${marketGate.freshnessState} · ${marketGate.reason}`,
+        'momentum',
+        marketGate,
+      )
+      if (marketGate.engineGate === 'PAUSE_DATA') {
+        registerPauseData(symbol)
+      }
+      store.setLastSnapshot(symbol, {
+        ticker: symbol,
+        timestamp: new Date().toISOString(),
+        marketSession: session,
+        currentPrice,
+        previousClose,
+        marketGate,
+        lifecycle: life.lifecycle,
+      })
+      return {
+        ok: true,
+        skipped: true,
+        reason: `market-gate-${String(marketGate.engineGate).toLowerCase()}`,
+        ticker: symbol,
+        marketGate,
+        episode: store.getActiveEpisode(symbol),
+      }
+    }
+    // Successful live tick clears a prior PAUSE_DATA sleep
+    const priorSleep = getSleepRecord(symbol)
+    if (priorSleep?.kind === 'PAUSE_DATA') clearSleep(symbol)
+    schedulePendingClose(symbol)
+
     const asOfMs = candles.length ? candles[candles.length - 1].t : Date.now()
     store.pushLog(
       symbol,
@@ -437,6 +788,11 @@ export async function runMomentumTick(opts = {}) {
       sessionQuote,
       episode: store.getActiveEpisode(symbol),
       dailyCandles,
+      // Rolling-return cards: exact clock hours (not eligible-trading walk).
+      // Inactivity expiry still uses eligible trading time inside episode.js.
+      useEligibleTradingTime: false,
+      lifecycleState: life.lifecycle,
+      marketProfile: life.profile,
     })
 
     if (!result.ok) {
@@ -452,6 +808,15 @@ export async function runMomentumTick(opts = {}) {
 
     store.setLastSnapshot(symbol, result.snapshot)
     store.setActiveEpisode(symbol, result.episode)
+    if (result.closedEpisode?.episodeId) {
+      store.upsertHistoryEpisode(symbol, result.closedEpisode)
+    }
+    if (result.episode?.episodeNo) {
+      store.noteEpisodeNo(symbol, result.episode.episodeNo)
+    }
+    if (result.closedEpisode?.episodeNo) {
+      store.noteEpisodeNo(symbol, result.closedEpisode.episodeNo)
+    }
 
     // Watchlist-gated notification enrichment (title/body + eligible devices)
     let deliveredEvents = result.events
@@ -486,16 +851,32 @@ export async function runMomentumTick(opts = {}) {
       )
     }
 
-    // STARTED → auto Perplexity + push (async so UI can poll "research running")
-    let autoStart = null
-    const hasStart = deliveredEvents.some((ev) => {
-      const t = String(ev?.eventType || '')
-      return (
-        (t === 'MOMENTUM_STARTED' || t.endsWith('_STARTED')) &&
-        String(ev?.reason || '').toUpperCase() !== 'AFTER_REVERSAL'
-      )
+    void persistTick(
+      symbol,
+      result.episode,
+      deliveredEvents,
+      result.closedEpisode || null,
+    ).then((no) => {
+      if (no && result.episode && result.episode.episodeNo !== no) {
+        result.episode.episodeNo = no
+        store.noteEpisodeNo(symbol, no)
+        store.setActiveEpisode(symbol, result.episode)
+      } else if (no) {
+        store.noteEpisodeNo(symbol, no)
+      }
     })
-    if (hasStart) {
+
+    // Perplexity only on STARTED (not AFTER_REVERSAL) or REVERSED — nowhere else
+    let autoStart = null
+    const hasResearchTrigger = deliveredEvents.some((ev) => {
+      const t = String(ev?.eventType || '')
+      if (t === 'MOMENTUM_REVERSED') return true
+      if (t === 'MOMENTUM_STARTED' || t.endsWith('_STARTED')) {
+        return String(ev?.reason || '').toUpperCase() !== 'AFTER_REVERSAL'
+      }
+      return false
+    })
+    if (hasResearchTrigger) {
       // Fire-and-forget: RUNNING row appears on next status poll while Perplexity works
       void handleAutoStartResearchAlerts({
         ticker: symbol,
@@ -514,7 +895,7 @@ export async function runMomentumTick(opts = {}) {
           store.pushLog(
             symbol,
             'error',
-            `Auto-start research/alert failed: ${
+            `Auto research/alert failed: ${
               autoErr instanceof Error ? autoErr.message : autoErr
             }`,
             'research',
@@ -577,9 +958,24 @@ export async function runMomentumTick(opts = {}) {
       ticker: symbol,
       endpoint: `yahoo.chart+quote(${symbol})`,
     })
+    if (isUnresolvableYahooError(detail.message)) {
+      markUnresolvable(symbol)
+    }
+    // 429 storms: back off this symbol so the whole watchlist stops hammering Yahoo
+    const msg = String(detail.message || '')
+    if (
+      /too many requests/i.test(msg) ||
+      /\b429\b/.test(msg) ||
+      /rate.?limit/i.test(msg)
+    ) {
+      registerPauseData(symbol)
+    }
     store.setLastError(symbol, detail)
-    store.pushLog(symbol, 'error', `Tick failed: ${detail.message}`, source, detail)
-    console.warn(`[${symbol} MOMENTUM] fetch/tick failed:`, detail.message, detail)
+    store.pushLog(symbol, 'error', `Tick failed: ${detail.message}`, source, {
+      message: detail.message,
+      ticker: symbol,
+    })
+    console.warn(`[${symbol} MOMENTUM] fetch/tick failed: ${detail.message}`)
     return {
       ok: false,
       ticker: symbol,
@@ -593,9 +989,10 @@ export async function runMomentumTick(opts = {}) {
 }
 
 /**
- * Background poll — **active tab only** (aggressive interval).
- * Other watchlist symbols are NOT fetched until the UI focuses them
- * (tab switch triggers a one-shot tick) or the user presses Run tick.
+ * Background poll — watchlist universe.
+ * US equities follow the Trigger window (Sun 20:00 ET → Fri 20:00 ET).
+ * Crypto / FX / futures stay 24×7. Each cycle polls a bounded batch (round-robin).
+ * Focus + ACTIVE episodes always included.
  * @param {{ source?: string }} [opts]
  */
 export async function runMomentumTickAll(opts = {}) {
@@ -605,15 +1002,48 @@ export async function runMomentumTickAll(opts = {}) {
   }
   cycleRunning = true
   try {
-    const t = store.getFocusTicker()
-    const result = await runMomentumTick({ ticker: t, source })
+    // Recover overdue PAUSE_DATA / lost wake timers before selecting the batch
+    kickWakeScheduler()
+    // Re-seed Trigger app watchlist occasionally (not every poll)
+    const now = Date.now()
+    if (
+      source === 'boot' ||
+      now - lastMonitoredSyncMs >= MONITORED_SYNC_MIN_MS
+    ) {
+      lastMonitoredSyncMs = now
+      if (source === 'boot') {
+        await syncWatchlistFromMonitoredTickers().catch(() => {})
+      } else {
+        void syncWatchlistFromMonitoredTickers().catch(() => {})
+      }
+    }
+    const focus = store.getFocusTicker()
+    const watched = store.listWatchedTickers()
+    const ordered = selectTickersForPollCycle(watched, focus)
+    lastCycleTickers = ordered.slice()
+
+    /** @type {object[]} */
+    const results = []
+    for (let i = 0; i < ordered.length; i += 1) {
+      const t = ordered[i]
+      const result = await runMomentumTick({ ticker: t, source })
+      results.push(result)
+      if (i < ordered.length - 1 && MOMENTUM_TICKER_GAP_MS > 0) {
+        await new Promise((r) => setTimeout(r, MOMENTUM_TICKER_GAP_MS))
+      }
+    }
     return {
       ok: true,
       source,
-      mode: 'active-only',
-      focusTicker: t,
-      tickers: [t],
-      results: [result],
+      mode: 'watchlist-round-robin',
+      usEquityTriggerOpen: isUsEquityTriggerOpen(),
+      usEquitySession: usEquitySessionId(),
+      focusTicker: focus,
+      watchedCount: watched.length,
+      pollPerCycle: MOMENTUM_POLL_PER_CYCLE,
+      maxWatched: MOMENTUM_MAX_WATCHED,
+      tickers: ordered,
+      results,
     }
   } finally {
     cycleRunning = false
@@ -621,12 +1051,22 @@ export async function runMomentumTickAll(opts = {}) {
 }
 
 /**
- * Register UI watchlist + optional active (focus) tab for the poll loop.
+ * Register / merge UI + app watchlist. Default **merge** so opening the
+ * dashboard never drops other monitored symbols from the 24×7 loop.
  * @param {string[]} tickers
  * @param {string} [active]
+ * @param {{ merge?: boolean }} [opts]
  */
-export function setMomentumWatchlist(tickers, active) {
-  const limited = (tickers || []).slice(0, MOMENTUM_MAX_WATCHED)
+export function setMomentumWatchlist(tickers, active, opts = {}) {
+  const merge = opts.merge !== false
+  const incoming = (tickers || []).map(String).filter(Boolean)
+  const base = merge ? store.listWatchedTickers() : []
+  const combined = []
+  for (const t of [...base, ...incoming]) {
+    const k = store.normalizeMomentumTicker(t)
+    if (k && !combined.includes(k)) combined.push(k)
+  }
+  const limited = combined.slice(0, MOMENTUM_MAX_WATCHED)
   const watched = store.setWatchedTickers(limited)
   if (active) {
     store.setFocusTicker(active)
@@ -639,15 +1079,78 @@ export function setMomentumWatchlist(tickers, active) {
   }
 }
 
-/** Tell the engine which tab is currently open (only this symbol is polled). */
+/** Tell the engine which tab is currently open (polled first each cycle). */
 export function setMomentumFocus(ticker) {
   return store.setFocusTicker(ticker)
 }
+
+/**
+ * Pull Trigger-enabled tickers from device_monitored_tickers into the loop
+ * so the engine keeps watching even when the dashboard is closed.
+ * Replaces (does not merge) so unsubscribed symbols leave the universe.
+ */
+export async function syncWatchlistFromMonitoredTickers() {
+  try {
+    const { createClient } = await import('@supabase/supabase-js')
+    const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
+    const key =
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      process.env.VITE_SUPABASE_ANON_KEY
+    if (!url || !key) return store.listWatchedTickers()
+    const supabase = createClient(url, key, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+    const { data, error } = await supabase
+      .from('device_monitored_tickers')
+      .select('ticker, subscribers')
+      .limit(500)
+    if (error || !data?.length) return store.listWatchedTickers()
+
+    const { listWatchlistSubscribers } = await import('../notifications.js')
+    const tickers = []
+    for (const row of data) {
+      const t = store.normalizeMomentumTicker(row.ticker)
+      if (!t) continue
+      const recips = listWatchlistSubscribers([row], 'trigger')
+      if (recips.length) tickers.push(t)
+    }
+    if (tickers.length) {
+      const focus = store.getFocusTicker()
+      const focusStill =
+        focus &&
+        tickers.some(
+          (t) => store.normalizeMomentumTicker(t) === store.normalizeMomentumTicker(focus),
+        )
+          ? focus
+          : undefined
+      // Replace with Supabase truth (full universe, capped by MOMENTUM_MAX_WATCHED)
+      setMomentumWatchlist(tickers, focusStill, { merge: false })
+    }
+    return store.listWatchedTickers()
+  } catch {
+    return store.listWatchedTickers()
+  }
+}
+
+/** @type {ReturnType<typeof setInterval>|null} */
+let digestTimer = null
 
 export function startMomentumLoop() {
   // Seed bootstrap watchlist once; focus defaults to first bootstrap ticker
   store.setWatchedTickers(MOMENTUM_BOOTSTRAP_TICKERS)
   store.setFocusTicker(MOMENTUM_BOOTSTRAP_TICKERS[0] || MOMENTUM_TICKER)
+
+  // Prefer Supabase thresholds + episode policy over local disk
+  void hydrateThresholdsFromSupabase()
+  void hydrateEpisodePolicyFromSupabase()
+  // Seed full Trigger app watchlist ASAP so we are not focus-only after restart
+  void syncWatchlistFromMonitoredTickers().then((list) => {
+    console.log(
+      `[MOMENTUM] watchlist synced · ${list.length} ticker(s) · ≤${MOMENTUM_POLL_PER_CYCLE}/cycle round-robin`,
+    )
+    reconcileWatchlistSleep(list)
+  })
 
   if (!MOMENTUM_ENGINE_ENABLED) {
     const focus = store.getFocusTicker()
@@ -655,15 +1158,17 @@ export function startMomentumLoop() {
     console.log('[MOMENTUM] engine disabled (MOMENTUM_ENGINE_ENABLED=0)')
     return
   }
+  startWakeScheduler()
+  reconcileWatchlistSleep(store.listWatchedTickers())
   if (timer) return
   const focus = store.getFocusTicker()
   console.log(
-    `[MOMENTUM] poll loop every ${MOMENTUM_POLL_MS}ms · active-tab only · focus=${focus}`,
+    `[MOMENTUM] poll loop every ${MOMENTUM_POLL_MS}ms · universe≤${MOMENTUM_MAX_WATCHED} · ${MOMENTUM_POLL_PER_CYCLE}/cycle round-robin · focus-first=${focus}`,
   )
   store.pushLog(
     focus,
     'info',
-    `Poll loop starting · every ${MOMENTUM_POLL_MS}ms · active-tab only · focus=${focus}`,
+    `Poll loop starting · every ${MOMENTUM_POLL_MS}ms · ≤${MOMENTUM_POLL_PER_CYCLE}/cycle round-robin · universe≤${MOMENTUM_MAX_WATCHED} · focus-first=${focus}`,
     'loop',
   )
   // Fire once shortly after boot, then interval
@@ -674,6 +1179,26 @@ export function startMomentumLoop() {
     void runMomentumTickAll({ source: 'poll' })
   }, MOMENTUM_POLL_MS)
   if (typeof timer.unref === 'function') timer.unref()
+
+  // Market open/close watchlist bulletin (replaces per-ticker daily digests).
+  // Daily digest cycle only if explicitly re-enabled (legacy).
+  if ((isDailyDigestEnabled() || isMarketBulletinEnabled()) && !digestTimer) {
+    console.log(
+      `[MOMENTUM] market open/close bulletin every 60s` +
+        (isDailyDigestEnabled() ? ' · legacy daily digest also on' : ''),
+    )
+    setTimeout(() => {
+      if (isDailyDigestEnabled()) void runDailyDigestCycle({ source: 'boot' })
+      if (isMarketBulletinEnabled())
+        void runMarketSessionBulletinCycle({ source: 'boot' })
+    }, 12_000)
+    digestTimer = setInterval(() => {
+      if (isDailyDigestEnabled()) void runDailyDigestCycle({ source: 'poll' })
+      if (isMarketBulletinEnabled())
+        void runMarketSessionBulletinCycle({ source: 'poll' })
+    }, 60_000)
+    if (typeof digestTimer.unref === 'function') digestTimer.unref()
+  }
 }
 
 export function stopMomentumLoop() {
@@ -681,21 +1206,146 @@ export function stopMomentumLoop() {
     clearInterval(timer)
     timer = null
   }
+  if (digestTimer) {
+    clearInterval(digestTimer)
+    digestTimer = null
+  }
+  stopWakeScheduler()
+}
+
+/**
+ * Dashboard “Start episode” on a rolling-return card.
+ * Refreshes Yahoo when possible, then force-opens ACTIVE on that window.
+ * @param {{ ticker?: string, windowKey: string }} opts
+ */
+export async function runForceStartEpisode(opts = {}) {
+  const symbol = store.ensureTicker(opts.ticker || MOMENTUM_TICKER)
+  const windowKey = String(opts.windowKey || '').trim()
+  if (!symbol || !windowKey) {
+    return { ok: false, error: 'ticker and windowKey required' }
+  }
+
+  // Best-effort fresh tape (ignore skip/asleep — we still use last snapshot)
+  let tickResult = null
+  try {
+    tickResult = await runMomentumTick({
+      ticker: symbol,
+      source: 'api-start-episode',
+    })
+  } catch (err) {
+    store.pushLog(
+      symbol,
+      'warn',
+      `Start-episode pre-tick failed: ${err instanceof Error ? err.message : err}`,
+      'api',
+    )
+  }
+
+  const snap =
+    tickResult?.snapshot ||
+    store.getLastSnapshot(symbol) ||
+    null
+  if (!snap || !snap.returns) {
+    return {
+      ok: false,
+      error:
+        'No rolling-return snapshot yet — wait for a successful Yahoo tick, then retry',
+      code: 'NO_SNAPSHOT',
+      tick: tickResult,
+    }
+  }
+
+  const started = forceStartEpisodeFromWindow({
+    ticker: symbol,
+    windowKey,
+    currentPrice: snap.currentPrice,
+    returns: snap.returns,
+    references: snap.references || null,
+    referenceTimes: snap.referenceTimes || null,
+    exactLookbacks: snap.exactLookbacks || null,
+    marketSession: snap.marketSession || null,
+    assetClass: snap.assetClass || null,
+    nowIso: snap.timestamp || new Date().toISOString(),
+  })
+
+  if (!started.ok) {
+    return { ...started, tick: tickResult, snapshot: snap }
+  }
+
+  let deliveredEvents = started.events || []
+  try {
+    deliveredEvents = await deliverEpisodeEvents(
+      symbol,
+      started.events,
+      started.episode,
+    )
+  } catch (notifyErr) {
+    store.pushLog(
+      symbol,
+      'warn',
+      `Start-episode notify enrich failed: ${
+        notifyErr instanceof Error ? notifyErr.message : notifyErr
+      }`,
+      'notify',
+    )
+  }
+
+  for (const ev of deliveredEvents) {
+    // already pushed in forceStart for raw events; re-push enriched if new
+    if (ev && ev.notification) store.pushEvent(symbol, ev)
+  }
+
+  void persistTick(symbol, started.episode, deliveredEvents, null)
+
+  void handleAutoStartResearchAlerts({
+    ticker: symbol,
+    events: deliveredEvents,
+    episode: started.episode,
+    snapshot: snap,
+    meta: {
+      shortName: snap?.sessionQuote?.shortName || null,
+      longName: snap?.sessionQuote?.longName || null,
+    },
+  }).catch((err) => {
+    store.pushLog(
+      symbol,
+      'error',
+      `Start-episode research failed: ${err instanceof Error ? err.message : err}`,
+      'research',
+    )
+  })
+
+  return {
+    ok: true,
+    episode: started.episode,
+    events: deliveredEvents,
+    logs: started.logs,
+    windowKey,
+    tick: tickResult,
+    snapshot: snap,
+  }
 }
 
 export function getMomentumStatus(ticker = MOMENTUM_TICKER) {
   const symbol = store.ensureTicker(ticker)
   const focus = store.getFocusTicker()
+  const watched = store.listWatchedTickers()
   return {
     ok: true,
     ticker: symbol,
     pollIntervalMs: MOMENTUM_POLL_MS,
     engineEnabled: MOMENTUM_ENGINE_ENABLED,
     loopRunning: Boolean(timer),
-    pollMode: 'active-only',
+    pollMode: 'watchlist-round-robin',
+    usEquityTriggerOpen: isUsEquityTriggerOpen(),
+    usEquitySession: usEquitySessionId(),
+    pollPerCycle: MOMENTUM_POLL_PER_CYCLE,
+    maxWatched: MOMENTUM_MAX_WATCHED,
+    watchedCount: watched.length,
+    lastCycleTickers: lastCycleTickers.slice(),
     focusTicker: focus,
     isFocus: symbol === focus,
-    watchedTickers: store.listWatchedTickers(),
+    watchedTickers: watched,
     ...store.getDebugState(symbol),
   }
 }
