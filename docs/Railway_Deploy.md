@@ -68,7 +68,7 @@ You should then see build steps like `FROM node:22.14-bookworm-slim` and `NPM_CO
 Generate a public domain:
 
 - **Settings → Networking → Generate Domain**  
-- Example: `https://dashboard-for-newslabs-production.up.railway.app`
+- Example: `https://dashboardfornewslabs-production.up.railway.app`
 
 Copy that URL — this is your **API host**.
 

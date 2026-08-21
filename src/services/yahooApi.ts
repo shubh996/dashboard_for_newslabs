@@ -1,3 +1,4 @@
+import { apiUrl } from '@/lib/apiBase'
 import type {
   YahooSavedSnapshot,
   YahooSearchResults,
@@ -452,8 +453,12 @@ export type YahooStreamHandlers = {
 }
 
 // Server-Sent Events stream — one event per module unit for live progress.
+// Use apiUrl() so Cloudflare Pages hits the Railway API (EventSource is not
+// covered by the window.fetch rewrite in main.tsx).
 export function streamYahooTicker(ticker: string, handlers: YahooStreamHandlers): () => void {
-  const source = new EventSource(`/api/yahoo/${encodeURIComponent(ticker)}/stream`)
+  const source = new EventSource(
+    apiUrl(`/api/yahoo/${encodeURIComponent(ticker)}/stream`),
+  )
 
   source.addEventListener('start', (event) => {
     try {

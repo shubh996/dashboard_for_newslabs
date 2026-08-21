@@ -20,14 +20,16 @@ import MomentumStudioPage from '@/pages/MomentumStudioPage.tsx'
 
 /**
  * When VITE_API_BASE_URL is set (Cloudflare Pages → remote Node API), rewrite
- * same-origin `/api/...` fetches so Momentum / Yahoo / notifications hit the
- * real Express host instead of static Pages (which returns 405 on POST).
+ * same-origin `/api/...` fetches / EventSource so Momentum / Yahoo / notifications
+ * hit the real Express host instead of static Pages (405 on POST, HTML on SSE).
  */
 if (hasExternalApiBase() && typeof window !== 'undefined') {
+  const rewriteApiPath = (pathWithSearch: string) => apiUrl(pathWithSearch)
+
   const nativeFetch = window.fetch.bind(window)
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
     if (typeof input === 'string' && input.startsWith('/api/')) {
-      return nativeFetch(apiUrl(input), init)
+      return nativeFetch(rewriteApiPath(input), init)
     }
     if (input instanceof Request && input.url) {
       try {
@@ -37,7 +39,7 @@ if (hasExternalApiBase() && typeof window !== 'undefined') {
           u.pathname.startsWith('/api/')
         ) {
           return nativeFetch(
-            new Request(apiUrl(u.pathname + u.search), input),
+            new Request(rewriteApiPath(u.pathname + u.search), input),
             init,
           )
         }
@@ -46,6 +48,31 @@ if (hasExternalApiBase() && typeof window !== 'undefined') {
       }
     }
     return nativeFetch(input, init)
+  }
+
+  // EventSource is separate from fetch — Yahoo live module stream needs this.
+  const NativeEventSource = window.EventSource
+  window.EventSource = class extends NativeEventSource {
+    constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
+      let resolved: string | URL = url
+      if (typeof url === 'string' && url.startsWith('/api/')) {
+        resolved = rewriteApiPath(url)
+      } else {
+        try {
+          const u =
+            typeof url === 'string' ? new URL(url, window.location.origin) : url
+          if (
+            u.origin === window.location.origin &&
+            u.pathname.startsWith('/api/')
+          ) {
+            resolved = rewriteApiPath(u.pathname + u.search)
+          }
+        } catch {
+          /* keep original */
+        }
+      }
+      super(resolved, eventSourceInitDict)
+    }
   }
 }
 
