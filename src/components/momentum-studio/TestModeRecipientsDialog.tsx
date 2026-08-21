@@ -17,6 +17,8 @@ import { cn } from '@/lib/utils'
 export type TestModeDeviceRow = {
   device_id: string | null
   expo_push_token: string
+  /** Some API payloads use Expo `to` instead of expo_push_token */
+  to?: string | null
   label?: string | null
   pinned?: boolean
   enabled?: boolean
