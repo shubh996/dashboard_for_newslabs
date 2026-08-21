@@ -75,7 +75,6 @@ describe('wake scheduler + full close + 3h inactivity', () => {
     const { rec } = enterFullMarketClose('SNDK', new Date(fri800).toISOString())
     assert.ok(rec?.nextExpectedOpenUtc)
     assert.equal(isEngineAsleep('SNDK'), true)
-    const sun8 = et('2026', '06', '28', 20, 0)
     const openMs = Date.parse(rec.nextExpectedOpenUtc)
     assert.ok(Number.isFinite(openMs))
     assert.ok(openMs > fri800)

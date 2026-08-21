@@ -108,13 +108,17 @@ export function resolveSessionState(profile, ms = Date.now()) {
   }
 
   if (policy === SESSION_POLICY.US_EQUITY_YAHOO_24X5) {
+    // Calendar = Yahoo 24×5 poll window (Sun 20:00–Fri 20:00 ET) so we still
+    // fetch quotes for non-US listings (e.g. India morning overlaps this).
+    // Actual momentum RUN vs stop is decided by Yahoo marketState===REGULAR
+    // in the engine tick — not by hard-coded cash-bell hours per country.
     const open = isUsEquityTriggerOpen(now)
     return {
       state: open ? 'OPEN' : 'CLOSED',
       sessionName: open ? equitySessionName(now) : null,
       reason: open
-        ? `US equity ${equitySessionName(now) || 'session'}`
-        : 'US equity weekend / outside Yahoo 24x5',
+        ? `Equity poll window · ${equitySessionName(now) || 'session'} (Yahoo REGULAR gate applies)`
+        : 'Outside Yahoo equity 24×5 poll window',
     }
   }
 

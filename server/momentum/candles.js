@@ -28,6 +28,22 @@ export function inferMarketSession(ms) {
 }
 
 /**
+ * True when Yahoo says the main/regular session is live.
+ * This is the cross-exchange engine run signal (US RTH, NSE cash, LSE, …)
+ * without hard-coding each country's clock.
+ *
+ * PRE / PREPRE / POST / POSTPOST / CLOSED → not regular → do not run momentum.
+ *
+ * @param {string|null|undefined} marketState
+ */
+export function isYahooRegularMarketState(marketState) {
+  const s = String(marketState || '')
+    .trim()
+    .toUpperCase()
+  return s === 'REGULAR' || s === 'OPEN'
+}
+
+/**
  * Map Yahoo `marketState` (+ ET clock fallback) to a short session code.
  * @param {string|null|undefined} marketState
  * @param {number} [asOfMs]
@@ -562,6 +578,97 @@ export function normalizeYahooChart(chartBody) {
     previousClose,
     currentPrice: currentPrice ?? lastClose,
   }
+}
+
+/**
+ * Drop Yahoo 1m outlier prints that poison reference prices.
+ *
+ * Recurring failure mode (esp. pre/post): tape shows a garbage print
+ * (e.g. MSFT 467 while live/post ≈ 482) while the quote stream is correct.
+ * Live price stays right; `candleAtOrBefore` then freezes that bad close as
+ * `referencePrice` → absurd move %.
+ *
+ * A bar is removed only when it is far from the local rolling median **and**
+ * far from every quote anchor (live / regular / previous close). Real spikes
+ * that agree with the live quote are kept.
+ *
+ * @param {Candle[]} candles sorted asc
+ * @param {{
+ *   anchors?: Array<number|null|undefined>,
+ *   neighborRadius?: number,
+ *   medianDevPct?: number,
+ *   anchorDevPct?: number,
+ * }} [opts]
+ * @returns {Candle[]}
+ */
+export function sanitizeMomentumCandles(candles, opts = {}) {
+  if (!Array.isArray(candles) || candles.length < 3) {
+    return Array.isArray(candles) ? candles : []
+  }
+  const neighborRadius = Math.max(2, Math.round(Number(opts.neighborRadius) || 4))
+  const medianDevPct = Number(opts.medianDevPct)
+  const medPct = Number.isFinite(medianDevPct) && medianDevPct > 0 ? medianDevPct : 1.5
+  const anchorDevPct = Number(opts.anchorDevPct)
+  const ancPct =
+    Number.isFinite(anchorDevPct) && anchorDevPct > 0 ? anchorDevPct : 1.25
+  const anchors = (opts.anchors || [])
+    .map((v) => (typeof v === 'number' ? v : Number(v)))
+    .filter((n) => Number.isFinite(n) && n > 0)
+
+  const closes = candles.map((c) =>
+    c && Number.isFinite(c.close) && c.close > 0 ? c.close : null,
+  )
+  /** @type {Candle[]} */
+  const out = []
+
+  for (let i = 0; i < candles.length; i += 1) {
+    const c = candles[i]
+    const close = closes[i]
+    if (!c || close == null) continue
+
+    const lo = Math.max(0, i - neighborRadius)
+    const hi = Math.min(candles.length - 1, i + neighborRadius)
+    /** @type {number[]} */
+    const window = []
+    for (let j = lo; j <= hi; j += 1) {
+      if (j === i) continue
+      const v = closes[j]
+      if (v != null) window.push(v)
+    }
+    if (window.length < 3) {
+      out.push(c)
+      continue
+    }
+    window.sort((a, b) => a - b)
+    const med = window[Math.floor(window.length / 2)]
+    if (!Number.isFinite(med) || med <= 0) {
+      out.push(c)
+      continue
+    }
+    const vsMedPct = (Math.abs(close - med) / med) * 100
+    if (vsMedPct <= medPct) {
+      out.push(c)
+      continue
+    }
+
+    // Far from local tape. Keep only if it still matches an official quote.
+    if (anchors.length) {
+      const nearAnchor = anchors.some(
+        (a) => (Math.abs(close - a) / a) * 100 <= ancPct,
+      )
+      if (nearAnchor) {
+        out.push(c)
+        continue
+      }
+      continue // drop
+    }
+
+    // No quote anchors — only drop extreme median outliers
+    if (vsMedPct > Math.max(medPct * 2, 3)) continue
+    out.push(c)
+  }
+
+  return out
 }
 
 /**

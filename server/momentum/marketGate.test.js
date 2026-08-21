@@ -36,8 +36,9 @@ describe('market session calendar + freshness gate', () => {
     assert.notEqual(g.engineGate, 'RUN')
   })
 
-  it('T02: US stock Monday 1:02am BST summer — OPEN overnight + FRESH → RUN', () => {
+  it('T02: US stock Monday 1:02am BST summer — calendar OPEN overnight (poll window)', () => {
     // 22 Jun 2026 Mon 01:02 BST = 21 Jun 20:02 ET
+    // Calendar allows poll; Yahoo marketState REGULAR gate decides evaluate.
     const now = et('2026', '06', '21', 20, 2)
     const g = gate('AAPL', now, now - 30 * 1000)
     assert.equal(g.calendarState, 'OPEN')

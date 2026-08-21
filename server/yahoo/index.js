@@ -787,6 +787,7 @@ function mapMostActiveRow(quote, assetClass, fallbackTicker, fallbackLabel) {
     regularMarketChangePercent: Number.isFinite(percent) ? percent : null,
     currency: quote?.currency || null,
     exchange: quote?.fullExchangeName || quote?.exchange || null,
+    exchangeTimezoneName: quote?.exchangeTimezoneName || null,
     marketState: quote?.marketState || null,
     quoteType: quote?.quoteType || null,
   }
@@ -1167,6 +1168,7 @@ router.get('/quotes', async (request, response) => {
         currency: q.currency || null,
         marketState,
         exchange: streamed?.exchange || q.fullExchangeName || q.exchange || null,
+        exchangeTimezoneName: q.exchangeTimezoneName || null,
         liveSource: streamed ? 'yahoo-streamer' : 'yahoo-quote',
         streamReceivedAt: streamed?.receivedAt || null,
       }
@@ -1866,6 +1868,7 @@ router.get('/:ticker/quote', async (request, response) => {
         // Yahoo marketState as-is (PRE / PREPRE / REGULAR / POST / POSTPOST / CLOSED)
         marketState: resolveQuoteMarketState(null, q.marketState),
         exchange: q.fullExchangeName || q.exchange || null,
+        exchangeTimezoneName: q.exchangeTimezoneName || null,
         website,
         logoUrl,
       },

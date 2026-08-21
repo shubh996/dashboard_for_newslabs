@@ -79,12 +79,20 @@ export function etWallToUtcMs(
   return utc
 }
 
+/** Yahoo ATS extended window (Sun 20:00 → Fri 20:00 ET) — display / tape only. */
 export function isUsEquityTriggerOpen(ms = Date.now()) {
   const { weekday, minutes } = etPartsAt(ms)
   if (weekday === 'Sat') return false
   if (weekday === 'Sun') return minutes >= US_EQUITY_MIN.overnightStart
   if (weekday === 'Fri') return minutes < US_EQUITY_MIN.ahEnd
   return true
+}
+
+/** Cash RTH Mon–Fri 09:30–16:00 ET — momentum engine run window for US equities. */
+export function isUsEquityRthOpen(ms = Date.now()) {
+  const { weekday, minutes } = etPartsAt(ms)
+  if (weekday === 'Sat' || weekday === 'Sun') return false
+  return minutes >= US_EQUITY_MIN.rthStart && minutes < US_EQUITY_MIN.rthEnd
 }
 
 export function usEquitySessionId(ms = Date.now()): UsEquitySessionId {

@@ -64,7 +64,10 @@ import {
   resolveYahooActiveSession,
   type YahooSessionKey,
 } from '@/lib/yahooMarketSession'
-
+import {
+  EXCHANGE_TZ_FALLBACK,
+  resolveExchangeTimeZone,
+} from '@/lib/exchangeTimeZone'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -88,6 +91,19 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+
+function tickerExchangeTimeZone(
+  ticker: string,
+  quote?: Pick<YahooLiveQuote, 'exchangeTimezoneName' | 'exchange'> | null,
+  assetClass?: string | null,
+): string {
+  return resolveExchangeTimeZone({
+    exchangeTimezoneName: quote?.exchangeTimezoneName,
+    exchange: quote?.exchange,
+    symbol: ticker,
+    assetClass,
+  })
+}
 
 type DashboardSection = 'tickers' | 'news' | 'custom' | 'users' | 'settings'
 type TickerSortMode =
@@ -587,6 +603,8 @@ type MarketDataPillItem = {
   updatedAt?: string | null
   priceTimeLabel?: string | null
   priceTimestamp?: string | null
+  /** Listing exchange IANA zone for tooltip fetch clocks */
+  displayTimeZone?: string | null
   stale?: boolean
   note?: string | null
   statusOnly?: boolean
@@ -636,7 +654,7 @@ function MarketDataPill({
         const fetchedTimeLabel = lastSourceRefreshAt
           ? formatMarketTimestamp(
               new Date(lastSourceRefreshAt).toISOString(),
-              'America/New_York',
+              item.displayTimeZone || EXCHANGE_TZ_FALLBACK,
             )
           : null
         const isLiveSession =
@@ -2954,8 +2972,8 @@ function drawMiniChart(
     series?: ShareChartBar[] | null
     /** elapsed = 0m / 15m · timestamp = 9:30 AM wall clock */
     axisMode?: 'elapsed' | 'timestamp'
-    /** IANA zone for timestamp mode */
-    axisTimezone?: ShareChartTimezone
+    /** IANA zone for timestamp mode (listing exchange; not browser local) */
+    axisTimezone?: string
     /** Max x-axis labels (3–10), including start + end */
     maxAxisLabels?: number
     /** Override stroke/fill accent (green/red shade from layout). */
@@ -3002,11 +3020,7 @@ function drawMiniChart(
   const dayLabelMode = clampShareChartDayLabelMode(options?.dayLabelMode)
   const series = options?.series && options.series.length >= 2 ? options.series : null
   const axisMode = options?.axisMode === 'timestamp' ? 'timestamp' : 'elapsed'
-  const axisTz: ShareChartTimezone =
-    options?.axisTimezone &&
-    SHARE_CHART_TIMEZONES.some((z) => z.id === options.axisTimezone)
-      ? options.axisTimezone
-      : 'America/New_York'
+  const axisTz = String(options?.axisTimezone || '').trim() || EXCHANGE_TZ_FALLBACK
   // User setting: 3…10 labels (was hard-capped at 8 — that broke higher counts)
   const MAX_LABELS = Math.min(
     10,
@@ -4090,15 +4104,14 @@ const SHARE_CHART_TIMEZONES: Array<{
   { id: 'UTC', label: 'UTC', short: 'UTC' },
 ]
 
-/** Short zone label for stamps / axis: EDT, EST, GMT, BST, IST, UTC. */
+/** Short zone label for stamps / axis: EDT, EST, GMT, BST, IST, UTC, … */
 function shareTimezoneAbbrev(
-  tz: ShareChartTimezone | undefined,
+  tz: string | undefined,
   atMs: number = Date.now(),
 ): string {
-  const zone =
-    tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz) ? tz : 'America/New_York'
-  if (zone === 'Asia/Kolkata') return 'IST'
-  if (zone === 'UTC') return 'UTC'
+  const zone = String(tz || '').trim() || EXCHANGE_TZ_FALLBACK
+  if (zone === 'Asia/Kolkata' || zone === 'Asia/Calcutta') return 'IST'
+  if (zone === 'UTC' || zone === 'Etc/UTC') return 'UTC'
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: zone,
@@ -4107,10 +4120,8 @@ function shareTimezoneAbbrev(
     const raw = parts.find((p) => p.type === 'timeZoneName')?.value || ''
     if (zone === 'America/New_York') {
       if (raw === 'EDT' || raw === 'EST') return raw
-      // Engines that emit GMT-4 / GMT-5 / UTC−4
       if (/GMT-4|UTC-4|UTC−4/i.test(raw)) return 'EDT'
       if (/GMT-5|UTC-5|UTC−5/i.test(raw)) return 'EST'
-      // Last resort: July-ish → EDT else EST
       const m = new Date(atMs).getUTCMonth()
       return m >= 2 && m <= 9 ? 'EDT' : 'EST'
     }
@@ -4122,6 +4133,7 @@ function shareTimezoneAbbrev(
       return m >= 2 && m <= 9 ? 'BST' : 'GMT'
     }
     if (raw && !/^GMT[+-]/i.test(raw) && !/^UTC[+-]/i.test(raw)) return raw
+    if (raw) return raw
   } catch {
     /* fall through */
   }
@@ -4998,17 +5010,17 @@ function etDateKey(d: Date = new Date()): string {
 }
 
 /**
- * Share stamp under the session headline — FULLY converted to the selected zone.
- * Market event times are US Eastern wall-clock; we convert then append ET/BST/IST/UTC.
- * Examples: “Today · 3:33 PM ET” · “Today · 8:33 PM BST” · “Today · 1:03 AM IST”
+ * Share stamp under the session headline — always the listing exchange zone.
+ * Market event times are stored as US Eastern wall-clock for US equities; we
+ * project into the exchange IANA zone (normally America/New_York for MSFT).
+ * Examples: “Today · 3:33 PM EDT” · “Today · 4:30 PM BST” (LSE)
  */
 function formatShareStampLabel(
   event: PriceMovementEvent,
-  tz: ShareChartTimezone = 'America/New_York',
+  tz: string = EXCHANGE_TZ_FALLBACK,
 ): string {
   const eventDate = String(event.event_date || '').slice(0, 10)
-  const zone =
-    tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz) ? tz : 'America/New_York'
+  const zone = String(tz || '').trim() || EXCHANGE_TZ_FALLBACK
 
   // Prefer true instant from ET wall time so clocks re-project into UK / IST / UTC
   let utcMs = eventEasternWallTimeToUtcMs(event)
@@ -5079,36 +5091,35 @@ function formatShareStampLabel(
   return withTimezoneSuffix(formatClock(at), abbrev)
 }
 
-function shareStampTimezone(
-  tz: ShareChartTimezone | undefined,
-): ShareChartTimezone {
-  return tz && SHARE_CHART_TIMEZONES.some((z) => z.id === tz)
-    ? tz
-    : 'America/New_York'
-}
-
-/** True when stamp is empty or still one of the auto timezone labels. */
-function isGeneratedShareStamp(event: PriceMovementEvent, stamp: string): boolean {
+/** True when stamp is empty or still an auto-generated timezone label. */
+function isGeneratedShareStamp(
+  event: PriceMovementEvent,
+  stamp: string,
+  displayTimeZone: string = EXCHANGE_TZ_FALLBACK,
+): boolean {
   const custom = String(stamp || '').trim()
   if (!custom) return true
+  if (formatShareStampLabel(event, displayTimeZone) === custom) return true
+  // Legacy auto stamps from the old UK/IST/UTC convert picker
   return SHARE_CHART_TIMEZONES.some((z) => formatShareStampLabel(event, z.id) === custom)
 }
 
 /**
  * Live-editable stamp. Hidden when style.showTimestamp is off or the user
- * cleared the field. Timezone switches still convert until they type a custom string.
+ * cleared the field. Always regenerates in the listing exchange timezone.
  */
 function resolveShareStampLabel(
   event: PriceMovementEvent,
   style: ShareCardStyle,
   textContent?: ShareCardTextContent | null,
+  displayTimeZone: string = EXCHANGE_TZ_FALLBACK,
 ): string {
   if (style.showTimestamp === false) return ''
-  const auto = formatShareStampLabel(event, shareStampTimezone(style.chartAxisTimezone))
+  const auto = formatShareStampLabel(event, displayTimeZone)
   if (!textContent || textContent.stamp === undefined) return auto
   const custom = String(textContent.stamp).trim()
   if (!custom) return ''
-  return isGeneratedShareStamp(event, custom) ? auto : custom
+  return isGeneratedShareStamp(event, custom, displayTimeZone) ? auto : custom
 }
 
 /**
@@ -5564,6 +5575,7 @@ function buildShareCardTextContent(
   event: PriceMovementEvent,
   companyName?: string | null,
   style: ShareCardStyle = DEFAULT_SHARE_CARD_STYLE,
+  displayTimeZone: string = EXCHANGE_TZ_FALLBACK,
 ): ShareCardTextContent {
   const symbol = String(ticker || '').toUpperCase()
   const close = formatChange(event.price_change || event.momentum)
@@ -5587,6 +5599,10 @@ function buildShareCardTextContent(
       ? geminiLine
       : pickShareSessionLineByTone(sessionOptions, tone) || geminiLine
   const reason = extractShareReasonBody(rawSummary, titleText, event)
+  const zone =
+    String(displayTimeZone || '').trim() ||
+    resolveExchangeTimeZone({ symbol }) ||
+    EXCHANGE_TZ_FALLBACK
 
   return {
     title: titleText,
@@ -5594,7 +5610,7 @@ function buildShareCardTextContent(
     price: formatSharePriceLabel(event.price),
     sessionLine,
     reason,
-    stamp: formatShareStampLabel(event, style.chartAxisTimezone || 'America/New_York'),
+    stamp: formatShareStampLabel(event, zone),
     brand: 'Track at Trigger',
   }
 }
@@ -5629,6 +5645,7 @@ async function renderMomentumTweetImage(
    * - sharp hero frame in the photo slot (above/below header or chart)
    */
   sideImageDataUrl?: string | null,
+  displayTimeZone: string = EXCHANGE_TZ_FALLBACK,
 ): Promise<{ blob: Blob; objectUrl: string; width: number; height: number } | null> {
   if (typeof document === 'undefined') return null
   await ensureShareFontsLoaded()
@@ -5637,10 +5654,14 @@ async function renderMomentumTweetImage(
   const premarket = formatChange(getPremarketChange(event))
   let isDown = Boolean(close?.negative || (!close?.positive && premarket?.negative))
   let isUp = Boolean(close?.positive || premarket?.positive) && !isDown
+  const zone =
+    String(displayTimeZone || '').trim() ||
+    resolveExchangeTimeZone({ symbol }) ||
+    EXCHANGE_TZ_FALLBACK
 
-  // Session stamp: custom text when edited; otherwise convert market ET → selected zone.
+  // Session stamp: listing exchange zone (never browser-local BST conversion).
   // Hidden when showTimestamp is off or the user cleared the field.
-  const stampLabel = resolveShareStampLabel(event, style, textContent)
+  const stampLabel = resolveShareStampLabel(event, style, textContent, zone)
 
   // Company name + Yahoo line (9:30 ET → stamp’s ET minute) in parallel
   const [companyLabel, chartSeriesFull] = await Promise.all([
@@ -6391,11 +6412,7 @@ async function renderMomentumTweetImage(
       axisTextColor: mutedText,
       series: chartSeries.length >= 2 ? chartSeries : null,
       axisMode: style.chartAxisMode === 'timestamp' ? 'timestamp' : 'elapsed',
-      axisTimezone:
-        style.chartAxisTimezone &&
-        SHARE_CHART_TIMEZONES.some((z) => z.id === style.chartAxisTimezone)
-          ? style.chartAxisTimezone
-          : 'America/New_York',
+      axisTimezone: zone,
       maxAxisLabels: style.chartAxisLabelCount ?? 5,
       lineColor: moveAccentHex,
       pointLabelMode: style.chartPointLabelMode || 'off',
@@ -7216,7 +7233,9 @@ function ShareCardLayoutControls({
   onSideImageChange,
   googleSearchQuery,
   titleIdentity,
-  shareEvent,
+  shareEvent: _shareEvent,
+  exchangeTimeZone,
+  exchangeTimeZoneLabel,
 }: {
   style: ShareCardStyle
   onChange: (next: ShareCardStyle | ((prev: ShareCardStyle) => ShareCardStyle)) => void
@@ -7232,8 +7251,11 @@ function ShareCardLayoutControls({
   googleSearchQuery?: string
   /** Used when toggling company name ↔ ticker on the image */
   titleIdentity?: { ticker: string; companyName?: string | null }
-  /** Event used to rebuild the auto timestamp when timezone changes */
+  /** Event used to rebuild the auto timestamp when exchange zone is known */
   shareEvent?: PriceMovementEvent
+  /** Listing exchange IANA zone (e.g. America/New_York) — stamps always use this */
+  exchangeTimeZone?: string | null
+  exchangeTimeZoneLabel?: string | null
 }) {
   const set = (patch: Partial<ShareCardStyle>) =>
     onChange((s) => {
@@ -7244,12 +7266,6 @@ function ShareCardLayoutControls({
   const setText = (patch: Partial<ShareCardTextContent>) => {
     if (!textContent || !onTextChange) return
     onTextChange({ ...textContent, sessionLine: textContent.sessionLine ?? '', ...patch })
-  }
-  const applyChartTimezone = (tz: ShareChartTimezone) => {
-    set({ chartAxisTimezone: tz })
-    if (!shareEvent || !textContent || !onTextChange) return
-    if (!isGeneratedShareStamp(shareEvent, textContent.stamp)) return
-    setText({ stamp: formatShareStampLabel(shareEvent, tz) })
   }
   const applyTitleMode = (mode: 'company' | 'ticker') => {
     set({ titleMode: mode })
@@ -9787,30 +9803,17 @@ function ShareCardLayoutControls({
             count when possible.
           </p>
         </div>
-        <div className="space-y-1.5">
-          <p className="text-[10px] text-muted-foreground">
-            Session stamp timezone — full convert (e.g. 3:33 PM ET → 8:33 PM BST). Chart axis
-            stays clean (0m / 9:30 AM only, no zone).
+        <div className="space-y-1.5 rounded-lg border border-border/60 bg-muted/30 px-2.5 py-2">
+          <p className="text-[10px] font-medium text-foreground">
+            Timestamps = listing exchange
           </p>
-          <div className="flex flex-wrap gap-1">
-            {SHARE_CHART_TIMEZONES.map((z) => (
-              <Button
-                key={z.id}
-                type="button"
-                size="sm"
-                variant={
-                  (style.chartAxisTimezone || 'America/New_York') === z.id
-                    ? 'default'
-                    : 'outline'
-                }
-                className="h-7 px-2 text-[11px]"
-                onClick={() => applyChartTimezone(z.id)}
-                title={z.label}
-              >
-                {z.short}
-              </Button>
-            ))}
-          </div>
+          <p className="text-[10px] text-muted-foreground">
+            {exchangeTimeZoneLabel
+              ? `${exchangeTimeZoneLabel} · ${exchangeTimeZone || EXCHANGE_TZ_FALLBACK}`
+              : exchangeTimeZone || EXCHANGE_TZ_FALLBACK}
+            {' · '}
+            no browser/local convert (MSFT stays EDT/EST, not BST).
+          </p>
         </div>
       </ShareLayoutSection>
       ) : null}
@@ -11880,6 +11883,10 @@ export default function NotificationsPage() {
       void (async () => {
         setShareImageRerendering(true)
         try {
+          const exchangeTz = tickerExchangeTimeZone(
+            tweetRenderCtx.ticker,
+            liveQuotes[String(tweetRenderCtx.ticker || '').toUpperCase()] || null,
+          )
           const image = await renderMomentumTweetImage(
             tweetRenderCtx.ticker,
             tweetRenderCtx.event,
@@ -11887,6 +11894,7 @@ export default function NotificationsPage() {
             shareCardStyle,
             tweetRenderCtx.cardText,
             shareSideImageDataUrl,
+            exchangeTz,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -11936,6 +11944,10 @@ export default function NotificationsPage() {
       void (async () => {
         setShareImageRerendering(true)
         try {
+          const exchangeTz = tickerExchangeTimeZone(
+            socialShareCtx.ticker,
+            liveQuotes[String(socialShareCtx.ticker || '').toUpperCase()] || null,
+          )
           const image = await renderMomentumTweetImage(
             socialShareCtx.ticker,
             socialShareCtx.event,
@@ -11943,6 +11955,7 @@ export default function NotificationsPage() {
             shareCardStyle,
             socialShareCtx.cardText,
             shareSideImageDataUrl,
+            exchangeTz,
           )
           if (cancelled) {
             if (image?.objectUrl) {
@@ -13209,11 +13222,16 @@ export default function NotificationsPage() {
         eventForShare,
         resolvedCompany,
       )
+      const exchangeTz = tickerExchangeTimeZone(
+        ticker,
+        liveQuotes[String(ticker || '').toUpperCase()] || null,
+      )
       const cardText = buildShareCardTextContent(
         ticker,
         eventForShare,
         resolvedCompany,
         style,
+        exchangeTz,
       )
       const image = await renderMomentumTweetImage(
         ticker,
@@ -13222,6 +13240,7 @@ export default function NotificationsPage() {
         style,
         cardText,
         shareSideImageDataUrl,
+        exchangeTz,
       )
       setSocialShareCtx((prev) => {
         if (prev?.imageUrl) {
@@ -14476,6 +14495,7 @@ export default function NotificationsPage() {
       const priceTimestamp =
         sourceTimestamp ||
         (liveQuotesLastCheckedAt ? new Date(liveQuotesLastCheckedAt).toISOString() : null)
+      const displayTimeZone = tickerExchangeTimeZone(activeTicker, activeLiveQuote)
       return {
         label,
         price: price ?? null,
@@ -14486,8 +14506,9 @@ export default function NotificationsPage() {
         updatedAt: sourceTimestamp,
         priceTimeLabel: statusOnly
           ? null
-          : formatMarketTimestamp(priceTimestamp, 'America/New_York'),
+          : formatMarketTimestamp(priceTimestamp, displayTimeZone),
         priceTimestamp: statusOnly ? null : priceTimestamp,
+        displayTimeZone,
         statusOnly,
       }
     }
@@ -19770,11 +19791,16 @@ export default function NotificationsPage() {
                   }
                   onTextReset={() => {
                     if (!socialShareCtx) return
+                    const exchangeTz = tickerExchangeTimeZone(
+                      socialShareCtx.ticker,
+                      liveQuotes[String(socialShareCtx.ticker || '').toUpperCase()] || null,
+                    )
                     const defaults = buildShareCardTextContent(
                       socialShareCtx.ticker,
                       socialShareCtx.event,
                       socialShareCtx.companyName,
                       shareCardStyle,
+                      exchangeTz,
                     )
                     setSocialShareCtx((prev) =>
                       prev ? { ...prev, cardText: defaults } : prev,
@@ -19793,6 +19819,15 @@ export default function NotificationsPage() {
                     companyName: socialShareCtx.companyName,
                   }}
                   shareEvent={socialShareCtx.event}
+                  exchangeTimeZone={tickerExchangeTimeZone(
+                    socialShareCtx.ticker,
+                    liveQuotes[String(socialShareCtx.ticker || '').toUpperCase()] || null,
+                  )}
+                  exchangeTimeZoneLabel={
+                    liveQuotes[String(socialShareCtx.ticker || '').toUpperCase()]
+                      ?.exchange ||
+                    socialShareCtx.ticker
+                  }
                 />
               </div>
             </div>
@@ -20123,11 +20158,17 @@ export default function NotificationsPage() {
                     }
                     onTextReset={() => {
                       if (!tweetRenderCtx) return
+                      const exchangeTz = tickerExchangeTimeZone(
+                        tweetRenderCtx.ticker,
+                        liveQuotes[String(tweetRenderCtx.ticker || '').toUpperCase()] ||
+                          null,
+                      )
                       const defaults = buildShareCardTextContent(
                         tweetRenderCtx.ticker,
                         tweetRenderCtx.event,
                         tweetRenderCtx.companyName,
                         shareCardStyle,
+                        exchangeTz,
                       )
                       setTweetRenderCtx((prev) =>
                         prev ? { ...prev, cardText: defaults } : prev,
@@ -20150,6 +20191,22 @@ export default function NotificationsPage() {
                         : undefined
                     }
                     shareEvent={tweetRenderCtx?.event}
+                    exchangeTimeZone={
+                      tweetRenderCtx
+                        ? tickerExchangeTimeZone(
+                            tweetRenderCtx.ticker,
+                            liveQuotes[
+                              String(tweetRenderCtx.ticker || '').toUpperCase()
+                            ] || null,
+                          )
+                        : EXCHANGE_TZ_FALLBACK
+                    }
+                    exchangeTimeZoneLabel={
+                      tweetRenderCtx
+                        ? liveQuotes[String(tweetRenderCtx.ticker || '').toUpperCase()]
+                            ?.exchange || tweetRenderCtx.ticker
+                        : null
+                    }
                   />
                 </div>
               ) : null}

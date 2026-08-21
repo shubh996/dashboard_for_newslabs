@@ -21,9 +21,11 @@ import {
 import {
   buildSessionQuote,
   inferMarketSession,
+  isYahooRegularMarketState,
   normalizeYahooChart,
   resolveMarketSession,
   resolveSessionOpenPrint,
+  sanitizeMomentumCandles,
 } from './candles.js'
 import {
   isUsEquityTriggerOpen,
@@ -56,7 +58,11 @@ import {
   strongestMomentum,
 } from './returns.js'
 import { findEpisodeThresholdCrosses, findThresholdCrosses } from './detector.js'
-import { advanceEpisode, forceStartEpisodeFromWindow } from './episode.js'
+import {
+  advanceEpisode,
+  closeActiveEpisodeFullMarketClose,
+  forceStartEpisodeFromWindow,
+} from './episode.js'
 import { deliverEpisodeEvents } from './delivery.js'
 import { handleAutoStartResearchAlerts } from './autoStartAlert.js'
 import { hydrateTicker, persistTick } from './persist.js'
@@ -251,14 +257,30 @@ export async function fetchIntradayCandles(ticker) {
   const previousClose =
     sessionQuote.previousClose ?? normalized.previousClose
 
+  // Strip Yahoo pre/post 1m garbage prints before any lookback/reference use.
+  // Live quote stays authoritative; bad hist closes were freezing wrong refs.
+  const rawCandles = normalized.candles || []
+  const candles = sanitizeMomentumCandles(rawCandles, {
+    anchors: [
+      currentPrice,
+      sessionQuote?.regular?.price,
+      previousClose,
+      sessionQuote?.postMarket?.price,
+      sessionQuote?.preMarket?.price,
+    ],
+  })
+
   return {
     ...normalized,
+    candles,
     symbol,
     currentPrice,
     previousClose,
     quote,
     sessionQuote,
     dailyCandles,
+    candlesRawCount: rawCandles.length,
+    candlesSanitizedCount: candles.length,
   }
 }
 
@@ -705,6 +727,53 @@ export async function runMomentumTick(opts = {}) {
       sessionQuote,
       candles.length ? candles[candles.length - 1].t : null,
     )
+
+    // Cross-exchange run gate: Yahoo marketState only (US / India / UK / …).
+    // REGULAR (or OPEN) → evaluate. Anything else → end episodes + skip.
+    // Keeps polling so the next REGULAR print can wake the symbol naturally.
+    const yahooMarketState = sessionQuote?.marketState ?? quote?.marketState ?? null
+    if (
+      yahooMarketState != null &&
+      String(yahooMarketState).trim() !== '' &&
+      !isYahooRegularMarketState(yahooMarketState)
+    ) {
+      const nowIso = new Date().toISOString()
+      const closed = closeActiveEpisodeFullMarketClose(symbol, {
+        nowIso,
+        marketSession: resolveMarketSession(yahooMarketState, Date.now()),
+      })
+      if (closed?.closedEpisode) {
+        void persistTick(symbol, null, closed.events || [], closed.closedEpisode).catch(
+          () => {},
+        )
+      }
+      store.pushLog(
+        symbol,
+        'info',
+        `Yahoo marketState=${String(yahooMarketState).toUpperCase()} · not REGULAR · episodes ended · skip evaluate`,
+        'momentum',
+        { marketState: yahooMarketState },
+      )
+      store.setLastSnapshot(symbol, {
+        ticker: symbol,
+        timestamp: nowIso,
+        marketSession: resolveMarketSession(yahooMarketState, Date.now()),
+        currentPrice,
+        previousClose,
+        marketState: yahooMarketState,
+        yahooRegularGate: false,
+      })
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'yahoo-not-regular',
+        ticker: symbol,
+        marketState: yahooMarketState,
+        closedEpisode: closed?.closedEpisode || null,
+        episode: null,
+      }
+    }
+
     const marketGate = evaluateSymbolGate({
       symbol,
       nowUtc: Date.now(),

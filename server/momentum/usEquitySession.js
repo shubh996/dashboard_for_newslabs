@@ -93,7 +93,8 @@ export function etWallToUtcMs(y, mo, d, hour, minute) {
 }
 
 /**
- * Trigger equity window: Sunday 20:00 ET inclusive → Friday 20:00 ET exclusive.
+ * Yahoo / ATS extended window: Sunday 20:00 ET inclusive → Friday 20:00 ET exclusive.
+ * Used for display / tape labels — NOT for momentum engine run/sleep.
  * @param {number} [ms]
  */
 export function isUsEquityTriggerOpen(ms = Date.now()) {
@@ -102,6 +103,19 @@ export function isUsEquityTriggerOpen(ms = Date.now()) {
   if (weekday === 'Sun') return minutes >= US_EQUITY_MIN.overnightStart
   if (weekday === 'Fri') return minutes < US_EQUITY_MIN.ahEnd
   return true
+}
+
+/**
+ * Cash regular trading hours only: Mon–Fri 09:30 ≤ t < 16:00 America/New_York.
+ * Momentum engine runs equities only inside this window; outside → sleep + end episodes.
+ * @param {number} [ms]
+ */
+export function isUsEquityRthOpen(ms = Date.now()) {
+  const { weekday, minutes } = etPartsAt(ms)
+  if (weekday === 'Sat' || weekday === 'Sun') return false
+  return (
+    minutes >= US_EQUITY_MIN.rthStart && minutes < US_EQUITY_MIN.rthEnd
+  )
 }
 
 /**

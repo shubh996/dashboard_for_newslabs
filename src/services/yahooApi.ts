@@ -149,6 +149,8 @@ export type YahooLiveQuote = {
    */
   marketState: string | null
   exchange: string | null
+  /** Yahoo IANA zone for the listing (e.g. America/New_York, Europe/London). */
+  exchangeTimezoneName?: string | null
   liveSource?: 'yahoo-streamer' | 'yahoo-quote' | string | null
   streamReceivedAt?: string | null
   website?: string | null

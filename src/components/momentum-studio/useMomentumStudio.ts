@@ -40,6 +40,9 @@ export function useMomentumStudio() {
   const [testModeEnabled, setTestModeEnabled] = useState(false)
   const [testModeSaving, setTestModeSaving] = useState(false)
   const [tickBusy, setTickBusy] = useState(false)
+  const [endingEpisodeTicker, setEndingEpisodeTicker] = useState<string | null>(
+    null,
+  )
 
   const classTickers = useMemo(
     () => tickers.filter((t) => t.assetClass === assetClass),
@@ -255,6 +258,74 @@ export function useMomentumStudio() {
     }
   }
 
+  /** Manually end a live episode from the Active episodes rail (no push). */
+  const endActiveEpisode = useCallback(
+    async (ticker: string, row?: ActiveEpisodeRow | null) => {
+      const symbol = String(ticker || '').trim().toUpperCase()
+      if (!symbol || endingEpisodeTicker) return false
+      const dir = row?.direction || 'episode'
+      const peak =
+        row && Number.isFinite(Number(row.peakMovePercent))
+          ? Number(row.peakMovePercent)
+          : null
+      const peakLabel =
+        peak != null
+          ? `${peak > 0 ? '+' : ''}${peak.toFixed(2)}%`
+          : ''
+      const ok = window.confirm(
+        `End the active ${dir} episode for ${symbol}?${
+          peakLabel ? `\nPeak so far: ${peakLabel}` : ''
+        }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
+      )
+      if (!ok) return false
+
+      setEndingEpisodeTicker(symbol)
+      try {
+        const res = await fetch(
+          `/api/momentum/${encodeURIComponent(symbol)}/end-episode`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'MANUAL' }),
+          },
+        )
+        const body = (await res.json().catch(() => ({}))) as {
+          error?: string
+          status?: StudioStatus
+        }
+        if (!res.ok) {
+          throw new Error(body.error || `End failed (${res.status})`)
+        }
+        if (
+          activeTicker &&
+          activeTicker.toUpperCase() === symbol &&
+          body.status
+        ) {
+          setStatus(body.status)
+        }
+        await loadActiveEpisodes()
+        if (railEntityFocus) {
+          await loadEpisodeHistory({ refresh: true })
+        }
+        return true
+      } catch (err) {
+        window.alert(
+          err instanceof Error ? err.message : 'Failed to end episode',
+        )
+        return false
+      } finally {
+        setEndingEpisodeTicker(null)
+      }
+    },
+    [
+      activeTicker,
+      endingEpisodeTicker,
+      loadActiveEpisodes,
+      loadEpisodeHistory,
+      railEntityFocus,
+    ],
+  )
+
   /**
    * Select a history/active row: stay on episodes view.
    * Right column switches to that entity’s episodes (active + history).
@@ -340,6 +411,7 @@ export function useMomentumStudio() {
     testModeEnabled,
     testModeSaving,
     tickBusy,
+    endingEpisodeTicker,
     loadWatchlist,
     loadStatus,
     loadActiveEpisodes,
@@ -347,6 +419,7 @@ export function useMomentumStudio() {
     toggleTestMode,
     confirmTestMode,
     runTick,
+    endActiveEpisode,
     selectActiveEpisode,
     livePrice,
     dayPct,

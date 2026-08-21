@@ -64,7 +64,10 @@ export function evaluateSymbolGate(input) {
   let reason = session.reason
 
   if (SLEEP_STATES.has(session.state)) {
-    if (freshness.state === 'FRESH') {
+    // RTH-only equities still get fresh Yahoo pre/post prints after the cash
+    // bell — that is expected, not a profile bug. Only escalate when the
+    // profile claims extended hours are part of the trading calendar.
+    if (freshness.state === 'FRESH' && profile.supportsExtendedHours) {
       engineGate = 'CONFLICT'
       reason = `Calendar ${session.state} but Yahoo print is fresh — check profile`
     } else {

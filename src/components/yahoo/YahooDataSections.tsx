@@ -16,6 +16,7 @@ import {
 } from '@/components/tickerDashboard/shared'
 import { YahooInteractiveChart } from '@/components/yahoo/YahooInteractiveChart'
 import { fetchYahooQuote, type YahooLiveQuote } from '@/services/yahooApi'
+import { resolveExchangeTimeZone } from '@/lib/exchangeTimeZone'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import {
@@ -788,6 +789,11 @@ export function YahooOverviewSection({ data }: { data: YahooStructuredData }) {
         defaultRange="1y"
         height={360}
         borderless
+        timeZone={resolveExchangeTimeZone({
+          exchangeTimezoneName: liveQuote?.exchangeTimezoneName,
+          exchange: liveQuote?.exchange || data.exchange,
+          symbol,
+        })}
       />
 
       {/* Identity (multi-col) + Key snapshot beside it */}
@@ -926,6 +932,10 @@ export function YahooQuoteSection({ data }: { data: YahooStructuredData }) {
         initialChart={data.chart}
         title="Price chart"
         defaultRange="1y"
+        timeZone={resolveExchangeTimeZone({
+          exchange: data.exchange,
+          symbol: data.symbol,
+        })}
       />
     </div>
   )
@@ -2207,6 +2217,14 @@ export function YahooHistoricalSection({ data }: { data: YahooStructuredData }) 
         title="Price chart (historical)"
         defaultRange="1y"
         height={340}
+        timeZone={resolveExchangeTimeZone({
+          exchangeTimezoneName:
+            typeof chart?.meta?.exchangeTimezoneName === 'string'
+              ? chart.meta.exchangeTimezoneName
+              : null,
+          exchange: data.exchange,
+          symbol: data.symbol,
+        })}
       />
       {chart?.meta ? <ObjectTable title="Chart meta" data={chart.meta} description="Exchange, currency, ranges" /> : null}
       {!chart ? (

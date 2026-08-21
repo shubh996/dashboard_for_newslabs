@@ -8,7 +8,11 @@ import {
   type YahooChartRange,
 } from '@/services/yahooApi'
 import { cn } from '@/lib/utils'
-import { withLocalTimeZone } from '@/lib/localTimeZone'
+import {
+  EXCHANGE_TZ_FALLBACK,
+  resolveExchangeTimeZone,
+  withExchangeTimeZone,
+} from '@/lib/exchangeTimeZone'
 
 const RANGES: { id: YahooChartRange; label: string }[] = [
   { id: '1d', label: '1D' },
@@ -70,10 +74,32 @@ function cacheKey(range: YahooChartRange, interval: string) {
   return `${range}:${interval}`
 }
 
+function chartMetaTimeZone(chart: unknown): string | null {
+  const meta =
+    (chart as { meta?: Record<string, unknown> } | null)?.meta ||
+    (chart as { chart?: { result?: Array<{ meta?: Record<string, unknown> }> } } | null)
+      ?.chart?.result?.[0]?.meta
+  if (!meta) return null
+  const named = String(meta.exchangeTimezoneName || '').trim()
+  if (named) return named
+  return null
+}
+
+function formatInZone(
+  d: Date,
+  timeZone: string,
+  opts: Intl.DateTimeFormatOptions,
+  withZone: boolean,
+): string {
+  const value = d.toLocaleString('en-US', { ...opts, timeZone })
+  return withZone ? withExchangeTimeZone(value, d, timeZone) : value
+}
+
 function parseQuotes(
   chart: unknown,
   interval: string,
-  showTimeZone: boolean,
+  timeZone: string,
+  withZoneLabel: boolean,
 ): ChartPoint[] {
   const quotes = (chart as { quotes?: Record<string, unknown>[] } | null)?.quotes
   if (!Array.isArray(quotes)) return []
@@ -91,23 +117,23 @@ function parseQuotes(
       t: d.getTime(),
       date: d.toISOString(),
       label: intraday
-        ? showTimeZone
-          ? withLocalTimeZone(
-              d.toLocaleString('en-US', {
-                month: 'short',
-                day: 'numeric',
-                hour: 'numeric',
-                minute: '2-digit',
-              }),
-              d,
-            )
-          : d.toLocaleString('en-US', {
+        ? formatInZone(
+            d,
+            timeZone,
+            {
               month: 'short',
               day: 'numeric',
               hour: 'numeric',
               minute: '2-digit',
-            })
-        : d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+            },
+            withZoneLabel,
+          )
+        : d.toLocaleDateString('en-US', {
+            timeZone,
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+          }),
       close,
       open: rawNum(row.open),
       high: rawNum(row.high),
@@ -132,35 +158,39 @@ function formatAxisTick(
   point: ChartPoint,
   range: YahooChartRange,
   interval: string,
-  opts?: { includeYear?: boolean; showTimeZone?: boolean },
+  timeZone: string,
+  opts?: { includeYear?: boolean; withZoneLabel?: boolean },
 ): string {
   const d = new Date(point.t)
+  const withZone = Boolean(opts?.withZoneLabel)
   if (interval === '1m' || interval === '2m' || interval === '5m' || range === '1d') {
-    const value = d.toLocaleTimeString('en-US', {
-      hour: 'numeric',
-      minute: '2-digit',
-    })
-    return opts?.showTimeZone ? withLocalTimeZone(value, d) : value
+    return formatInZone(
+      d,
+      timeZone,
+      { hour: 'numeric', minute: '2-digit', hour12: true },
+      withZone,
+    )
   }
   if (isIntradayInterval(interval) || range === '5d') {
-    const value = d.toLocaleString('en-US', {
-      weekday: 'short',
-      hour: 'numeric',
-      minute: '2-digit',
-    })
-    return opts?.showTimeZone ? withLocalTimeZone(value, d) : value
+    return formatInZone(
+      d,
+      timeZone,
+      { weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true },
+      withZone,
+    )
   }
   if (range === '1mo' || range === '3mo') {
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    return d.toLocaleDateString('en-US', { timeZone, month: 'short', day: 'numeric' })
   }
   if (range === '6mo' || range === 'ytd' || range === '1y') {
     return d.toLocaleDateString('en-US', {
+      timeZone,
       month: 'short',
       day: 'numeric',
       year: opts?.includeYear ? '2-digit' : undefined,
     })
   }
-  return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' })
+  return d.toLocaleDateString('en-US', { timeZone, month: 'short', year: '2-digit' })
 }
 
 /**
@@ -171,16 +201,17 @@ function buildTimeAxisTicks(
   points: ChartPoint[],
   range: YahooChartRange,
   interval: string,
+  timeZone: string,
   maxTicks = 7,
-  showTimeZone = false,
+  withZoneLabel = false,
 ): { index: number; label: string }[] {
   if (points.length === 0) return []
   if (points.length === 1) {
     return [{
       index: 0,
-      label: formatAxisTick(points[0], range, interval, {
+      label: formatAxisTick(points[0], range, interval, timeZone, {
         includeYear: true,
-        showTimeZone,
+        withZoneLabel,
       }),
     }]
   }
@@ -193,9 +224,9 @@ function buildTimeAxisTicks(
     const index = count === 1 ? 0 : Math.round((i / (count - 1)) * (points.length - 1))
     const point = points[index]
     const includeYear = i === 0 || i === count - 1 || range === '1y' || range === '6mo' || range === 'ytd'
-    const label = formatAxisTick(point, range, interval, {
+    const label = formatAxisTick(point, range, interval, timeZone, {
       includeYear,
-      showTimeZone,
+      withZoneLabel,
     })
     if (seen.has(label) && i !== 0 && i !== count - 1) continue
     seen.add(label)
@@ -205,9 +236,9 @@ function buildTimeAxisTicks(
   if (ticks[0]?.index !== 0) {
     ticks.unshift({
       index: 0,
-      label: formatAxisTick(points[0], range, interval, {
+      label: formatAxisTick(points[0], range, interval, timeZone, {
         includeYear: true,
-        showTimeZone,
+        withZoneLabel,
       }),
     })
   }
@@ -215,9 +246,9 @@ function buildTimeAxisTicks(
   if (ticks[ticks.length - 1]?.index !== lastIdx) {
     ticks.push({
       index: lastIdx,
-      label: formatAxisTick(points[lastIdx], range, interval, {
+      label: formatAxisTick(points[lastIdx], range, interval, timeZone, {
         includeYear: true,
-        showTimeZone,
+        withZoneLabel,
       }),
     })
   }
@@ -241,7 +272,8 @@ export function YahooInteractiveChart({
   defaultRange = '1y',
   borderless = false,
   compact = false,
-  showTimeZone = false,
+  timeZone,
+  showTimeZone = true,
 }: {
   ticker: string
   /** Optional already-fetched chart payload used as a daily seed for longer ranges. */
@@ -256,7 +288,12 @@ export function YahooInteractiveChart({
    * No range/interval controls, hover chrome, or period footer.
    */
   compact?: boolean
-  /** Append the browser's actual zone (BST/GMT, EDT/EST, IST, GMT±…) to times. */
+  /**
+   * IANA exchange timezone for axis / hover labels (e.g. America/New_York).
+   * Falls back to chart meta, then symbol heuristics — never browser local.
+   */
+  timeZone?: string | null
+  /** Append short zone name (EDT/BST/IST…). Default true when timeZone resolves. */
   showTimeZone?: boolean
 }) {
   const [range, setRange] = useState<YahooChartRange>(defaultRange)
@@ -339,9 +376,21 @@ export function YahooInteractiveChart({
     setBarInterval(defaultIntervalFor(nextRange))
   }
 
+  const resolvedTimeZone = useMemo(() => {
+    if (timeZone && String(timeZone).trim()) return String(timeZone).trim()
+    const fromMeta = chartMetaTimeZone(chart)
+    if (fromMeta) {
+      return resolveExchangeTimeZone({
+        exchangeTimezoneName: fromMeta,
+        symbol: ticker,
+      })
+    }
+    return resolveExchangeTimeZone({ symbol: ticker }) || EXCHANGE_TZ_FALLBACK
+  }, [timeZone, chart, ticker])
+
   const allPoints = useMemo(
-    () => parseQuotes(chart, activeInterval, showTimeZone),
-    [chart, activeInterval, showTimeZone],
+    () => parseQuotes(chart, activeInterval, resolvedTimeZone, showTimeZone),
+    [chart, activeInterval, resolvedTimeZone, showTimeZone],
   )
 
   // For ranges served from the long daily seed, filter client-side so switching
@@ -349,14 +398,23 @@ export function YahooInteractiveChart({
   const filteredPoints = useMemo(() => {
     if (!allPoints.length) return []
 
-    // 1D: keep only the most recent trading day of bars (handles weekends).
+    // 1D: keep only the most recent trading day of bars (exchange calendar, not browser local).
     if (range === '1d') {
-      const lastDay = new Date(allPoints[allPoints.length - 1].t)
-      const dayKey = `${lastDay.getFullYear()}-${lastDay.getMonth()}-${lastDay.getDate()}`
-      const dayPoints = allPoints.filter((p) => {
-        const d = new Date(p.t)
-        return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}` === dayKey
-      })
+      const dayKeyFor = (ms: number) => {
+        try {
+          return new Intl.DateTimeFormat('en-CA', {
+            timeZone: resolvedTimeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(new Date(ms))
+        } catch {
+          const d = new Date(ms)
+          return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`
+        }
+      }
+      const dayKey = dayKeyFor(allPoints[allPoints.length - 1].t)
+      const dayPoints = allPoints.filter((p) => dayKeyFor(p.t) === dayKey)
       return dayPoints.length >= 2 ? dayPoints : allPoints
     }
 
@@ -376,7 +434,7 @@ export function YahooInteractiveChart({
     if (cutoff == null) return allPoints
     const sliced = allPoints.filter((p) => p.t >= cutoff)
     return sliced.length >= 2 ? sliced : allPoints
-  }, [allPoints, range])
+  }, [allPoints, range, resolvedTimeZone])
 
   // Keep more points for 1m bars so the minute scale stays useful.
   const maxPlotPoints = activeInterval === '1m' || activeInterval === '2m' ? 600 : 400
@@ -412,6 +470,7 @@ export function YahooInteractiveChart({
       points,
       range,
       activeInterval,
+      resolvedTimeZone,
       tickCount,
       showTimeZone,
     ).map((tick) => ({
@@ -448,6 +507,7 @@ export function YahooInteractiveChart({
     compact,
     padL,
     padT,
+    resolvedTimeZone,
     showTimeZone,
   ])
 

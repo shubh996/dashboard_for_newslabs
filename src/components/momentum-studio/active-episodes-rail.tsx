@@ -1,4 +1,5 @@
 import { IconTrendingDown, IconTrendingUp } from '@tabler/icons-react'
+import { Loader2 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -124,6 +125,11 @@ export function ActiveEpisodesRail({
                     String(row.ticker || '').toUpperCase() === ticker
                   }
                   onSelect={() => studio.selectActiveEpisode(row)}
+                  onEnd={() => void studio.endActiveEpisode(row.ticker, row)}
+                  ending={
+                    studio.endingEpisodeTicker ===
+                    String(row.ticker || '').toUpperCase()
+                  }
                 />
               ))
             )
@@ -151,17 +157,29 @@ export function ActiveEpisodesRail({
                   No live ACTIVE episode for {ticker}
                 </p>
               ) : null}
-              {entityList.map((row) => (
-                <EpisodeRowCard
-                  key={`${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
-                  row={row}
-                  selected={
-                    String(row.status || '').toUpperCase() === 'ACTIVE'
-                  }
-                  onSelect={() => studio.selectActiveEpisode(row)}
-                  showStatus
-                />
-              ))}
+              {entityList.map((row) => {
+                const live =
+                  String(row.status || '').toUpperCase() === 'ACTIVE'
+                return (
+                  <EpisodeRowCard
+                    key={`${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
+                    row={row}
+                    selected={live}
+                    onSelect={() => studio.selectActiveEpisode(row)}
+                    showStatus
+                    onEnd={
+                      live
+                        ? () => void studio.endActiveEpisode(row.ticker, row)
+                        : undefined
+                    }
+                    ending={
+                      live &&
+                      studio.endingEpisodeTicker ===
+                        String(row.ticker || '').toUpperCase()
+                    }
+                  />
+                )
+              })}
               <Button
                 type="button"
                 size="sm"
@@ -189,31 +207,39 @@ function EpisodeRowCard({
   row,
   selected,
   onSelect,
+  onEnd,
+  ending,
   showStatus,
 }: {
   row: ActiveEpisodeRow
   selected?: boolean
   onSelect: () => void
+  /** Shown on the right for live ACTIVE rows — ends tracking (no push). */
+  onEnd?: () => void
+  ending?: boolean
   showStatus?: boolean
 }) {
   const up = row.direction !== 'DOWN'
   const Trend = up ? IconTrendingUp : IconTrendingDown
   const isLive = String(row.status || 'ACTIVE').toUpperCase() === 'ACTIVE'
   const move = row.currentMovePercent ?? row.peakMovePercent ?? null
+  const canEnd = Boolean(onEnd) && isLive
 
   return (
-    <button
-      type="button"
-      onClick={onSelect}
+    <div
       className={cn(
-        'w-full rounded-lg border px-2.5 py-2 text-left transition-colors',
+        'w-full rounded-lg border px-2.5 py-2 transition-colors',
         selected
           ? 'border-foreground/20 bg-muted/50'
           : 'bg-background hover:bg-muted/30',
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
+        <button
+          type="button"
+          onClick={onSelect}
+          className="min-w-0 flex-1 text-left"
+        >
           <p className="truncate text-sm font-semibold">
             {row.ticker}
             <span className="ml-1.5 font-normal text-muted-foreground tabular-nums">
@@ -223,8 +249,15 @@ function EpisodeRowCard({
           <p className="mt-0.5 text-[11px] text-muted-foreground">
             {row.detectedWindow || '—'} · {fmtDateTime(row.episodeStartedAt)}
           </p>
-        </div>
-        <div className="flex shrink-0 flex-col items-end gap-1">
+          {!showStatus ? (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              {String(row.direction || '—')} ·{' '}
+              {formatEpisodeState(row.state || row.status)}
+              {row.currentPrice != null ? ` · ${fmtPrice(row.currentPrice)}` : ''}
+            </p>
+          ) : null}
+        </button>
+        <div className="flex shrink-0 flex-col items-end gap-1.5">
           {showStatus ? (
             <Badge variant={isLive ? 'default' : 'outline'} className="text-[10px]">
               {formatEpisodeState(row.status || row.state)}
@@ -240,14 +273,32 @@ function EpisodeRowCard({
               {fmtPct(move)}
             </span>
           ) : null}
+          {canEnd ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-[11px] text-rose-700 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
+              disabled={ending}
+              title={`End active episode for ${row.ticker}`}
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                onEnd?.()
+              }}
+            >
+              {ending ? (
+                <>
+                  <Loader2 className="size-3 animate-spin" />
+                  Ending…
+                </>
+              ) : (
+                'End'
+              )}
+            </Button>
+          ) : null}
         </div>
       </div>
-      {!showStatus ? (
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          {String(row.direction || '—')} · {formatEpisodeState(row.state || row.status)}
-          {row.currentPrice != null ? ` · ${fmtPrice(row.currentPrice)}` : ''}
-        </p>
-      ) : null}
-    </button>
+    </div>
   )
 }

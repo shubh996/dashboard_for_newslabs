@@ -7,7 +7,14 @@
  *                 testers are always included whether or not they subscribe.
  *
  * Persist: data/momentum-test-mode.json (survives restarts on disk hosts).
- * Env MOMENTUM_TEST_MODE=1 forces on at boot (file still wins after UI toggle).
+ *
+ * Env MOMENTUM_TEST_MODE wins over the JSON file and the UI toggle:
+ *   =1 / true / on  → always allowlist-only (safe for localhost)
+ *   =0 / false / off → always live recipients
+ *   unset           → use data/momentum-test-mode.json (UI)
+ *
+ * Put MOMENTUM_TEST_MODE=1 in .env.local so a local API never blasts prod users
+ * even if the JSON file still says enabled:false.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -61,9 +68,23 @@ let selectedDeviceIds = ALWAYS_NOTIFY_DEVICES.map((d) => d.device_id)
 /** @type {string[]} */
 let selectedTokens = ALWAYS_NOTIFY_DEVICES.map((d) => d.expo_push_token)
 
-function envWantsTestModeOn() {
+/**
+ * @returns {boolean|null} true/false when env forces a value; null when unset
+ */
+function envTestModeOverride() {
   const v = String(process.env.MOMENTUM_TEST_MODE || '').trim().toLowerCase()
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes'
+  if (v === '1' || v === 'true' || v === 'on' || v === 'yes') return true
+  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false
+  return null
+}
+
+function envWantsTestModeOn() {
+  return envTestModeOverride() === true
+}
+
+/** True when .env forces allowlist-only (typical localhost .env.local). */
+export function isTestModeForcedByEnv() {
+  return envTestModeOverride() === true
 }
 
 function defaultAllowlist() {
@@ -178,6 +199,9 @@ function persistToDisk() {
 loadFromDisk()
 
 export function isTestModeEnabled() {
+  const ov = envTestModeOverride()
+  if (ov === true) return true
+  if (ov === false) return false
   return testModeEnabled
 }
 
@@ -339,7 +363,21 @@ export function getTestModeAllowlistRecipients(appKey = 'trigger') {
  * @returns {ReturnType<typeof getTestModeSnapshot>}
  */
 export function setTestModeEnabled(enabled, allowlist = undefined) {
-  testModeEnabled = Boolean(enabled)
+  const wantOn = Boolean(enabled)
+  const ov = envTestModeOverride()
+  if (ov === true && !wantOn) {
+    console.warn(
+      '[testMode] MOMENTUM_TEST_MODE=1 in env — staying ON (allowlist-only). Remove or set MOMENTUM_TEST_MODE=0 to allow live pushes.',
+    )
+    testModeEnabled = true
+  } else if (ov === false && wantOn) {
+    console.warn(
+      '[testMode] MOMENTUM_TEST_MODE=0 in env — staying OFF. Set MOMENTUM_TEST_MODE=1 (or unset) to use Test Mode.',
+    )
+    testModeEnabled = false
+  } else {
+    testModeEnabled = wantOn
+  }
   if (allowlist && typeof allowlist === 'object') {
     if (
       'selectedDeviceIds' in allowlist ||
@@ -350,7 +388,7 @@ export function setTestModeEnabled(enabled, allowlist = undefined) {
   }
   persistToDisk()
   console.log(
-    `[testMode] ${testModeEnabled ? 'ON' : 'OFF'} · allowlist ${selectedTokens.length} token(s) / ${selectedDeviceIds.length} id(s)`,
+    `[testMode] ${isTestModeEnabled() ? 'ON' : 'OFF'}${ov !== null ? ' (env)' : ''} · allowlist ${selectedTokens.length} token(s) / ${selectedDeviceIds.length} id(s)`,
   )
   return getTestModeSnapshot()
 }
@@ -362,10 +400,14 @@ export function getTestModeSnapshot() {
   const alwaysList = listAlwaysNotifyDevices()
   const allow = getSelectedAllowlist()
   const alwaysPrimary = alwaysList[0] || null
+  const enabled = isTestModeEnabled()
+  const forcedByEnv = envTestModeOverride()
   return {
-    enabled: testModeEnabled,
+    enabled,
+    /** When non-null, MOMENTUM_TEST_MODE env is locking the mode */
+    forcedByEnv,
     /** True only when Test Mode is ON (or explicit MOMENTUM_DUMMY_RESEARCH=1 handled in config) */
-    dummyResearch: testModeEnabled,
+    dummyResearch: enabled,
     /** @deprecated single-device shape — prefer alwaysNotifyDevices */
     alwaysNotify: alwaysPrimary
       ? {
@@ -379,11 +421,13 @@ export function getTestModeSnapshot() {
     alwaysNotifyDevices: alwaysList,
     selectedAllowlist: allow,
     /** Who receives pushes in the current mode (for UI detail) */
-    recipients: testModeEnabled
+    recipients: enabled
       ? {
           mode: 'test',
           description:
-            'Only the selected devices from the Test Mode picker (all others blocked)',
+            forcedByEnv === true
+              ? 'MOMENTUM_TEST_MODE=1 — only selected allowlist Expo tokens (local-safe)'
+              : 'Only the selected devices from the Test Mode picker (all others blocked)',
           devices: getTestModeAllowlistRecipients('trigger').map((r) => ({
             device_id: r.device_id,
             expo_push_token: r.expo_push_token,
@@ -400,8 +444,8 @@ export function getTestModeSnapshot() {
           perplexity: 'real',
         },
     /** Human summary for settings copy */
-    summary: testModeEnabled
-      ? `Test mode ON — ${allow.selectedTokens.length || allow.selectedDeviceIds.length || ALWAYS_NOTIFY_DEVICES.length} selected device(s); Perplexity is dummy.`
+    summary: enabled
+      ? `Test mode ON${forcedByEnv === true ? ' (env)' : ''} — ${allow.selectedTokens.length || allow.selectedDeviceIds.length || ALWAYS_NOTIFY_DEVICES.length} selected device(s); Perplexity is dummy.`
       : 'Test mode OFF — subscribers get pushes; both always-notify testers included; real Perplexity.',
   }
 }

@@ -67,6 +67,7 @@ export {
 } from './marketSessionBulletin.js'
 export {
   isTestModeEnabled,
+  isTestModeForcedByEnv,
   setTestModeEnabled,
   getTestModeSnapshot,
   ALWAYS_NOTIFY_DEVICE,

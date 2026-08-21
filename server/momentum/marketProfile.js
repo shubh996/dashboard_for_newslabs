@@ -22,6 +22,7 @@ const DEFAULTS = {
     holidayCalendarId: 'NASDAQ',
     freshnessGraceSec: 240,
     pollGraceMultiplier: 2,
+    // Poll window is 24×5; evaluate only when Yahoo marketState is REGULAR.
     supportsExtendedHours: true,
   },
   [SESSION_POLICY.FX_SPOT_24X5]: {

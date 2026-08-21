@@ -100,7 +100,11 @@ import {
 import type { YahooSearchResult } from '@/types/yahoo'
 import { resolveYahooActiveSession } from '@/lib/yahooMarketSession'
 import { YahooFinanceWithMarketState } from '@/components/yahoo/YahooMarketStateLabel'
-import { timeZoneSuffix, withLocalTimeZone } from '@/lib/localTimeZone'
+import { timeZoneSuffix } from '@/lib/localTimeZone'
+import {
+  formatExchangeTime,
+  resolveExchangeTimeZone,
+} from '@/lib/exchangeTimeZone'
 
 type ReturnsMap = {
   '1m'?: number | null
@@ -3062,62 +3066,54 @@ function fmtPrice(
   return `${body} ${cur}`
 }
 
+/** Active listing timezone for Momentum quote stamps (exchange, not browser local). */
+let momentumDisplayTimeZone = 'America/New_York'
+
+function setMomentumDisplayTimeZone(tz: string | null | undefined) {
+  if (tz && String(tz).trim()) momentumDisplayTimeZone = String(tz).trim()
+}
+
 function fmtTime(iso: string | null | undefined) {
   if (!iso) return '—'
-  try {
-    const date = new Date(iso)
-    return withLocalTimeZone(date.toLocaleTimeString(), date)
-  } catch {
-    return iso
-  }
+  return (
+    formatExchangeTime(iso, momentumDisplayTimeZone, {
+      hour12: true,
+      withZone: true,
+    }) || iso
+  )
 }
 
-/** Date + time for previous close / session prints (ET-friendly local string). */
+/** Date + time for previous close / session prints (exchange zone). */
 function fmtDateTime(iso: string | null | undefined) {
   if (!iso) return null
-  try {
-    const date = new Date(iso)
-    return withLocalTimeZone(date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      second: '2-digit',
-    }), date)
-  } catch {
-    return String(iso)
-  }
+  return (
+    formatExchangeTime(iso, momentumDisplayTimeZone, {
+      date: true,
+      year: true,
+      seconds: true,
+      hour12: true,
+      withZone: true,
+    }) || String(iso)
+  )
 }
 
-/** Short clock only — e.g. 9:42 PM BST (no full date) */
+/** Short clock only — e.g. 4:00 PM EDT (no full date) */
 function fmtClock(iso: string | null | undefined) {
   if (!iso) return null
-  try {
-    const date = new Date(iso)
-    return withLocalTimeZone(date.toLocaleTimeString('en-US', {
-      hour: 'numeric',
-      minute: '2-digit',
-    }), date)
-  } catch {
-    return null
-  }
+  return formatExchangeTime(iso, momentumDisplayTimeZone, {
+    hour12: true,
+    withZone: true,
+  })
 }
 
-/** Compact date + time — e.g. Mar 11 · 1:27 PM BST */
+/** Compact date + time — e.g. Mar 11, 4:00 PM EDT */
 function fmtDateClock(iso: string | null | undefined) {
   if (!iso) return null
-  try {
-    const date = new Date(iso)
-    return withLocalTimeZone(date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-    }), date)
-  } catch {
-    return null
-  }
+  return formatExchangeTime(iso, momentumDisplayTimeZone, {
+    date: true,
+    hour12: true,
+    withZone: true,
+  })
 }
 
 /** Session tag for dates / headings (matches alert + Supabase wording). */
@@ -3148,13 +3144,13 @@ function fmtEpisodeWhen(
     if (Number.isNaN(d.getTime())) base = String(iso)
     else {
       const sameYear = d.getFullYear() === new Date().getFullYear()
-      base = withLocalTimeZone(d.toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: sameYear ? undefined : 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-      }), d)
+      base =
+        formatExchangeTime(iso, momentumDisplayTimeZone, {
+          date: true,
+          year: !sameYear,
+          hour12: true,
+          withZone: true,
+        }) || String(iso)
     }
   } catch {
     base = String(iso)
@@ -3824,7 +3820,7 @@ const MARKET_PROBE_INFO: Record<
   stocks: {
     title: 'US Stocks (SPY)',
     lines: [
-      'Headline probe for US equities. Session policy: Yahoo 24×5 (Sun 8:00pm – Fri 8:00pm ET).',
+      'Headline probe for US equities. Engine runs only while Yahoo marketState is REGULAR (same rule for NSE/LSE/…). Pre/AH/closed → episodes end.',
       'Calendar hours are America/New_York. This row never starts or stops the engine.',
     ],
   },
@@ -3889,8 +3885,8 @@ function sessionHoverInfo(
     'Post-market': {
       title: 'Session · Post-market',
       lines: [
-        'US equity after-hours (about 4:00pm–8:00pm ET).',
-        'Still tradable on Yahoo — Friday 8:00pm ET is the weekly full close.',
+        'US equity after-hours on Yahoo (marketState POST).',
+        'Momentum skips evaluate and ends active episodes whenever Yahoo is not REGULAR.',
       ],
     },
     Open: {
@@ -5699,6 +5695,10 @@ export function SndkMomentumPanel({
   }, [loadMarketStatusPopup])
   /** Manual end / exit of the live episode from Recent Events */
   const [endingEpisode, setEndingEpisode] = useState(false)
+  /** When ending from the Active episodes rail — which ticker is in-flight. */
+  const [endingEpisodeTicker, setEndingEpisodeTicker] = useState<string | null>(
+    null,
+  )
   const [deletingEpisodeId, setDeletingEpisodeId] = useState<string | null>(
     null,
   )
@@ -6848,6 +6848,16 @@ export function SndkMomentumPanel({
     return null
   })()
 
+  // Quote / chart stamps use the listing exchange zone (never browser local).
+  const exchangeDisplayTz = resolveExchangeTimeZone({
+    exchangeTimezoneName: tabQuote?.exchangeTimezoneName,
+    exchange: tabQuote?.exchange,
+    symbol: displayTicker,
+    assetClass: activeTab?.assetClass || snap?.assetClass || null,
+  })
+  // Sync module helper zone before JSX fmt* calls in this render.
+  setMomentumDisplayTimeZone(exchangeDisplayTz)
+
   // Live price: Yahoo field group for marketState (PRE → pre*, PREPRE/POST → post*)
   const livePrice =
     yahooActive?.price ??
@@ -7540,24 +7550,44 @@ export function SndkMomentumPanel({
     }
   }
 
-  /** Manually end / exit the live momentum episode (no push). */
-  async function endActiveEpisode() {
+  /**
+   * Manually end / exit a live momentum episode (no push).
+   * Defaults to the focused ticker; pass `ticker` from the Active episodes rail.
+   */
+  async function endActiveEpisode(opts?: {
+    ticker?: string
+    direction?: string | null
+    peakMovePercent?: number | null
+  }) {
     if (endingEpisode) return
-    const dir = episode?.direction || 'episode'
-    const peak =
-      episode && Number.isFinite(episode.peakMovePercent)
-        ? fmtPct(episode.peakMovePercent)
-        : ''
+    const symbol = String(opts?.ticker || displayTicker || '')
+      .trim()
+      .toUpperCase()
+    if (!symbol) return
+    const dir =
+      opts?.direction ||
+      (symbol === displayTicker.toUpperCase() ? episode?.direction : null) ||
+      'episode'
+    const peakRaw =
+      opts?.peakMovePercent != null && Number.isFinite(Number(opts.peakMovePercent))
+        ? Number(opts.peakMovePercent)
+        : symbol === displayTicker.toUpperCase() &&
+            episode &&
+            Number.isFinite(episode.peakMovePercent)
+          ? Number(episode.peakMovePercent)
+          : null
+    const peak = peakRaw != null ? fmtPct(peakRaw) : ''
     const ok = window.confirm(
-      `End the active ${dir} episode for ${displayTicker}?${
+      `End the active ${dir} episode for ${symbol}?${
         peak ? `\nPeak so far: ${peak}` : ''
       }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
     )
     if (!ok) return
 
     setEndingEpisode(true)
+    setEndingEpisodeTicker(symbol)
     try {
-      const res = await fetch(momentumApiPath(displayTicker, 'end-episode'), {
+      const res = await fetch(momentumApiPath(symbol, 'end-episode'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'MANUAL' }),
@@ -7566,18 +7596,29 @@ export function SndkMomentumPanel({
       if (!res.ok) {
         throw new Error(body.error || `End failed (${res.status})`)
       }
-      if (body?.status) setStatus(body.status as MomentumStatus)
-      else void load()
+      if (symbol === displayTicker.toUpperCase()) {
+        if (body?.status) setStatus(body.status as MomentumStatus)
+        else void load()
+      }
       setEpisodeByTicker((prev) => ({
         ...prev,
-        [displayTicker.toUpperCase()]: null,
+        [symbol]: null,
       }))
+      setActiveEpisodesList((prev) =>
+        prev.filter(
+          (row) => String(row.ticker || '').toUpperCase() !== symbol,
+        ),
+      )
+      if (rightRailMode === 'activeEpisodes') {
+        void loadActiveEpisodesList({ refresh: true })
+      }
     } catch (err) {
       window.alert(
         err instanceof Error ? err.message : 'Failed to end episode',
       )
     } finally {
       setEndingEpisode(false)
+      setEndingEpisodeTicker(null)
     }
   }
 
@@ -8489,6 +8530,7 @@ export function SndkMomentumPanel({
                       height={96}
                       defaultRange="1d"
                       compact
+                      timeZone={exchangeDisplayTz}
                       showTimeZone
                     />
                   </div>
@@ -8571,6 +8613,7 @@ export function SndkMomentumPanel({
                 height={320}
                 defaultRange="1d"
                 borderless
+                timeZone={exchangeDisplayTz}
                 showTimeZone
               />
             </div>
@@ -9525,82 +9568,115 @@ export function SndkMomentumPanel({
                             expanded && 'ring-1 ring-border',
                           )}
                         >
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setActiveEpisodeExpanded((prev) => ({
-                                ...prev,
-                                [key]: !prev[key],
-                              }))
-                            }
-                            className="flex w-full items-start gap-2 px-2.5 py-2 text-left transition-colors hover:bg-muted/50"
-                            aria-expanded={expanded}
-                          >
-                            <span className="mt-0.5 shrink-0 text-muted-foreground">
-                              {expanded ? (
-                                <ChevronUp className="size-3.5" strokeWidth={2} />
-                              ) : (
-                                <ChevronDown
-                                  className="size-3.5"
-                                  strokeWidth={2}
-                                />
-                              )}
-                            </span>
-                            <span
-                              className={cn(
-                                'mt-1 size-1.5 shrink-0 rounded-full',
-                                dirUp
-                                  ? 'bg-emerald-500'
-                                  : 'bg-rose-500',
-                              )}
-                              aria-hidden
-                            />
-                            <div className="min-w-0 flex-1">
-                              <div className="flex min-w-0 items-center gap-1.5">
-                                <span className="truncate text-[12px] font-semibold tracking-tight">
-                                  {row.ticker}
-                                </span>
-                                {no ? (
-                                  <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
-                                    {no}
+                          <div className="flex w-full items-start gap-2 px-2.5 py-2 transition-colors hover:bg-muted/50">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setActiveEpisodeExpanded((prev) => ({
+                                  ...prev,
+                                  [key]: !prev[key],
+                                }))
+                              }
+                              className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                              aria-expanded={expanded}
+                            >
+                              <span className="mt-0.5 shrink-0 text-muted-foreground">
+                                {expanded ? (
+                                  <ChevronUp
+                                    className="size-3.5"
+                                    strokeWidth={2}
+                                  />
+                                ) : (
+                                  <ChevronDown
+                                    className="size-3.5"
+                                    strokeWidth={2}
+                                  />
+                                )}
+                              </span>
+                              <span
+                                className={cn(
+                                  'mt-1 size-1.5 shrink-0 rounded-full',
+                                  dirUp ? 'bg-emerald-500' : 'bg-rose-500',
+                                )}
+                                aria-hidden
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex min-w-0 items-center gap-1.5">
+                                  <span className="truncate text-[12px] font-semibold tracking-tight">
+                                    {row.ticker}
                                   </span>
-                                ) : null}
-                                <span
-                                  className={cn(
-                                    'ml-auto shrink-0 text-[12px] font-semibold tabular-nums',
-                                    pctColor(row.currentMovePercent),
-                                  )}
-                                >
-                                  {fmtPct(row.currentMovePercent)}
-                                </span>
+                                  {no ? (
+                                    <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
+                                      {no}
+                                    </span>
+                                  ) : null}
+                                  <span
+                                    className={cn(
+                                      'ml-auto shrink-0 text-[12px] font-semibold tabular-nums',
+                                      pctColor(row.currentMovePercent),
+                                    )}
+                                  >
+                                    {fmtPct(row.currentMovePercent)}
+                                  </span>
+                                </div>
+                                <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-muted-foreground">
+                                  <span className="truncate font-medium text-foreground/80">
+                                    {label !== row.ticker ? label : null}
+                                  </span>
+                                  <span
+                                    className={cn(
+                                      'font-semibold uppercase',
+                                      dirUp
+                                        ? 'text-emerald-600 dark:text-emerald-400'
+                                        : 'text-rose-600 dark:text-rose-400',
+                                    )}
+                                  >
+                                    {dirUp ? 'UP' : 'DOWN'}
+                                  </span>
+                                  <span>·</span>
+                                  <span>
+                                    {formatEpisodeState(row.state) || 'Active'}
+                                  </span>
+                                  {row.detectedWindow ? (
+                                    <>
+                                      <span>·</span>
+                                      <span>{row.detectedWindow}</span>
+                                    </>
+                                  ) : null}
+                                </div>
                               </div>
-                              <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-muted-foreground">
-                                <span className="truncate font-medium text-foreground/80">
-                                  {label !== row.ticker ? label : null}
-                                </span>
-                                <span
-                                  className={cn(
-                                    'font-semibold uppercase',
-                                    dirUp
-                                      ? 'text-emerald-600 dark:text-emerald-400'
-                                      : 'text-rose-600 dark:text-rose-400',
-                                  )}
-                                >
-                                  {dirUp ? 'UP' : 'DOWN'}
-                                </span>
-                                <span>·</span>
-                                <span>
-                                  {formatEpisodeState(row.state) || 'Active'}
-                                </span>
-                                {row.detectedWindow ? (
-                                  <>
-                                    <span>·</span>
-                                    <span>{row.detectedWindow}</span>
-                                  </>
-                                ) : null}
-                              </div>
-                            </div>
-                          </button>
+                            </button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={
+                                endingEpisode ||
+                                endingEpisodeTicker ===
+                                  String(row.ticker || '').toUpperCase()
+                              }
+                              title={`End active episode for ${row.ticker} (no push)`}
+                              className="mt-0.5 h-7 shrink-0 gap-1 rounded-full px-2.5 text-[11px] font-semibold text-rose-700 hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                e.preventDefault()
+                                void endActiveEpisode({
+                                  ticker: row.ticker,
+                                  direction: row.direction,
+                                  peakMovePercent: row.peakMovePercent,
+                                })
+                              }}
+                              onPointerDown={(e) => e.stopPropagation()}
+                            >
+                              {endingEpisodeTicker ===
+                              String(row.ticker || '').toUpperCase() ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <X className="size-3" strokeWidth={2} />
+                              )}
+                              End
+                            </Button>
+                          </div>
                           {expanded ? (
                             <div className="space-y-2 border-t border-border/60 bg-muted/20 px-2.5 py-2.5 text-[11px]">
                               <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
@@ -10195,7 +10271,8 @@ export function SndkMomentumPanel({
                           const isActive = group.status === 'ACTIVE'
                           const isLiveFocus =
                             isActive && episode != null && matchesLive
-                          const canEndEpisode = Boolean(isLiveFocus)
+                          // Always offer End on ACTIVE episode cards (settings / events rail)
+                          const canEndEpisode = isActive
                           const lastStateFromEvents = [...group.events]
                             .reverse()
                             .find(
@@ -10512,17 +10589,27 @@ export function SndkMomentumPanel({
                                           type="button"
                                           variant="outline"
                                           size="sm"
-                                          disabled={endingEpisode || !!deletingEpisodeId}
+                                          disabled={
+                                            endingEpisode || !!deletingEpisodeId
+                                          }
                                           onClick={(e) => {
                                             e.stopPropagation()
                                             e.preventDefault()
-                                            void endActiveEpisode()
+                                            void endActiveEpisode({
+                                              ticker: displayTicker,
+                                              direction: group.direction,
+                                              peakMovePercent:
+                                                group.peakMovePercent ??
+                                                (matchesLive
+                                                  ? episode?.peakMovePercent
+                                                  : null),
+                                            })
                                           }}
                                           onPointerDown={(e) =>
                                             e.stopPropagation()
                                           }
                                           title="Manually end this episode (no push)"
-                                          className="h-6 shrink-0 gap-1 rounded-full px-2 text-[10px] font-semibold text-muted-foreground hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-800"
+                                          className="h-6 shrink-0 gap-1 rounded-full px-2 text-[10px] font-semibold text-rose-700 hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
                                         >
                                           {endingEpisode ? (
                                             <Loader2 className="size-3 animate-spin" />
