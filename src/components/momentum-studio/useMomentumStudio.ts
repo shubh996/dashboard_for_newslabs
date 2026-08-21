@@ -28,6 +28,14 @@ export function useMomentumStudio() {
   const [statusError, setStatusError] = useState<string | null>(null)
   const [quotes, setQuotes] = useState<Record<string, YahooLiveQuote>>({})
   const [activeEpisodes, setActiveEpisodes] = useState<ActiveEpisodeRow[]>([])
+  /** ACTIVE + closed/expired across tickers (center “all episodes so far” list) */
+  const [episodeHistory, setEpisodeHistory] = useState<ActiveEpisodeRow[]>([])
+  const [episodeHistoryLoading, setEpisodeHistoryLoading] = useState(false)
+  /**
+   * 3rd-column mode: false = list all live ACTIVE (app load / episodes tab).
+   * true = filter to the selected entity’s episodes after a click.
+   */
+  const [railEntityFocus, setRailEntityFocus] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [testModeEnabled, setTestModeEnabled] = useState(false)
   const [testModeSaving, setTestModeSaving] = useState(false)
@@ -121,6 +129,28 @@ export function useMomentumStudio() {
     }
   }, [])
 
+  const loadEpisodeHistory = useCallback(async (opts?: { refresh?: boolean }) => {
+    setEpisodeHistoryLoading(true)
+    try {
+      const q = new URLSearchParams({ _: String(Date.now()), limit: '120' })
+      if (opts?.refresh) q.set('refresh', '1')
+      const res = await fetch(`/api/momentum/episodes-history?${q}`)
+      const body = await res.json().catch(() => ({}))
+      setEpisodeHistory(
+        Array.isArray(body.episodes)
+          ? (body.episodes as ActiveEpisodeRow[])
+          : [],
+      )
+      if (Array.isArray(body.activeEpisodes)) {
+        setActiveEpisodes(body.activeEpisodes as ActiveEpisodeRow[])
+      }
+    } catch {
+      /* keep */
+    } finally {
+      setEpisodeHistoryLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     void loadWatchlist()
     void fetch(`/api/momentum/test-mode?_=${Date.now()}`)
@@ -145,6 +175,16 @@ export function useMomentumStudio() {
   }, [loadActiveEpisodes])
 
   useEffect(() => {
+    if (view !== 'episodes' && view !== 'overview') return
+    void loadEpisodeHistory({ refresh: view === 'episodes' })
+    const id = window.setInterval(
+      () => void loadEpisodeHistory(),
+      view === 'episodes' ? 20_000 : 45_000,
+    )
+    return () => window.clearInterval(id)
+  }, [view, loadEpisodeHistory])
+
+  useEffect(() => {
     if (!classTickers.length) return
     const ac = new AbortController()
     void fetchYahooQuotes(
@@ -166,24 +206,39 @@ export function useMomentumStudio() {
     return () => ac.abort()
   }, [classTickers])
 
-  async function toggleTestMode(next: boolean) {
+  async function confirmTestMode(payload: {
+    enabled: boolean
+    selectedDeviceIds?: string[]
+    selectedTokens?: string[]
+  }) {
     setTestModeSaving(true)
     try {
       const res = await fetch('/api/momentum/test-mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: next }),
+        body: JSON.stringify({
+          enabled: payload.enabled,
+          selectedDeviceIds: payload.selectedDeviceIds,
+          selectedTokens: payload.selectedTokens,
+        }),
       })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(body.error || 'Failed')
       setTestModeEnabled(
-        typeof body.enabled === 'boolean' ? body.enabled : next,
+        typeof body.enabled === 'boolean' ? body.enabled : payload.enabled,
       )
+      // Refresh status so settings show updated allowlist / always-notify list
+      if (activeTicker) await loadStatus(activeTicker)
     } catch {
       /* keep */
     } finally {
       setTestModeSaving(false)
     }
+  }
+
+  /** @deprecated use confirmTestMode — kept for simple on/off without picker */
+  async function toggleTestMode(next: boolean) {
+    await confirmTestMode({ enabled: next })
   }
 
   async function runTick() {
@@ -199,6 +254,41 @@ export function useMomentumStudio() {
       setTickBusy(false)
     }
   }
+
+  /**
+   * Select a history/active row: stay on episodes view.
+   * Right column switches to that entity’s episodes (active + history).
+   */
+  const selectActiveEpisode = useCallback(
+    (row: ActiveEpisodeRow) => {
+      const ticker = String(row.ticker || '').trim().toUpperCase()
+      if (!ticker) return
+      const item = tickers.find((t) => t.ticker.toUpperCase() === ticker)
+      if (item) setAssetClass(item.assetClass)
+      setActiveTicker(ticker)
+      setRailEntityFocus(true)
+      setView('episodes')
+    },
+    [tickers],
+  )
+
+  /** Reset 3rd column to all live ACTIVE episodes. */
+  const clearRailEntityFocus = useCallback(() => {
+    setRailEntityFocus(false)
+  }, [])
+
+  /** Live ACTIVE episode for the focused ticker (3rd column), if any. */
+  const activeEpisodeForTicker = useMemo(() => {
+    const t = String(activeTicker || '').toUpperCase()
+    if (!t) return null
+    return (
+      activeEpisodes.find(
+        (e) =>
+          String(e.ticker || '').toUpperCase() === t &&
+          String(e.status || 'ACTIVE').toUpperCase() === 'ACTIVE',
+      ) || null
+    )
+  }, [activeEpisodes, activeTicker])
 
   const quote = quotes[activeTicker] || quotes[activeTicker.toUpperCase()]
   const snap = status?.snapshot
@@ -239,6 +329,12 @@ export function useMomentumStudio() {
     quotes,
     quote,
     activeEpisodes,
+    episodeHistory,
+    episodeHistoryLoading,
+    activeEpisodeForTicker,
+    railEntityFocus,
+    setRailEntityFocus,
+    clearRailEntityFocus,
     settingsOpen,
     setSettingsOpen,
     testModeEnabled,
@@ -247,8 +343,11 @@ export function useMomentumStudio() {
     loadWatchlist,
     loadStatus,
     loadActiveEpisodes,
+    loadEpisodeHistory,
     toggleTestMode,
+    confirmTestMode,
     runTick,
+    selectActiveEpisode,
     livePrice,
     dayPct,
     logo: resolveYahooLogoUrl(quote || null, activeTicker),

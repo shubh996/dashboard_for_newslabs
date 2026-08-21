@@ -3,7 +3,6 @@ import { IconTrendingDown, IconTrendingUp } from '@tabler/icons-react'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardAction,
@@ -22,6 +21,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useTheme } from '@/hooks/useTheme'
+import { ActiveEpisodesRail } from './active-episodes-rail'
 import { AppSidebar } from './app-sidebar'
 import { AssetClassRail } from './asset-class-rail'
 import { ChartAreaInteractive } from './chart-area-interactive'
@@ -31,7 +31,9 @@ import { PerplexityUsagePanel } from './perplexity-usage'
 import { SectionCards } from './section-cards'
 import { SiteHeader } from './site-header'
 import { fmtDateTime, fmtEpisodeNo, fmtPct, formatEpisodeState } from './format'
+import { cn } from '@/lib/utils'
 import { useMomentumStudio } from './useMomentumStudio'
+import type { ActiveEpisodeRow } from './types'
 
 export function MomentumStudioApp() {
   const { theme, toggleTheme } = useTheme()
@@ -75,7 +77,7 @@ export function MomentumStudioApp() {
               {studio.view === 'overview' ? (
                 <OverviewDashboard studio={studio} />
               ) : studio.view === 'episodes' ? (
-                <EpisodesGrid studio={studio} />
+                <EpisodesList studio={studio} />
               ) : studio.view === 'users' ? (
                 <UsersView studio={studio} />
               ) : studio.view === 'perplexity' ? (
@@ -90,7 +92,10 @@ export function MomentumStudioApp() {
                   />
                   {chartExpanded && studio.activeTicker ? (
                     <div className="px-4 lg:px-6">
-                      <ChartAreaInteractive ticker={studio.activeTicker} />
+                      <ChartAreaInteractive
+                        ticker={studio.activeTicker}
+                        marketState={studio.quote?.marketState}
+                      />
                     </div>
                   ) : null}
                   <EventsTable studio={studio} />
@@ -101,6 +106,8 @@ export function MomentumStudioApp() {
         </div>
         {studio.view === 'watchlist' ? (
           <AssetClassRail studio={studio} />
+        ) : studio.view === 'episodes' || studio.view === 'overview' ? (
+          <ActiveEpisodesRail studio={studio} />
         ) : null}
         </div>
       </SidebarInset>
@@ -112,10 +119,119 @@ export function MomentumStudioApp() {
         onToggleTheme={toggleTheme}
         testModeEnabled={studio.testModeEnabled}
         testModeSaving={studio.testModeSaving}
-        onToggleTestMode={(v) => void studio.toggleTestMode(v)}
+        onConfirmTestMode={(payload) => void studio.confirmTestMode(payload)}
         status={studio.status}
       />
     </SidebarProvider>
+  )
+}
+
+/** Center column — all episodes so far (history + live). */
+function EpisodesList({
+  studio,
+}: {
+  studio: ReturnType<typeof useMomentumStudio>
+}) {
+  const rows = studio.episodeHistory
+
+  if (studio.episodeHistoryLoading && !rows.length) {
+    return (
+      <div className="px-4 lg:px-6">
+        <div className="flex aspect-video w-full flex-1 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
+          Loading episodes…
+        </div>
+      </div>
+    )
+  }
+
+  if (!rows.length) {
+    return (
+      <div className="px-4 lg:px-6">
+        <div className="flex aspect-video w-full flex-1 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
+          No episodes yet
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="px-4 lg:px-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>All episodes</CardTitle>
+          <CardDescription>
+            History across tickers · click a row — right column shows if that
+            ticker has a live ACTIVE episode
+            {studio.activeEpisodes.length
+              ? ` · ${studio.activeEpisodes.length} active now`
+              : ''}
+          </CardDescription>
+        </CardHeader>
+        <CardFooter className="block p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Ticker</TableHead>
+                <TableHead>Episode</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Window</TableHead>
+                <TableHead className="text-right">Move</TableHead>
+                <TableHead className="text-right">Started</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => {
+                const selected =
+                  String(row.ticker || '').toUpperCase() ===
+                  String(studio.activeTicker || '').toUpperCase()
+                const isLive =
+                  String(row.status || '').toUpperCase() === 'ACTIVE'
+                const up = row.direction !== 'DOWN'
+                const Trend = up ? IconTrendingUp : IconTrendingDown
+                return (
+                  <TableRow
+                    key={`${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
+                    className={cn(
+                      'cursor-pointer',
+                      selected && 'bg-muted/60',
+                    )}
+                    onClick={() => studio.selectActiveEpisode(row)}
+                  >
+                    <TableCell className="font-medium">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Trend className="size-3.5 text-muted-foreground" />
+                        {row.ticker}
+                      </span>
+                    </TableCell>
+                    <TableCell className="tabular-nums">
+                      {fmtEpisodeNo(row.episodeNo) || '—'}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={isLive ? 'default' : 'outline'}>
+                        {formatEpisodeState(row.status || row.state)}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>{row.detectedWindow || '—'}</TableCell>
+                    <TableCell
+                      className={cn(
+                        'text-right font-semibold tabular-nums',
+                        row.direction === 'DOWN'
+                          ? 'text-rose-600 dark:text-rose-400'
+                          : 'text-emerald-600 dark:text-emerald-400',
+                      )}
+                    >
+                      {fmtPct(row.currentMovePercent ?? row.peakMovePercent)}
+                    </TableCell>
+                    <TableCell className="text-right text-muted-foreground tabular-nums">
+                      {fmtDateTime(row.episodeStartedAt)}
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </CardFooter>
+      </Card>
+    </div>
   )
 }
 
@@ -124,12 +240,14 @@ function EpisodesGrid({
 }: {
   studio: ReturnType<typeof useMomentumStudio>
 }) {
-  const rows = studio.activeEpisodes
+  const rows = studio.episodeHistory.length
+    ? studio.episodeHistory.slice(0, 12)
+    : studio.activeEpisodes
   if (!rows.length) {
     return (
       <div className="px-4 lg:px-6">
         <div className="flex aspect-video w-full flex-1 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
-          No active episodes
+          No episodes yet
         </div>
       </div>
     )
@@ -139,20 +257,24 @@ function EpisodesGrid({
       {rows.map((row) => {
         const up = row.direction !== 'DOWN'
         const Trend = up ? IconTrendingUp : IconTrendingDown
+        const isLive = String(row.status || '').toUpperCase() === 'ACTIVE'
         return (
           <Card
-            key={`${row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
-            className="@container/card"
+            key={`${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
+            className="@container/card cursor-pointer transition-colors hover:bg-muted/30"
+            onClick={() => studio.selectActiveEpisode(row as ActiveEpisodeRow)}
           >
             <CardHeader>
               <CardDescription>{row.ticker}</CardDescription>
               <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
-                {fmtPct(row.currentMovePercent)}
+                {fmtPct(row.currentMovePercent ?? row.peakMovePercent)}
               </CardTitle>
               <CardAction>
-                <Badge variant="outline">
+                <Badge variant={isLive ? 'default' : 'outline'}>
                   <Trend />
-                  {fmtEpisodeNo(row.episodeNo) || 'live'}
+                  {isLive
+                    ? fmtEpisodeNo(row.episodeNo) || 'live'
+                    : formatEpisodeState(row.status)}
                 </Badge>
               </CardAction>
             </CardHeader>
@@ -161,24 +283,8 @@ function EpisodesGrid({
                 {row.direction} · {formatEpisodeState(row.state || row.status)}
                 <Trend className="size-4" />
               </div>
-              <div className="flex w-full items-center justify-between text-muted-foreground">
-                <span>
-                  {row.detectedWindow || '—'} · {fmtDateTime(row.episodeStartedAt)}
-                </span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => {
-                    const item = studio.tickers.find(
-                      (t) => t.ticker === row.ticker,
-                    )
-                    if (item) studio.setAssetClass(item.assetClass)
-                    studio.setActiveTicker(row.ticker)
-                    studio.setView('watchlist')
-                  }}
-                >
-                  Open
-                </Button>
+              <div className="text-muted-foreground">
+                {row.detectedWindow || '—'} · {fmtDateTime(row.episodeStartedAt)}
               </div>
             </CardFooter>
           </Card>

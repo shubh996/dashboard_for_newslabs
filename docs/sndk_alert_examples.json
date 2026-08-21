@@ -1,0 +1,175 @@
+{
+  "examples": [
+    {
+      "id": "1_STARTED_day_pre",
+      "when": "Episode opens on day window in pre-market (after Perplexity)",
+      "copy": {
+        "title": "🟢 SNDK +4.2% surge in pre-market so far",
+        "body": "Investors are reacting to stronger-than-expected NAND demand commentary."
+      },
+      "notes": "Push after Perplexity; body = likely_driver. Raw MOMENTUM_STARTED alone is not pushed."
+    },
+    {
+      "id": "2_STARTED_60m",
+      "when": "Episode opens on ~60m window during RTH",
+      "copy": {
+        "title": "🟢 SNDK +3.1% rally in last 48 minutes",
+        "body": "Sharp upward momentum detected."
+      },
+      "notes": "Generic body if research has no driver."
+    },
+    {
+      "id": "3_STARTED_DOWN",
+      "when": "Downside episode starts",
+      "copy": {
+        "title": "🔴 SNDK -5.4% drop in last 1 hour 30 mins",
+        "body": "Sharp downward momentum detected."
+      }
+    },
+    {
+      "id": "4_ACCEL_UP",
+      "when": "Material extension after last alert (+2pp style)",
+      "copy": {
+        "title": "🟢 SNDK adds another +3.0% in 25 mins",
+        "body": "The surge now stands at +7.2% over 48 minutes."
+      }
+    },
+    {
+      "id": "5_ACCEL_DOWN",
+      "when": "Downside continues extending",
+      "copy": {
+        "title": "🔴 SNDK falls another 2.7% in 25 mins",
+        "body": "The decline now stands at -6.8% over 48 minutes."
+      }
+    },
+    {
+      "id": "6_RE_ACCEL_UP",
+      "when": "After strong fade, move builds again",
+      "copy": {
+        "title": "🟢 SNDK is accelerating again",
+        "body": "The move has recovered from +3.2% to +6.5% after the earlier fade."
+      }
+    },
+    {
+      "id": "7_EXTENDS_RECOVERY",
+      "when": "Further +2pp after a prior re-acceleration",
+      "copy": {
+        "title": "🟢 SNDK extends its recovery",
+        "body": "The surge now stands at +8.4%."
+      }
+    },
+    {
+      "id": "8_EXTENDS_DECLINE",
+      "when": "Further extension after re-accel on DOWN episode",
+      "copy": {
+        "title": "🔴 SNDK extends its decline",
+        "body": "The decline now stands at -9.1%."
+      }
+    },
+    {
+      "id": "9_STRONG_GIVEBACK_UP",
+      "when": "≥60% of peak UP move given back (one-shot)",
+      "copy": {
+        "title": "🔴 SNDK has given back 60% of its surge",
+        "body": "The earlier +8.0% move has faded sharply, with about +3.2% remaining."
+      }
+    },
+    {
+      "id": "10_STRONG_GIVEBACK_DOWN",
+      "when": "≥60% of peak DOWN move recovered (fade of decline)",
+      "copy": {
+        "title": "🟢 SNDK has given back 60% of its decline",
+        "body": "The earlier -7.0% move has faded sharply, with about -2.8% remaining."
+      }
+    },
+    {
+      "id": "11_REVERSED_UP_EPISODE",
+      "when": "UP episode fully reverses (gains erased)",
+      "copy": {
+        "title": "🔴 SNDK reverses lower",
+        "body": "Earlier gains have been erased as downside momentum builds."
+      },
+      "notes": "Also runs Perplexity for reverse why; body may be replaced by driver."
+    },
+    {
+      "id": "12_REVERSED_DOWN_EPISODE",
+      "when": "DOWN episode rebounds (losses recovered)",
+      "copy": {
+        "title": "🟢 SNDK rebounds sharply",
+        "body": "Earlier losses are being recovered as upward momentum builds."
+      }
+    },
+    {
+      "id": "13_ENDED_REVERSAL",
+      "when": "Terminal end with reason REVERSAL (same copy family)",
+      "copy": {
+        "title": "🔴 SNDK reverses lower",
+        "body": "Earlier gains have been erased as downside momentum builds."
+      }
+    },
+    {
+      "id": "14_MARKET_OPEN",
+      "when": "~5 min after US RTH open (watchlist-wide)",
+      "copy": {
+        "title": "The US market has opened",
+        "body": "We will alert you if unusual momentum is detected in any of your watchlist assets. Tap to see what's moving."
+      }
+    },
+    {
+      "id": "15_MARKET_CLOSE",
+      "when": "~5 min after US RTH close (watchlist-wide)",
+      "copy": {
+        "title": "The US market has closed",
+        "body": "Trigger never sleeps. We will alert you if unusual momentum is triggered on any of your watchlist assets."
+      }
+    },
+    {
+      "id": "16_DIGEST_OPEN",
+      "when": "Per-ticker market-open digest (if enabled for user)",
+      "copy": {
+        "title": "🟢 SNDK opens strong ↑ +1.8%",
+        "body": "Shares are trading 1.8% above the previous session close after the opening move."
+      }
+    },
+    {
+      "id": "17_DIGEST_CLOSE",
+      "when": "Per-ticker market-close digest",
+      "copy": {
+        "title": "🔴 SNDK closes lower ↓ 0.6% today",
+        "body": "SNDK finished the session 0.6% below the previous session close."
+      }
+    }
+  ],
+  "silent": [
+    {
+      "id": "S1",
+      "when": "HOLDING",
+      "notes": "State only — no push"
+    },
+    {
+      "id": "S2",
+      "when": "WEAKENING (<60% giveback)",
+      "notes": "State only — no push"
+    },
+    {
+      "id": "S3",
+      "when": "MOMENTUM_ENDED reason=EXPIRED / INACTIVITY",
+      "notes": "No push"
+    },
+    {
+      "id": "S4",
+      "when": "CLOSED_AT_MARKET_CLOSE",
+      "notes": "No push"
+    },
+    {
+      "id": "S5",
+      "when": "MOMENTUM_RESEARCH_RUNNING / DONE",
+      "notes": "Timeline only"
+    },
+    {
+      "id": "S6",
+      "when": "Tiny re-accel below policy threshold",
+      "notes": "No push"
+    }
+  ]
+}

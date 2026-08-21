@@ -592,7 +592,8 @@ describe('notification copy', () => {
     })
     assert.ok(overnightDay?.title.includes('overnight so far'), overnightDay?.title)
 
-    // Rolling window during PRE still keeps duration and tags session
+    // Rolling 60m/5m during PRE (e.g. ref 9:10 AM): duration, NOT “pre-market so far”
+    // Example: 🟢 AAPL +3.1% rally in last 5 minutes
     const pre5m = buildNotificationCopy({
       ticker: 'AAPL',
       eventType: 'MOMENTUM_STARTED',
@@ -603,7 +604,19 @@ describe('notification copy', () => {
       marketSession: 'PRE',
     })
     assert.ok(pre5m?.title.includes('in last 5 minutes'), pre5m?.title)
-    assert.ok(pre5m?.title.includes('pre-market'), pre5m?.title)
+    assert.ok(!pre5m?.title.includes('pre-market so far'), pre5m?.title)
+
+    const pre60m = buildNotificationCopy({
+      ticker: 'AMZN',
+      eventType: 'MOMENTUM_STARTED',
+      direction: 'UP',
+      movePercent: 2.0,
+      exactMinutes: 60,
+      detectedWindow: '60m',
+      marketSession: 'PRE',
+    })
+    assert.ok(pre60m?.title.includes('in last 1 hour'), pre60m?.title)
+    assert.ok(!pre60m?.title.includes('pre-market so far'), pre60m?.title)
   })
 
   it('acceleration uses since-last and total', () => {
@@ -651,9 +664,25 @@ describe('notification copy', () => {
       givebackPct: 60,
       remainingMovePercent: 4,
     })
-    assert.equal(copy?.title, '🟢 SNDK has given back 60% of its surge')
+    // UP episode fade → 🔴 (inverted vs original surge)
+    assert.equal(copy?.title, '🔴 SNDK has given back 60% of its surge')
     assert.ok(copy?.body.includes('+10.0%') || copy?.body.includes('+10%'))
     assert.ok(copy?.body.includes('+4.0%') || copy?.body.includes('+4%'))
+
+    const downFade = buildNotificationCopy({
+      ticker: 'SNAP',
+      eventType: 'MOMENTUM_STRONG_WEAKENING',
+      direction: 'DOWN',
+      movePercent: -4,
+      peakMovePercent: -10,
+      givebackPct: 60,
+      remainingMovePercent: -4,
+    })
+    // DOWN episode fade → 🟢
+    assert.equal(
+      downFade?.title,
+      '🟢 SNAP has given back 60% of its decline',
+    )
   })
 
   it('re-accel copy uses recovery wording', () => {

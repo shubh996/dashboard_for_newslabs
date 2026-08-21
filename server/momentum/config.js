@@ -537,15 +537,29 @@ function clamp01(n) {
   return Math.min(1, Math.max(0, n))
 }
 
-/** Env / bootstrap defaults (seed every class until UI diverges). */
-function buildDefaultEpisodePolicy() {
+/**
+ * Env / bootstrap defaults (seed every class until UI diverges).
+ * Equity / crypto / forex / commodity default inactivity = 6h (360 eligible min);
+ * index stays at 3h (180) unless overridden.
+ * @param {string} [assetClass]
+ */
+function buildDefaultEpisodePolicy(assetClass = 'equity') {
+  const cls = normalizeThresholdAssetClass(assetClass)
+  const accelDefault =
+    cls === 'commodity' || cls === 'forex' || cls === 'crypto' ? 1 : 2
+  const inactDefault = cls === 'index' ? 180 : 360
   const accel = Number(
     process.env.MOMENTUM_ACCEL_POINTS ||
       process.env.MOMENTUM_ACCEL_DELTA_PP ||
-      2,
+      accelDefault,
   )
   const material = Number(process.env.MOMENTUM_MATERIAL_PROGRESS_PP || 0.5)
-  const inact = Number(process.env.MOMENTUM_INACTIVITY_MIN || 180)
+  const inact = Number(
+    process.env.MOMENTUM_INACTIVITY_MIN != null &&
+      process.env.MOMENTUM_INACTIVITY_MIN !== ''
+      ? process.env.MOMENTUM_INACTIVITY_MIN
+      : inactDefault,
+  )
   const rearm = Math.max(
     0,
     Number(process.env.MOMENTUM_REARM_BUFFER_PP ?? 1) || 1,
@@ -590,7 +604,7 @@ function buildDefaultEpisodePolicy() {
 
 /** @type {Record<string, ReturnType<typeof buildDefaultEpisodePolicy>>} */
 const policyByClass = Object.fromEntries(
-  THRESHOLD_ASSET_CLASSES.map((c) => [c, buildDefaultEpisodePolicy()]),
+  THRESHOLD_ASSET_CLASSES.map((c) => [c, buildDefaultEpisodePolicy(c)]),
 )
 
 /**

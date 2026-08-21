@@ -32,6 +32,7 @@ import {
   fetchYahooChart,
   type YahooChartRange,
 } from '@/services/yahooApi'
+import { YahooFinanceWithMarketState } from '@/components/yahoo/YahooMarketStateLabel'
 
 const chartConfig = {
   price: { label: 'Price' },
@@ -54,10 +55,13 @@ export function ChartAreaInteractive({
   ticker,
   compact = false,
   onExpand,
+  marketState,
 }: {
   ticker: string
   compact?: boolean
   onExpand?: () => void
+  /** Live Yahoo marketState for the label above “Yahoo Finance” */
+  marketState?: string | null
 }) {
   const isMobile = useIsMobile()
   const [range, setRange] = useState<YahooChartRange>('1d')
@@ -203,10 +207,12 @@ export function ChartAreaInteractive({
       <CardHeader>
         <CardTitle>{title}</CardTitle>
         <CardDescription>
-          <span className="hidden @[540px]/card:block">
-            Yahoo Finance · shadcn Chart
-          </span>
-          <span className="@[540px]/card:hidden">Yahoo · Chart</span>
+          <YahooFinanceWithMarketState marketState={marketState}>
+            <span className="hidden text-xs @[540px]/card:block">
+              Yahoo Finance · shadcn Chart
+            </span>
+            <span className="text-xs @[540px]/card:hidden">Yahoo · Chart</span>
+          </YahooFinanceWithMarketState>
         </CardDescription>
         <CardAction>
           <ToggleGroup

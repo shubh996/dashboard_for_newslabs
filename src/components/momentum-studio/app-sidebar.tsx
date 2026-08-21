@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   LineChart,
   PanelLeft,
+  Settings,
   Sparkles,
   Users,
   Wheat,
@@ -114,26 +115,14 @@ export function AppSidebar({
     <Sidebar collapsible="icon" {...props}>
       <SidebarHeader>
         <SidebarMenu>
-          <SidebarMenuItem className="flex items-center gap-1">
-            <SidebarMenuButton size="lg" asChild tooltip="Trigger">
-              <a href="/momentum-studio">
-                <img
-                  src="/icons/momentum-logo.png"
-                  alt="Momentum"
-                  className="size-8 rounded-lg object-cover"
-                />
-                <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-medium">Trigger</span>
-                  <span className="truncate text-xs">Momentum</span>
-                </div>
-              </a>
-            </SidebarMenuButton>
+          <SidebarMenuItem>
             <Button
               type="button"
               variant="ghost"
               size="icon-sm"
               className="group-data-[collapsible=icon]:hidden"
               onClick={toggleSidebar}
+              aria-label="Toggle Sidebar"
             >
               <PanelLeft />
               <span className="sr-only">Toggle Sidebar</span>
@@ -150,10 +139,22 @@ export function AppSidebar({
               <SidebarMenuButton
                 tooltip="Dashboard"
                 isActive={studio.view === 'overview'}
-                onClick={() => studio.setView('overview')}
+                onClick={() => {
+                  studio.clearRailEntityFocus()
+                  studio.setView('overview')
+                }}
               >
                 <LayoutDashboard />
                 <span>Dashboard</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                tooltip="Settings"
+                onClick={() => studio.setSettingsOpen(true)}
+              >
+                <Settings />
+                <span>Settings</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -200,7 +201,10 @@ export function AppSidebar({
               <SidebarMenuButton
                 tooltip="Active episodes"
                 isActive={studio.view === 'episodes'}
-                onClick={() => studio.setView('episodes')}
+                onClick={() => {
+                  studio.clearRailEntityFocus()
+                  studio.setView('episodes')
+                }}
               >
                 <BarChart3 />
                 <span>Active episodes</span>
@@ -216,14 +220,12 @@ export function AppSidebar({
               >
                 <SidebarMenuButton
                   size="sm"
-                  onClick={() => {
-                    const item = studio.tickers.find(
-                      (t) => t.ticker === row.ticker,
-                    )
-                    if (item) studio.setAssetClass(item.assetClass)
-                    studio.setActiveTicker(row.ticker)
-                    studio.setView('watchlist')
-                  }}
+                  isActive={
+                    studio.view === 'episodes' &&
+                    String(row.ticker || '').toUpperCase() ===
+                      String(studio.activeTicker || '').toUpperCase()
+                  }
+                  onClick={() => studio.selectActiveEpisode(row)}
                 >
                   <span>{row.ticker}</span>
                   <span className="ml-auto text-xs text-muted-foreground">

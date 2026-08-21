@@ -372,25 +372,57 @@ export function daySessionExactLabel(marketSession) {
 }
 
 /**
- * Alert-title “when” phrase for day / session cards.
- * Returns null when the normal lookback duration phrase should be used instead.
+ * Alert-title “when” phrase for **day / vs-previous-close** session cards only.
+ *
+ *   ✅ day + PRE  → “in pre-market so far”
+ *   ✅ day + POST → “in after-hours so far”
+ *   ❌ 60m / 5m START even if clock is 9:10 ET (still PRE) → null
+ *      (caller uses duration: “in last 60 minutes” — not “pre-market so far”)
+ *
+ * Why: a 60m window with reference 9:10 AM is a rolling lookback, not the
+ * day-vs-close session card. Labelling it “pre-market so far” is wrong.
  *
  * @param {string|null|undefined} marketSession
  * @param {string|null|undefined} windowKey
+ * @param {string|null|undefined} [exactLabel]  e.g. "pre-market" from daySessionExactLabel
  * @returns {string|null}
  */
-export function sessionTitlePhrase(marketSession, windowKey) {
+export function sessionTitlePhrase(marketSession, windowKey, exactLabel) {
   const wk = String(windowKey || '').trim()
   const s = String(marketSession || '').trim().toUpperCase()
-  // Day card = vs previous close — ongoing sessions get “so far”
-  if (wk === 'day') {
-    if (s === 'PRE') return 'in pre-market so far'
-    if (s === 'PREPRE') return 'overnight so far'
-    if (s === 'POST' || s === 'POSTPOST') return 'in after-hours so far'
-    if (s === 'CLOSED' || s === 'CLOSE') return 'at the close'
-    return 'so far today'
+  const label = String(exactLabel || '').trim().toLowerCase()
+
+  // Only the day (vs previous close) card uses session “so far” phrases.
+  // Rolling windows (5m, 60m, 24h, …) always fall through to duration wording.
+  const isDayCard =
+    wk === 'day' ||
+    // exactLabel alone only when window key missing but label is a session name
+    (!wk &&
+      /^(pre[\s-]?market|premarket|overnight|after[\s-]?hours|today|at the close)$/i.test(
+        label,
+      ))
+
+  if (!isDayCard) return null
+
+  const fromLabel =
+    s ||
+    (/pre[\s-]?market|premarket/.test(label)
+      ? 'PRE'
+      : /after[\s-]?hours|post/.test(label)
+        ? 'POST'
+        : /overnight|prepre/.test(label)
+          ? 'PREPRE'
+          : /at the close|closed/.test(label)
+            ? 'CLOSED'
+            : '')
+
+  if (fromLabel === 'PRE') return 'in pre-market so far'
+  if (fromLabel === 'PREPRE') return 'overnight so far'
+  if (fromLabel === 'POST' || fromLabel === 'POSTPOST') {
+    return 'in after-hours so far'
   }
-  return null
+  if (fromLabel === 'CLOSED' || fromLabel === 'CLOSE') return 'at the close'
+  return 'so far today'
 }
 
 /**
@@ -465,43 +497,33 @@ export function moveIntensityWord(direction, movePercent) {
 /**
  * Lookback phrase for alert titles.
  *
- * Day / session card:  "in pre-market so far" / "in after-hours so far" / "so far today"
- * Normal (wall-clock ≈ window):  "in last 3 hours" / "in last 1 hour 31 mins"
- * Mismatch only (closed gap):    "in last 3 trading hours" / "in last 24 trading hours"
- * Extended hours + rolling window: append " · pre-market" etc.
+ * Day + PRE/POST/overnight:  "in pre-market so far" / … (no clock duration)
+ * Rolling window (5m/60m/…): "in last 60 minutes" even if wall clock is still PRE
+ * Gap (weekend):             "in last 3 trading hours"
  *
  * @param {number|null|undefined} minutes  minutes to name in the phrase
  * @param {{
  *   useTradingWording?: boolean,
  *   marketSession?: string|null,
  *   windowKey?: string|null,
+ *   exactLabel?: string|null,
  * }} [opts]
  * @returns {string}
  */
 export function formatLookbackTitlePhrase(minutes, opts = {}) {
-  const sessionWhen = sessionTitlePhrase(opts.marketSession, opts.windowKey)
+  const sessionWhen = sessionTitlePhrase(
+    opts.marketSession,
+    opts.windowKey,
+    opts.exactLabel,
+  )
   if (sessionWhen) return sessionWhen
 
-  let base
   if (minutes == null || !Number.isFinite(Number(minutes)) || Number(minutes) <= 0) {
-    base = 'in last session'
-  } else {
-    base = formatHumanLookbackDuration(minutes, {
-      useTradingWording: Boolean(opts.useTradingWording),
-    })
+    return 'in last session'
   }
-
-  // Rolling windows during pre/post: keep duration, tag the session
-  const sess = sessionDisplayLabel(opts.marketSession)
-  if (
-    sess &&
-    sess !== 'regular' &&
-    sess !== 'closed' &&
-    String(opts.windowKey || '').trim() !== 'day'
-  ) {
-    return `${base} · ${sess}`
-  }
-  return base
+  return formatHumanLookbackDuration(minutes, {
+    useTradingWording: Boolean(opts.useTradingWording),
+  })
 }
 
 /**
@@ -660,6 +682,7 @@ export function buildMomentumAlertTitle(opts = {}) {
     useTradingWording,
     marketSession: opts.marketSession,
     windowKey: opts.windowKey,
+    exactLabel: opts.exactLabel,
   })
   return [emoji, heading, pct, intensity, when]
     .filter(Boolean)
@@ -928,7 +951,9 @@ export function buildNotificationCopy(ev) {
   /**
    * Strong giveback (≥60% of peak/trough move faded) — one-shot fade alert.
    * Example: peak +8.0%, remaining +3.2% → 60% giveback
-   *   "🟢 SNDK has given back 60% of its surge"
+   *   "🔴 SNDK has given back 60% of its surge"   (UP fade → red)
+   *   "🟢 XYZ has given back 60% of its decline"  (DOWN fade → green)
+   * Emoji is inverted vs the original move: fade = adverse to the open episode.
    * Named STRONG_WEAKENING / STRONG_GIVEBACK — not REVERSAL (true reverse is separate).
    * Legacy MOMENTUM_STRONG_REVERSAL still accepted for hydrated history.
    */
@@ -971,13 +996,15 @@ export function buildNotificationCopy(ev) {
     const remDisp = Number.isFinite(remaining)
       ? fmtDisplayPct(remaining)
       : 'a fraction'
+    // Invert emoji vs episode direction (UP fade → 🔴, DOWN fade → 🟢)
+    const fadeDir = dir === 'UP' ? 'DOWN' : 'UP'
 
     if (dir === 'UP') {
       return {
         title: withDirectionCircle(
           `${name} has given back ${gbRounded}% of its surge`,
-          dir,
-          move,
+          fadeDir,
+          null,
         ),
         body: `The earlier ${peakDisp} move has faded sharply, with about ${remDisp} remaining.`,
       }
@@ -985,8 +1012,8 @@ export function buildNotificationCopy(ev) {
     return {
       title: withDirectionCircle(
         `${name} has given back ${gbRounded}% of its decline`,
-        dir,
-        move,
+        fadeDir,
+        null,
       ),
       body: `The earlier ${peakDisp} move has faded sharply, with about ${remDisp} remaining.`,
     }

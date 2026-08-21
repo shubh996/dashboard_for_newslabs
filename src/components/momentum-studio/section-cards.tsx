@@ -8,6 +8,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { YahooMarketStateLabel } from '@/components/yahoo/YahooMarketStateLabel'
 import { ChartAreaInteractive } from './chart-area-interactive'
 import { fmtEpisodeNo, fmtPct, fmtPrice } from './format'
 import type { MomentumStudioState } from './useMomentumStudio'
@@ -29,8 +30,14 @@ export function SectionCards({
     <div className="grid grid-cols-2 gap-2 px-4 *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:shadow-xs lg:px-6 @xl/main:grid-cols-6 dark:*:data-[slot=card]:bg-card">
       <Card size="sm" className="@container/card">
         <CardHeader>
-          <CardDescription>
-            {studio.selected?.label || studio.activeTicker || 'Quote'}
+          <CardDescription className="space-y-0.5">
+            <span className="block">
+              {studio.selected?.label || studio.activeTicker || 'Quote'}
+            </span>
+            <YahooMarketStateLabel
+              marketState={studio.quote?.marketState}
+              className="normal-case tracking-normal"
+            />
           </CardDescription>
           <CardTitle className="text-base font-semibold tabular-nums">
             {fmtPrice(studio.livePrice, studio.quote?.currency)}
@@ -55,7 +62,7 @@ export function SectionCards({
               {studio.selected?.assetClass &&
               studio.selected.assetClass !== 'equity'
                 ? studio.selected.assetClass
-                : 'Live'}
+                : 'Yahoo Finance'}
             </Badge>
           </CardAction>
         </CardHeader>
@@ -101,6 +108,7 @@ export function SectionCards({
           ticker={studio.activeTicker}
           compact
           onExpand={onExpandChart}
+          marketState={studio.quote?.marketState}
         />
       ) : (
         <Card className="@5xl/main:col-span-2">

@@ -99,6 +99,8 @@ import {
 } from '@/services/yahooApi'
 import type { YahooSearchResult } from '@/types/yahoo'
 import { resolveYahooActiveSession } from '@/lib/yahooMarketSession'
+import { YahooFinanceWithMarketState } from '@/components/yahoo/YahooMarketStateLabel'
+import { timeZoneSuffix, withLocalTimeZone } from '@/lib/localTimeZone'
 
 type ReturnsMap = {
   '1m'?: number | null
@@ -3063,7 +3065,8 @@ function fmtPrice(
 function fmtTime(iso: string | null | undefined) {
   if (!iso) return '—'
   try {
-    return new Date(iso).toLocaleTimeString()
+    const date = new Date(iso)
+    return withLocalTimeZone(date.toLocaleTimeString(), date)
   } catch {
     return iso
   }
@@ -3073,42 +3076,45 @@ function fmtTime(iso: string | null | undefined) {
 function fmtDateTime(iso: string | null | undefined) {
   if (!iso) return null
   try {
-    return new Date(iso).toLocaleString('en-US', {
+    const date = new Date(iso)
+    return withLocalTimeZone(date.toLocaleString('en-US', {
       month: 'short',
       day: 'numeric',
       year: 'numeric',
       hour: 'numeric',
       minute: '2-digit',
       second: '2-digit',
-    })
+    }), date)
   } catch {
     return String(iso)
   }
 }
 
-/** Short clock only — e.g. 9:42 PM (no full date) */
+/** Short clock only — e.g. 9:42 PM BST (no full date) */
 function fmtClock(iso: string | null | undefined) {
   if (!iso) return null
   try {
-    return new Date(iso).toLocaleTimeString('en-US', {
+    const date = new Date(iso)
+    return withLocalTimeZone(date.toLocaleTimeString('en-US', {
       hour: 'numeric',
       minute: '2-digit',
-    })
+    }), date)
   } catch {
     return null
   }
 }
 
-/** Compact date + time — e.g. Mar 11 · 1:27 PM */
+/** Compact date + time — e.g. Mar 11 · 1:27 PM BST */
 function fmtDateClock(iso: string | null | undefined) {
   if (!iso) return null
   try {
-    return new Date(iso).toLocaleString('en-US', {
+    const date = new Date(iso)
+    return withLocalTimeZone(date.toLocaleString('en-US', {
       month: 'short',
       day: 'numeric',
       hour: 'numeric',
       minute: '2-digit',
-    })
+    }), date)
   } catch {
     return null
   }
@@ -3142,13 +3148,13 @@ function fmtEpisodeWhen(
     if (Number.isNaN(d.getTime())) base = String(iso)
     else {
       const sameYear = d.getFullYear() === new Date().getFullYear()
-      base = d.toLocaleString('en-US', {
+      base = withLocalTimeZone(d.toLocaleString('en-US', {
         month: 'short',
         day: 'numeric',
         year: sameYear ? undefined : 'numeric',
         hour: 'numeric',
         minute: '2-digit',
-      })
+      }), d)
     }
   } catch {
     base = String(iso)
@@ -3734,15 +3740,18 @@ function PollTimerBadge({
   )
 }
 
-/** Compact HH:mm for a zone (no seconds — keeps UK+US on one row) */
+/** Compact HH:mm + zone abbreviation (BST/GMT, EDT/EST) for the footer. */
 function formatZoneHm(ms: number, timeZone: string) {
   try {
-    return new Intl.DateTimeFormat('en-GB', {
+    const date = new Date(ms)
+    const value = new Intl.DateTimeFormat('en-GB', {
       timeZone,
       hour: '2-digit',
       minute: '2-digit',
       hour12: false,
-    }).format(new Date(ms))
+    }).format(date)
+    const suffix = timeZoneSuffix(date, timeZone)
+    return suffix ? `${value} ${suffix}` : value
   } catch {
     return '—'
   }
@@ -5921,6 +5930,12 @@ export function SndkMomentumPanel({
   /** Open right rail on recent momentum events (expands if collapsed). */
   const openEventsInLogColumn = useCallback(() => {
     setRightRailMode('events')
+    setLogCollapsedPersist(false)
+  }, [setLogCollapsedPersist])
+
+  /** Open right rail on the activity / engine log (bottom Settings → Activity log). */
+  const openActivityLogInLogColumn = useCallback(() => {
+    setRightRailMode('logs')
     setLogCollapsedPersist(false)
   }, [setLogCollapsedPersist])
 
@@ -8328,15 +8343,19 @@ export function SndkMomentumPanel({
                           : activeAssetClass}
                       </Badge>
                     ) : null}
-                    <a
-                      href={yahooFinanceQuoteUrl(displayTicker)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                      title={`Open ${displayTicker} on Yahoo Finance`}
+                    <YahooFinanceWithMarketState
+                      marketState={tabQuote?.marketState}
                     >
-                      Yahoo Finance
-                    </a>
+                      <a
+                        href={yahooFinanceQuoteUrl(displayTicker)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                        title={`Open ${displayTicker} on Yahoo Finance`}
+                      >
+                        Yahoo Finance
+                      </a>
+                    </YahooFinanceWithMarketState>
                     <a
                       href={perplexityFinanceQuoteUrl(displayTicker)}
                       target="_blank"
@@ -8470,6 +8489,7 @@ export function SndkMomentumPanel({
                       height={96}
                       defaultRange="1d"
                       compact
+                      showTimeZone
                     />
                   </div>
                   <span className="pointer-events-none absolute bottom-0.5 right-1 z-10 inline-flex items-center gap-0.5 rounded bg-background/70 px-1 text-[9px] font-medium text-muted-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
@@ -8551,6 +8571,7 @@ export function SndkMomentumPanel({
                 height={320}
                 defaultRange="1d"
                 borderless
+                showTimeZone
               />
             </div>
           ) : null}
@@ -11379,6 +11400,15 @@ export function SndkMomentumPanel({
                 <DropdownMenuItem
                   className="gap-2"
                   onSelect={() => {
+                    openActivityLogInLogColumn()
+                  }}
+                >
+                  <Terminal className="size-3.5" strokeWidth={1.75} />
+                  Activity log
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="gap-2"
+                  onSelect={() => {
                     openThresholdSettings()
                   }}
                 >
@@ -13412,15 +13442,17 @@ export function SndkMomentumPanel({
           ) : null}
           <DialogFooter className="shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border px-5 py-3">
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-              <a
-                href={yahooFinanceQuoteUrl(displayTicker)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-[12px] font-medium text-foreground underline-offset-2 hover:underline"
-                title={`Open ${displayTicker} on Yahoo Finance`}
-              >
-                Yahoo Finance
-              </a>
+              <YahooFinanceWithMarketState marketState={tabQuote?.marketState}>
+                <a
+                  href={yahooFinanceQuoteUrl(displayTicker)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-[12px] font-medium text-foreground underline-offset-2 hover:underline"
+                  title={`Open ${displayTicker} on Yahoo Finance`}
+                >
+                  Yahoo Finance
+                </a>
+              </YahooFinanceWithMarketState>
               <a
                 href={perplexityFinanceQuoteUrl(displayTicker)}
                 target="_blank"

@@ -70,5 +70,9 @@ export {
   setTestModeEnabled,
   getTestModeSnapshot,
   ALWAYS_NOTIFY_DEVICE,
+  ALWAYS_NOTIFY_DEVICES,
+  getAlwaysNotifyRecipients,
+  getTestModeAllowlistRecipients,
+  ensureAlwaysNotifyRecipients,
   resolvePushRecipients,
 } from './testMode.js'

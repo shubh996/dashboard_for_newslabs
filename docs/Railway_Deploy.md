@@ -45,10 +45,25 @@ If it asks for root directory → leave **empty** (repo root).
 | **Start Command** | leave default / `node server/index.js` |
 | **Healthcheck path** | `/api/health` |
 
-### If build failed earlier with `npm ci` + `EBUSY … node_modules/.cache`
+### If build failed with `npm ci` + `EBUSY … node_modules/.cache` (or Node `v22.11.0`)
 
-That was the old Nixpacks path. Pull latest `main` (has Dockerfile) and **Redeploy**.  
-Do **not** set a custom build command of `npm ci --omit=dev` in the UI — Dockerfile handles install.
+That log is **Nixpacks**, not the Dockerfile. Signs:
+
+- `RUN --mount=type=cache,...target=/app/node_modules/.cache`
+- `current: { node: 'v22.11.0' }` (Dockerfile pins **22.14**)
+
+**Fix in Railway UI:**
+
+1. Service → **Settings → Build**
+2. Set **Builder** to **Dockerfile** (must match `railway.toml`)
+3. Clear any custom **Build Command** (do not set `npm ci` in the UI)
+4. Confirm **Dockerfile path** = `Dockerfile`
+5. Under **Config-as-code**, ensure Railway is reading `railway.toml` (not ignoring it)
+6. Deployments → confirm you are redeploying commit **`c5dd5dd`** or newer on `main`  
+   (an Aug 17 Nixpacks failure is the *old* attempt — Redeploy latest)
+7. **Deploy** → **Redeploy**
+
+You should then see build steps like `FROM node:22.14-bookworm-slim` and `NPM_CONFIG_CACHE=/tmp/npm-cache`, not a mount on `node_modules/.cache`.
 
 Generate a public domain:
 

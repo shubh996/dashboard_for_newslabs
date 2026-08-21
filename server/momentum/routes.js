@@ -327,6 +327,92 @@ export function createMomentumRouter() {
   })
 
   /**
+   * Compact row for history list (ACTIVE + closed/expired/ended).
+   * @param {Record<string, unknown>} ep
+   * @param {string} ticker
+   */
+  function episodeHistorySummary(ep, ticker) {
+    if (!ep) return null
+    const status = String(ep.status || '').toUpperCase() || 'UNKNOWN'
+    return {
+      ticker: String(ticker || ep.ticker || '').toUpperCase(),
+      episodeId: ep.episodeId || ep.episode_id || null,
+      episodeNo: ep.episodeNo ?? ep.episode_no ?? null,
+      direction: ep.direction === 'DOWN' ? 'DOWN' : 'UP',
+      status,
+      state: ep.state || null,
+      endReason: ep.endReason || ep.end_reason || null,
+      detectedWindow: ep.detectedWindow || ep.windowType || null,
+      currentMovePercent:
+        ep.currentMovePercent != null ? Number(ep.currentMovePercent) : null,
+      peakMovePercent:
+        ep.peakMovePercent != null ? Number(ep.peakMovePercent) : null,
+      initialMovePercent:
+        ep.initialMovePercent != null
+          ? Number(ep.initialMovePercent)
+          : ep.triggerMovePct != null
+            ? Number(ep.triggerMovePct)
+            : null,
+      currentPrice: ep.currentPrice != null ? Number(ep.currentPrice) : null,
+      episodeStartedAt: ep.episodeStartedAt || ep.triggerTime || null,
+      endedAt: ep.endedAt || ep.ended_at || null,
+      exactLabel: ep.exactLabel || null,
+      marketSession: ep.marketSession || null,
+    }
+  }
+
+  /**
+   * GET /api/momentum/episodes-history
+   * All episodes so far (history + live ACTIVE) across watched tickers.
+   * Query: refresh=1 · limit=120 · perTicker=40
+   */
+  router.get('/episodes-history', async (request, response) => {
+    try {
+      const refresh =
+        String(request.query.refresh || '').trim() === '1' ||
+        String(request.query.refresh || '').toLowerCase() === 'true'
+      const limit = Number(request.query.limit) || 120
+      const perTicker = Number(request.query.perTicker) || 40
+      const watched = store.listWatchedTickers()
+      if (refresh) {
+        await Promise.all(
+          watched.map((t) =>
+            refreshEpisodesFromSupabase(t).catch(() => null),
+          ),
+        )
+      }
+      const raw = store.listAllEpisodeHistory({
+        tickers: watched,
+        perTicker,
+        limit,
+      })
+      const episodes = raw
+        .map((ep) => episodeHistorySummary(ep, ep.ticker))
+        .filter(Boolean)
+      const activeEpisodes = store
+        .listActiveEpisodes()
+        .map((ep) => activeEpisodeSummary(ep, ep.ticker))
+        .filter(Boolean)
+      response.json({
+        ok: true,
+        count: episodes.length,
+        episodes,
+        activeEpisodes,
+        activeCount: activeEpisodes.length,
+        at: new Date().toISOString(),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to list episode history',
+      })
+    }
+  })
+
+  /**
    * Register UI watchlist + active focus tab.
    * Background loop polls **only** `active` (or `focus`) aggressively.
    * Body: { tickers?: string[], active?: string, focus?: string }
@@ -549,10 +635,15 @@ export function createMomentumRouter() {
 
   /**
    * GET /api/momentum/test-mode
-   * POST /api/momentum/test-mode  body: { enabled: true|false }
+   * POST /api/momentum/test-mode
+   *   body: {
+   *     enabled: true|false,
+   *     selectedDeviceIds?: string[],
+   *     selectedTokens?: string[],
+   *   }
    *
-   * ON  → only always-notify tester device gets Expo pushes; Perplexity dummy
-   * OFF → real subscribers + always-notify tester; real Perplexity (unless env)
+   * ON  → only picker-selected devices get Expo pushes; Perplexity dummy
+   * OFF → real subscribers + both always-notify testers; real Perplexity
    */
   router.get('/market-status', async (_request, response) => {
     try {
@@ -596,7 +687,15 @@ export function createMomentumRouter() {
         raw === '1' ||
         String(raw).toLowerCase() === 'true' ||
         String(raw).toLowerCase() === 'on'
-      const snap = setTestModeEnabled(enabled)
+      const allowlist = {
+        selectedDeviceIds: Array.isArray(body.selectedDeviceIds)
+          ? body.selectedDeviceIds
+          : undefined,
+        selectedTokens: Array.isArray(body.selectedTokens)
+          ? body.selectedTokens
+          : undefined,
+      }
+      const snap = setTestModeEnabled(enabled, allowlist)
       const logOn = store.listWatchedTickers()[0] || MOMENTUM_TICKER
       store.pushLog(
         logOn,

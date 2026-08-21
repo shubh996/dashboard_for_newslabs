@@ -18,6 +18,11 @@ import { YahooInteractiveChart } from '@/components/yahoo/YahooInteractiveChart'
 import { fetchYahooQuote, type YahooLiveQuote } from '@/services/yahooApi'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
+import {
+  YahooFinanceWithMarketState,
+  YahooMarketStateLabel,
+} from '@/components/yahoo/YahooMarketStateLabel'
+import { SourceBadge } from '@/components/tickerDashboard/SourceBadge'
 
 function rawNum(value: unknown): number | null {
   if (value == null) return null
@@ -723,7 +728,7 @@ export function YahooOverviewSection({ data }: { data: YahooStructuredData }) {
 
   return (
     <div className="space-y-6">
-      {/* Header: company name only (tab already says Overview) — no Yahoo badge */}
+      {/* Header: company name + live Yahoo market state above Yahoo Finance */}
       <div className="space-y-1.5">
         <div className="flex flex-wrap items-center gap-2.5">
           <h2 className="text-3xl font-bold tracking-tight text-foreground sm:text-4xl">{companyName}</h2>
@@ -732,6 +737,9 @@ export function YahooOverviewSection({ data }: { data: YahooStructuredData }) {
               {data.isEtf || String(data.quoteType || '').toUpperCase() === 'ETF' ? 'ETF' : 'Fund'}
             </span>
           ) : null}
+          <YahooFinanceWithMarketState marketState={liveQuote?.marketState}>
+            <SourceBadge source="yahoo-finance" />
+          </YahooFinanceWithMarketState>
         </div>
         {metaLine ? <p className="text-sm text-muted-foreground">{metaLine}</p> : null}
         <div className="pt-1">
@@ -749,6 +757,7 @@ export function YahooOverviewSection({ data }: { data: YahooStructuredData }) {
             ) : liveError ? (
               <span className="text-[11px] text-amber-600 dark:text-amber-400">Snapshot price</span>
             ) : null}
+            <YahooMarketStateLabel marketState={liveQuote?.marketState} />
           </div>
           <div className="mt-0.5 flex flex-wrap items-end gap-x-3 gap-y-1">
             <div className="text-3xl font-semibold tracking-tight tabular-nums text-foreground sm:text-4xl">
@@ -766,9 +775,6 @@ export function YahooOverviewSection({ data }: { data: YahooStructuredData }) {
                 {formatDecimal(change)}
                 {changePct != null ? ` (${formatPercent(changePct, 1)})` : ''}
               </div>
-            ) : null}
-            {liveQuote?.marketState ? (
-              <div className="pb-1 text-xs text-muted-foreground">{liveQuote.marketState}</div>
             ) : null}
           </div>
         </div>

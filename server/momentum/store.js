@@ -452,6 +452,67 @@ export function listHistoryEpisodes(ticker, limit = 40) {
 }
 
 /**
+ * Merge history (+ live ACTIVE if missing from history) across tickers.
+ * Newest-first. Used by Momentum Studio “all episodes so far” list.
+ *
+ * @param {{ tickers?: string[], perTicker?: number, limit?: number }} [opts]
+ * @returns {Array<Record<string, unknown>>}
+ */
+export function listAllEpisodeHistory(opts = {}) {
+  const tickers = Array.isArray(opts.tickers) && opts.tickers.length
+    ? opts.tickers.map((t) => normalizeMomentumTicker(t)).filter(Boolean)
+    : listWatchedTickers()
+  const perTicker = Math.min(80, Math.max(1, Number(opts.perTicker) || 40))
+  const limit = Math.min(400, Math.max(1, Number(opts.limit) || 120))
+  /** @type {Map<string, Record<string, unknown>>} */
+  const byId = new Map()
+
+  for (const key of tickers) {
+    for (const ep of listHistoryEpisodes(key, perTicker)) {
+      const id = String(ep.episodeId || ep.episode_id || '')
+      if (!id) continue
+      byId.set(id, { ...ep, ticker: key })
+    }
+    const live = getActiveEpisode(key)
+    if (live && String(live.status || '').toUpperCase() === 'ACTIVE') {
+      const id = String(live.episodeId || live.episode_id || '')
+      if (id && !byId.has(id)) {
+        byId.set(id, { ...live, ticker: key, status: 'ACTIVE' })
+      } else if (id && byId.has(id)) {
+        // Prefer live fields for currently ACTIVE
+        byId.set(id, { ...byId.get(id), ...live, ticker: key, status: 'ACTIVE' })
+      }
+    }
+  }
+
+  const out = [...byId.values()]
+  out.sort((a, b) => {
+    const tb =
+      Date.parse(
+        String(
+          b.episodeStartedAt ||
+            b.triggerTime ||
+            b.started_at ||
+            b.endedAt ||
+            '',
+        ),
+      ) || 0
+    const ta =
+      Date.parse(
+        String(
+          a.episodeStartedAt ||
+            a.triggerTime ||
+            a.started_at ||
+            a.endedAt ||
+            '',
+        ),
+      ) || 0
+    return tb - ta
+  })
+  return out.slice(0, limit)
+}
+
+/**
  * Replace Daily Digest list (hydrate). Newest-first by detected_at.
  * @param {string} ticker
  * @param {Array<Record<string, unknown>>} digests

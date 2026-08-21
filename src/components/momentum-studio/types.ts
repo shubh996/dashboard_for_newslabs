@@ -120,6 +120,18 @@ export type StudioStatus = {
       alwaysNotify?: {
         device_id?: string
         expo_push_token?: string
+        label?: string
+      }
+      alwaysNotifyDevices?: Array<{
+        id?: string
+        label?: string
+        device_id?: string
+        expo_push_token?: string
+        aliases?: string[]
+      }>
+      selectedAllowlist?: {
+        selectedDeviceIds?: string[]
+        selectedTokens?: string[]
       }
     }
   }
@@ -127,13 +139,19 @@ export type StudioStatus = {
 
 export type ActiveEpisodeRow = {
   ticker: string
+  episodeId?: string | null
   episodeNo?: number | null
   direction?: string
   state?: string | null
   status?: string
+  endReason?: string | null
   detectedWindow?: string | null
   currentMovePercent?: number | null
   peakMovePercent?: number | null
+  initialMovePercent?: number | null
   currentPrice?: number | null
   episodeStartedAt?: string | null
+  endedAt?: string | null
+  exactLabel?: string | null
+  marketSession?: string | null
 }

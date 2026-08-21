@@ -30,10 +30,10 @@ import {
 } from './momentum/notifyCopy.js'
 import {
   isTestModeEnabled,
-  getAlwaysNotifyRecipient,
-  ensureAlwaysNotifyRecipient,
+  getTestModeAllowlistRecipients,
+  ensureAlwaysNotifyRecipients,
   resolvePushRecipients,
-  ALWAYS_NOTIFY_DEVICE,
+  ALWAYS_NOTIFY_DEVICES,
 } from './momentum/testMode.js'
 
 const FIRECRAWL_BASE = 'https://api.firecrawl.dev/v1'
@@ -2938,7 +2938,7 @@ function isSubscriberEnabled(subscriber) {
 
 /**
  * Delivery gates:
- *  1. Dashboard Test Mode ON  → only the hard-coded tester device
+ *  1. Dashboard Test Mode ON  → selected allowlist from Test Mode picker
  *  2. Else legacy PUSH_ALLOWLIST_* env → only those devices
  *  3. Else all eligible subscribers (+ always-notify injected elsewhere)
  *
@@ -2947,17 +2947,24 @@ function isSubscriberEnabled(subscriber) {
  *   PUSH_ALLOWLIST_TOKENS=ExponentPushToken[…]
  */
 function getPushAllowlist() {
-  // Dashboard Test Mode: only the hard-coded always-notify tester
+  // Dashboard Test Mode: selected devices from the Studio picker
   if (isTestModeEnabled()) {
-    const id = ALWAYS_NOTIFY_DEVICE.device_id
-    const token = ALWAYS_NOTIFY_DEVICE.expo_push_token
+    const forced = getTestModeAllowlistRecipients('trigger')
+    const deviceIds = forced.map((r) => r.device_id).filter(Boolean)
+    const tokens = forced.map((r) => r.expo_push_token).filter(Boolean)
+    // Include aliases so legacy device_ids still pass filters
+    for (const d of ALWAYS_NOTIFY_DEVICES) {
+      if (tokens.includes(d.expo_push_token) || deviceIds.includes(d.device_id)) {
+        for (const a of d.aliases || []) deviceIds.push(a)
+      }
+    }
     return {
       active: true,
       source: 'test_mode',
-      deviceIds: [id],
-      tokens: [token],
-      deviceIdSet: new Set([id]),
-      tokenSet: new Set([token]),
+      deviceIds,
+      tokens,
+      deviceIdSet: new Set(deviceIds),
+      tokenSet: new Set(tokens),
     }
   }
   // Legacy env allowlist only when explicitly opted in (does NOT run with Test Mode OFF by default)
@@ -3000,7 +3007,7 @@ function getPushAllowlist() {
  */
 function forceAllowlistRecipients(appKey = 'trigger') {
   if (isTestModeEnabled()) {
-    return [getAlwaysNotifyRecipient(appKey)]
+    return getTestModeAllowlistRecipients(appKey)
   }
   const allow = getPushAllowlist()
   if (!allow.active) return null
@@ -3127,9 +3134,9 @@ export function collectPushRecipients(rows, appKey = 'nineam') {
     return forced
   }
 
-  // Real subscribers + always-notify tester (even if not on this ticker)
+  // Real subscribers + both always-notify testers (even if not on this ticker)
   const subs = listWatchlistSubscribers(rows, selectedApp)
-  return ensureAlwaysNotifyRecipient(subs, selectedApp)
+  return ensureAlwaysNotifyRecipients(subs, selectedApp)
 }
 
 /**

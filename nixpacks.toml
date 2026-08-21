@@ -1,9 +1,20 @@
-# Railway uses Nixpacks by default. Keep install light — no frontend build.
+# Fallback only — prefer Dockerfile via railway.toml (builder = "DOCKERFILE").
+# If Railway still uses Nixpacks, keep npm cache off node_modules/.cache (EBUSY)
+# and avoid a Vite/frontend build on the API host.
+
+[variables]
+NPM_CONFIG_CACHE = "/tmp/npm-cache"
+NODE_ENV = "production"
+
 [phases.setup]
 nixPkgs = ["nodejs_22"]
+cmds = ["mkdir -p /tmp/npm-cache"]
 
 [phases.install]
-cmds = ["npm ci --omit=dev"]
+cmds = ["npm ci --omit=dev --no-audit --no-fund"]
+
+[phases.build]
+cmds = ["echo 'API-only image; skipping frontend build'"]
 
 [start]
-cmd = "npm start"
+cmd = "node server/index.js"

@@ -13,7 +13,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:momentum": "node --test server/momentum/engine.test.js server/momentum/usEquitySession.test.js server/momentum/marketGate.test.js server/momentum/wakeClose.test.js server/momentum/dailyDigest.test.js server/momentum/marketSessionBulletin.test.js",
+    "test:momentum": "node --test server/momentum/engine.test.js server/momentum/usEquitySession.test.js server/momentum/marketGate.test.js server/momentum/wakeClose.test.js server/momentum/dailyDigest.test.js server/momentum/marketSessionBulletin.test.js server/momentum/testMode.test.js",
     "start": "node server/index.js",
     "start:api": "node server/index.js",
     "deploy:hetzner": "bash deploy/hetzner/deploy.sh",

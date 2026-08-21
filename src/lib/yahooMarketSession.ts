@@ -110,6 +110,29 @@ export function yahooSessionLabel(state: YahooMarketState | null): string | null
   return null
 }
 
+/**
+ * Display string for UI next to Yahoo Finance — real Yahoo marketState only.
+ * Never invents a session from the wall clock.
+ */
+export function yahooMarketStateDisplay(raw?: string | null): {
+  state: YahooMarketState | null
+  /** Human label, or “Market state unavailable” when Yahoo did not return a known state */
+  label: string
+  available: boolean
+} {
+  const state = normalizeYahooMarketState(raw)
+  if (!state) {
+    return {
+      state: null,
+      label: 'Market state unavailable',
+      available: false,
+    }
+  }
+  const label =
+    yahooSessionLabelLong(state) || yahooSessionLabel(state) || state
+  return { state, label, available: true }
+}
+
 /** Longer label for pills / tooltips. */
 export function yahooSessionLabelLong(state: YahooMarketState | null): string | null {
   if (!state) return null
