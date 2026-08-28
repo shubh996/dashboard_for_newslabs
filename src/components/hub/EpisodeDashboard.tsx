@@ -97,7 +97,6 @@ import {
   fetchYahooQuote,
   fetchYahooQuotes,
   fetchYahooSavedTickers,
-  resolveYahooLogoUrl,
   searchYahooSaved,
   type YahooLiveQuote,
 } from '@/services/yahooApi'
@@ -3091,7 +3090,6 @@ type MomentumStatus = {
   snapshot: {
     marketSession?: string
     currentPrice?: number
-    returns?: Record<string, number | null | undefined>
     previousClose?: number | null
     previousCloseTime?: string | null
     lastSessionKind?: string | null
@@ -4578,18 +4576,6 @@ function PerplexityLogo({ className }: { className?: string }) {
     />
   )
 }
-
-
-
-function tradingViewSymbolUrl(ticker: string) {
-  const t = String(ticker || '')
-    .trim()
-    .toUpperCase()
-  // Chart deep-link works for equities / most Yahoo symbols
-  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(t)}`
-}
-
-
 
 /** Compact poll countdown chip */
 function PollTimerBadge({
