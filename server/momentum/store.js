@@ -1,6 +1,6 @@
 /**
  * In-memory per-ticker episode + event store.
- * History is hydrated from / persisted to Supabase (momentum_episodes).
+ * History is hydrated from / persisted to Supabase (episodes_* class tables).
  * Rearm gates + threshold edge snapshots also persist to local disk so restarts
  * do not invent STARTs from already-elevated windows.
  */
@@ -92,6 +92,24 @@ const episodeNoByTicker = new Map()
 
 /** Tickers already hydrated from Supabase. */
 const hydratedTickers = new Set()
+/** ticker → Date.now() of last successful hydrate */
+const hydratedAtMs = new Map()
+
+export const HYDRATE_TTL_MS = 120_000
+
+export function isHydratedFresh(ticker, ttlMs = HYDRATE_TTL_MS) {
+  const key = normalizeMomentumTicker(ticker)
+  if (!key) return false
+  const at = hydratedAtMs.get(key)
+  return Number.isFinite(at) && Date.now() - at < ttlMs
+}
+
+export function invalidateHydration(ticker) {
+  const key = normalizeMomentumTicker(ticker)
+  if (!key) return
+  hydratedTickers.delete(key)
+  hydratedAtMs.delete(key)
+}
 
 /**
  * After a manual End, do not start a new episode until ≤24h/1D goes quiet.
@@ -455,15 +473,16 @@ export function listHistoryEpisodes(ticker, limit = 40) {
  * Merge history (+ live ACTIVE if missing from history) across tickers.
  * Newest-first. Used by Momentum Studio “all episodes so far” list.
  *
- * @param {{ tickers?: string[], perTicker?: number, limit?: number }} [opts]
- * @returns {Array<Record<string, unknown>>}
+ * @param {{ tickers?: string[], perTicker?: number, limit?: number, offset?: number }} [opts]
+ * @returns {{ rows: Array<Record<string, unknown>>, total: number, offset: number, limit: number, hasMore: boolean }}
  */
 export function listAllEpisodeHistory(opts = {}) {
   const tickers = Array.isArray(opts.tickers) && opts.tickers.length
     ? opts.tickers.map((t) => normalizeMomentumTicker(t)).filter(Boolean)
     : listWatchedTickers()
-  const perTicker = Math.min(80, Math.max(1, Number(opts.perTicker) || 40))
-  const limit = Math.min(400, Math.max(1, Number(opts.limit) || 120))
+  const perTicker = Math.min(80, Math.max(1, Number(opts.perTicker) || 80))
+  const limit = Math.min(200, Math.max(1, Number(opts.limit) || 40))
+  const offset = Math.max(0, Number(opts.offset) || 0)
   /** @type {Map<string, Record<string, unknown>>} */
   const byId = new Map()
 
@@ -509,7 +528,14 @@ export function listAllEpisodeHistory(opts = {}) {
       ) || 0
     return tb - ta
   })
-  return out.slice(0, limit)
+  const total = out.length
+  return {
+    rows: out.slice(offset, offset + limit),
+    total,
+    offset,
+    limit,
+    hasMore: offset + limit < total,
+  }
 }
 
 /**
@@ -818,7 +844,9 @@ export function isHydrated(ticker) {
 
 export function markHydrated(ticker) {
   const key = normalizeMomentumTicker(ticker)
-  if (key) hydratedTickers.add(key)
+  if (!key) return
+  hydratedTickers.add(key)
+  hydratedAtMs.set(key, Date.now())
 }
 
 function eventDedupeKey(ev) {
@@ -1125,6 +1153,7 @@ export function resetStore(ticker) {
     rearmGate.delete(key)
     thresholdEdges.delete(key)
     hydratedTickers.delete(key)
+    hydratedAtMs.delete(key)
     // Drop push keys for this ticker prefix (best-effort)
     for (const k of [...pushIdempotencyKeys.keys()]) {
       if (k.startsWith(`${key}:`) || k.includes(`:${key}:`)) {
@@ -1139,6 +1168,7 @@ export function resetStore(ticker) {
   rearmGate.clear()
   thresholdEdges.clear()
   hydratedTickers.clear()
+  hydratedAtMs.clear()
   pushIdempotencyKeys.clear()
   // Re-seed empty buckets for currently watched so loop keeps working
   for (const key of watched) {

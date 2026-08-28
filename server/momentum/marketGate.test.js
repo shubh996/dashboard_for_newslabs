@@ -123,11 +123,16 @@ describe('market session calendar + freshness gate', () => {
     assert.notEqual(formatHmInTimeZone(open, UK_ZONE), '14:30')
   })
 
-  it('T12: dashboard headline is five probes; popup is informational', () => {
-    assert.equal(HEADLINE_PROBES.length, 5)
+  it('T12: dashboard headline probes cover global exchanges; popup is informational', () => {
+    assert.ok(HEADLINE_PROBES.length >= 15)
     assert.equal(HEADLINE_PROBES[0].symbol, 'SPY')
-    assert.equal(HEADLINE_PROBES[4].symbol, 'ES=F')
-    assert.equal(HEADLINE_PROBES[4].child.symbol, '^GSPC')
+    const indices = HEADLINE_PROBES.find((p) => p.id === 'indices')
+    assert.ok(indices)
+    assert.equal(indices.symbol, 'ES=F')
+    assert.equal(indices.child.symbol, '^GSPC')
+    assert.ok(HEADLINE_PROBES.some((p) => p.id === 'india-nse'))
+    assert.ok(HEADLINE_PROBES.some((p) => p.id === 'uk-stocks'))
+    assert.ok(HEADLINE_PROBES.some((p) => p.id === 'japan'))
   })
 
   it('T13: weekend reopen walkback is a gap, not continuous 8h', () => {

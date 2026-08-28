@@ -14,13 +14,24 @@ const CLASS_LABEL: Record<string, string> = {
   commodity: 'Commodities',
 }
 
-export function AssetClassRail({ studio }: { studio: MomentumStudioState }) {
+export function AssetClassRail({
+  studio,
+  className,
+}: {
+  studio: MomentumStudioState
+  className?: string
+}) {
   const label = CLASS_LABEL[studio.assetClass] || 'List'
   const list = studio.classTickers
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-l bg-background">
-      <div className="flex h-10 shrink-0 items-center justify-between px-3">
+    <aside
+      className={cn(
+        'flex w-60 shrink-0 flex-col border-l bg-background',
+        className,
+      )}
+    >
+      <div className="flex h-(--header-height) shrink-0 items-center justify-between px-3">
         <p className="text-sm font-medium">{label}</p>
         <p className="text-xs tabular-nums text-muted-foreground">{list.length}</p>
       </div>

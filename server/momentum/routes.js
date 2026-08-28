@@ -43,6 +43,8 @@ import {
   deleteEpisodeFromSupabase,
   applyEpisodeEdit,
   deleteEpisodeEvent,
+  loadResearchById,
+  loadResearchByEpisodeId,
 } from './persist.js'
 import * as store from './store.js'
 import {
@@ -104,9 +106,8 @@ function statusWithConfig(ticker) {
   }
 }
 
-/** Status after a fresh Supabase pull for episodes + events (no memory rail). */
+/** Status from RAM only — no automatic Supabase hydrate. */
 async function statusWithConfigFresh(ticker) {
-  await refreshEpisodesFromSupabase(ticker)
   return statusWithConfig(ticker)
 }
 
@@ -203,6 +204,17 @@ function runSimulateForTicker(ticker, body) {
 export function createMomentumRouter() {
   const router = express.Router()
 
+  // Momentum desk: never let browsers / proxies cache API responses.
+  router.use((_request, response, next) => {
+    response.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, private',
+    )
+    response.setHeader('Pragma', 'no-cache')
+    response.setHeader('Expires', '0')
+    next()
+  })
+
   /** Compact ACTIVE episode payload for overview / Active Episodes rail */
   function activeEpisodeSummary(ep, ticker) {
     if (!ep || String(ep.status || '').toUpperCase() !== 'ACTIVE') return null
@@ -242,6 +254,8 @@ export function createMomentumRouter() {
       exactLabel: ep.exactLabel || null,
       marketSession: ep.marketSession || null,
       lastMaterialProgressAt: ep.lastMaterialProgressAt || null,
+      supabaseSaved: Boolean(ep.supabaseSaved || ep.supabasePersist?.ok),
+      supabasePersist: ep.supabasePersist || null,
     }
   }
 
@@ -301,7 +315,7 @@ export function createMomentumRouter() {
         const watched = store.listWatchedTickers()
         await Promise.all(
           watched.map((t) =>
-            refreshEpisodesFromSupabase(t).catch(() => null),
+            refreshEpisodesFromSupabase(t, { force: true }).catch(() => null),
           ),
         )
       }
@@ -313,6 +327,7 @@ export function createMomentumRouter() {
         ok: true,
         count: list.length,
         activeEpisodes: list,
+        fromSupabase: refresh,
         at: new Date().toISOString(),
       })
     } catch (error) {
@@ -334,6 +349,7 @@ export function createMomentumRouter() {
   function episodeHistorySummary(ep, ticker) {
     if (!ep) return null
     const status = String(ep.status || '').toUpperCase() || 'UNKNOWN'
+    const persist = ep.supabasePersist || null
     return {
       ticker: String(ticker || ep.ticker || '').toUpperCase(),
       episodeId: ep.episodeId || ep.episode_id || null,
@@ -354,39 +370,57 @@ export function createMomentumRouter() {
             ? Number(ep.triggerMovePct)
             : null,
       currentPrice: ep.currentPrice != null ? Number(ep.currentPrice) : null,
+      referencePrice:
+        ep.referencePrice != null ? Number(ep.referencePrice) : null,
+      referenceTime: ep.referenceTime || null,
+      peakPrice: ep.peakPrice != null ? Number(ep.peakPrice) : null,
+      troughPrice: ep.troughPrice != null ? Number(ep.troughPrice) : null,
       episodeStartedAt: ep.episodeStartedAt || ep.triggerTime || null,
       endedAt: ep.endedAt || ep.ended_at || null,
       exactLabel: ep.exactLabel || null,
       marketSession: ep.marketSession || null,
+      supabaseSaved: Boolean(ep.supabaseSaved || persist?.ok || ep.episodeId),
+      supabasePersist: persist
+        ? {
+            ok: Boolean(persist.ok),
+            action: persist.action || null,
+            at: persist.at || null,
+            id: persist.id || null,
+          }
+        : ep.supabaseSaved || ep.episodeId
+          ? { ok: true, action: 'saved', at: null, id: ep.episodeId || null }
+          : null,
     }
   }
 
   /**
    * GET /api/momentum/episodes-history
    * All episodes so far (history + live ACTIVE) across watched tickers.
-   * Query: refresh=1 · limit=120 · perTicker=40
+   * Query: refresh=1 · limit=40 · offset=0 · perTicker=80
    */
   router.get('/episodes-history', async (request, response) => {
     try {
       const refresh =
         String(request.query.refresh || '').trim() === '1' ||
         String(request.query.refresh || '').toLowerCase() === 'true'
-      const limit = Number(request.query.limit) || 120
-      const perTicker = Number(request.query.perTicker) || 40
+      const limit = Number(request.query.limit) || 40
+      const offset = Number(request.query.offset) || 0
+      const perTicker = Number(request.query.perTicker) || 80
       const watched = store.listWatchedTickers()
       if (refresh) {
         await Promise.all(
           watched.map((t) =>
-            refreshEpisodesFromSupabase(t).catch(() => null),
+            refreshEpisodesFromSupabase(t, { force: true }).catch(() => null),
           ),
         )
       }
-      const raw = store.listAllEpisodeHistory({
+      const page = store.listAllEpisodeHistory({
         tickers: watched,
         perTicker,
         limit,
+        offset,
       })
-      const episodes = raw
+      const episodes = (page.rows || [])
         .map((ep) => episodeHistorySummary(ep, ep.ticker))
         .filter(Boolean)
       const activeEpisodes = store
@@ -396,9 +430,15 @@ export function createMomentumRouter() {
       response.json({
         ok: true,
         count: episodes.length,
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+        hasMore: page.hasMore,
+        nextOffset: page.hasMore ? page.offset + page.limit : null,
         episodes,
         activeEpisodes,
         activeCount: activeEpisodes.length,
+        fromSupabase: refresh,
         at: new Date().toISOString(),
       })
     } catch (error) {
@@ -456,13 +496,13 @@ export function createMomentumRouter() {
 
   /**
    * Watchlist source of truth: tickers users consciously monitor in the Trigger app.
-   * From device_monitored_tickers where subscribers[] has enabled entries.
-   * Categorized by asset class for Stocks / Indices / Forex / Crypto / Commodities tabs.
+   * From device_monitor where subscribers[] has enabled entries.
+   * Categorized by asset class for Stocks / ETFs / Indices / Forex / Crypto / Commodities tabs.
    *
-   * GET /api/momentum/monitored-tickers?assetClass=equity|index|forex|crypto|commodity
+   * GET /api/momentum/monitored-tickers?assetClass=equity|etf|index|forex|crypto|commodity
    * GET /api/momentum/monitored-tickers  → all classes
    *
-   * (momentum_research_* tables are research history only — not watchlist.)
+   * (`research` is history only — not watchlist.)
    */
   router.get('/monitored-tickers', async (request, response) => {
     try {
@@ -482,13 +522,13 @@ export function createMomentumRouter() {
         response.status(503).json({
           ok: false,
           error: 'Supabase not configured',
-          table: 'device_monitored_tickers',
+          table: 'device_monitor',
           items: [],
         })
         return
       }
       const { data, error } = await supabase
-        .from('device_monitored_tickers')
+        .from('device_monitor')
         .select(
           'ticker, company_name, subscribers, updated_at, created_at, notable_price_movements',
         )
@@ -498,12 +538,37 @@ export function createMomentumRouter() {
         response.status(500).json({
           ok: false,
           error: error.message,
-          table: 'device_monitored_tickers',
+          table: 'device_monitor',
           items: [],
         })
         return
       }
 
+      const KNOWN_ETFS = new Set([
+        'SPY',
+        'QQQ',
+        'IWM',
+        'DIA',
+        'VOO',
+        'VTI',
+        'VEA',
+        'VWO',
+        'EFA',
+        'EEM',
+        'ARKK',
+        'XLF',
+        'XLE',
+        'XLK',
+        'XLV',
+        'GLD',
+        'SLV',
+        'TLT',
+        'HYG',
+        'LQD',
+        'AGG',
+        'SMH',
+        'SOXX',
+      ])
       const detectClass = (ticker, npm) => {
         const fromNpm =
           npm && typeof npm === 'object'
@@ -517,6 +582,9 @@ export function createMomentumRouter() {
           fromNpm === 'stocks'
         ) {
           return 'equity'
+        }
+        if (fromNpm === 'etf' || fromNpm === 'etfs' || fromNpm === 'fund') {
+          return 'etf'
         }
         if (
           fromNpm === 'commodity' ||
@@ -538,6 +606,7 @@ export function createMomentumRouter() {
         ) {
           return 'crypto'
         }
+        if (KNOWN_ETFS.has(t)) return 'etf'
         return 'equity'
       }
 
@@ -577,13 +646,14 @@ export function createMomentumRouter() {
           assetClassFilter !== 'all' &&
           assetClass !== assetClassFilter
         ) {
-          // allow stock alias
-          if (
-            !(
-              (assetClassFilter === 'equity' || assetClassFilter === 'stock') &&
-              assetClass === 'equity'
-            )
-          ) {
+          // allow stock / etf aliases
+          const equityAlias =
+            (assetClassFilter === 'equity' || assetClassFilter === 'stock') &&
+            assetClass === 'equity'
+          const etfAlias =
+            (assetClassFilter === 'etf' || assetClassFilter === 'etfs') &&
+            assetClass === 'etf'
+          if (!(equityAlias || etfAlias)) {
             continue
           }
         }
@@ -600,20 +670,27 @@ export function createMomentumRouter() {
             expo_push_token: r.expo_push_token || null,
           })),
           updatedAt: row.updated_at || row.created_at || null,
-          source: 'device_monitored_tickers',
-          table: 'device_monitored_tickers',
+          source: 'device_monitor',
+          table: 'device_monitor',
         })
       }
 
       // Group counts for UI headers
-      const byClass = { equity: 0, index: 0, forex: 0, crypto: 0, commodity: 0 }
+      const byClass = {
+        equity: 0,
+        etf: 0,
+        index: 0,
+        forex: 0,
+        crypto: 0,
+        commodity: 0,
+      }
       for (const it of items) {
         if (byClass[it.assetClass] != null) byClass[it.assetClass] += 1
       }
 
       response.json({
         ok: true,
-        table: 'device_monitored_tickers',
+        table: 'device_monitor',
         app: appKey,
         assetClass: assetClassFilter || 'all',
         count: items.length,
@@ -627,7 +704,7 @@ export function createMomentumRouter() {
           error instanceof Error
             ? error.message
             : 'Failed to load monitored tickers',
-        table: 'device_monitored_tickers',
+        table: 'device_monitor',
         items: [],
       })
     }
@@ -902,8 +979,122 @@ export function createMomentumRouter() {
     response.json({ ok: true, status: statusWithConfig('SNDK') })
   })
 
+  /**
+   * POST /api/momentum/clear-cache
+   * Wipe server RAM (episodes/events/logs) for all watched tickers, then
+   * force-hydrate fresh history from Supabase.
+   */
+  router.post('/clear-cache', async (_request, response) => {
+    try {
+      store.resetStore()
+      const watched = store.listWatchedTickers()
+      const results = await Promise.all(
+        watched.map(async (t) => {
+          const r = await refreshEpisodesFromSupabase(t, { force: true }).catch(
+            (err) => ({
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          )
+          return { ticker: t, ...(r && typeof r === 'object' ? r : {}) }
+        }),
+      )
+      store.pushLog(
+        watched[0] || 'SYSTEM',
+        'warn',
+        `Clear cache — RAM wiped · rehydrated ${watched.length} ticker(s) from Supabase`,
+        'api',
+      )
+      response.json({
+        ok: true,
+        cleared: true,
+        hydrated: watched.length,
+        results,
+        at: new Date().toISOString(),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to clear cache',
+      })
+    }
+  })
+
   // ── Generic per-ticker routes ──────────────────────────────────
   // Express 5: :ticker matches path segments; client must encodeURIComponent (GC%3DF).
+
+  router.get('/research/:id', async (request, response) => {
+    try {
+      const row = await loadResearchById(request.params.id)
+      if (!row) {
+        response.status(404).json({ ok: false, error: 'research not found' })
+        return
+      }
+      response.json({ ok: true, research: row })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Failed to load research',
+      })
+    }
+  })
+
+  router.get('/episodes/:episodeId/research', async (request, response) => {
+    try {
+      const list = await loadResearchByEpisodeId(request.params.episodeId)
+      response.json({ ok: true, count: list.length, research: list })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Failed to load research',
+      })
+    }
+  })
+
+  /**
+   * Lightweight live poll — memory snapshot only (no Supabase history download).
+   */
+  router.get('/:ticker/live', (request, response) => {
+    try {
+      const ticker = decodeURIComponent(request.params.ticker || '')
+      if (!ticker) {
+        response.status(400).json({ ok: false, error: 'ticker required' })
+        return
+      }
+      store.ensureTicker(ticker)
+      const status = statusWithConfig(ticker)
+      const ep = status?.episode || null
+      const snap = status?.snapshot || null
+      response.json({
+        ok: true,
+        ticker: store.normalizeMomentumTicker(ticker),
+        livePrice: snap?.currentPrice ?? null,
+        dayReturn: snap?.returns?.day ?? null,
+        marketSession: snap?.marketSession || null,
+        episode: ep
+          ? {
+              episodeId: ep.episodeId || null,
+              status: ep.status || null,
+              state: ep.state || null,
+              direction: ep.direction || null,
+              currentMovePercent: ep.currentMovePercent ?? null,
+              peakMovePercent: ep.peakMovePercent ?? null,
+              currentPrice: ep.currentPrice ?? null,
+              detectedWindow: ep.detectedWindow || null,
+            }
+          : null,
+        lastFetchAt: status?.lastFetchAt || null,
+        loopRunning: status?.loopRunning ?? null,
+        at: new Date().toISOString(),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Failed to load live',
+      })
+    }
+  })
 
   router.get('/:ticker', async (request, response) => {
     try {
@@ -921,8 +1112,22 @@ export function createMomentumRouter() {
         return
       }
       store.ensureTicker(ticker)
-      await hydrateTicker(ticker)
-      response.json(statusWithConfig(ticker))
+      const force =
+        String(request.query.refresh || '').trim() === '1' ||
+        String(request.query.refresh || '').toLowerCase() === 'true'
+      // Hydrate from Supabase only on explicit refresh=1 (manual / boot UI).
+      let hydrate = { skipped: true, reason: 'no-auto-hydrate' }
+      if (force) {
+        hydrate = await hydrateTicker(ticker, { force: true })
+      }
+      response.json({
+        ...statusWithConfig(ticker),
+        supabaseHydrate: {
+          ran: !hydrate?.skipped,
+          skipped: Boolean(hydrate?.skipped),
+          reason: hydrate?.reason || null,
+        },
+      })
     } catch (error) {
       response.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to load status',
@@ -1441,7 +1646,6 @@ export function createMomentumRouter() {
                 provider: body.provider || 'perplexity',
                 model: body.model || null,
                 citations: body.citations || [],
-                search_results: body.search_results || [],
                 completedAt: nowIso,
               }
         const reasonText =

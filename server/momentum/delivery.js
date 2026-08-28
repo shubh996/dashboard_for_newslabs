@@ -5,7 +5,7 @@
  * (`sendTriggerEpisodePush` → `sendExpoPushMessages` in notifications.js).
  *
  * Eligibility source of truth: in-app Momentum/watchlist selections, synced to
- * `device_monitored_tickers.subscribers`. A push only goes to devices that
+ * `device_monitor.subscribers`. A push only goes to devices that
  * currently have that exact ticker enabled for the Trigger app.
  *
  * Delivery is re-checked at send time so watchlist removals take effect immediately.

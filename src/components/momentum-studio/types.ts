@@ -51,6 +51,7 @@ export type StudioEvent = {
   price?: number
   shouldNotify?: boolean
   state?: string
+  episodeId?: string | null
   episodeNo?: number | null
   notification?: { title?: string; body?: string } | null
 }

@@ -43,6 +43,57 @@ function iso(v) {
   return Number.isFinite(t) ? new Date(t).toISOString() : null
 }
 
+/** Per-asset-class episode tables (replaces single episodes writes). */
+export const EPISODE_CLASS_TABLES = {
+  stocks: 'episodes_stocks',
+  indexes: 'episodes_indexes',
+  forex: 'episodes_forex',
+  etfs: 'episodes_etfs',
+  crypto: 'episodes_crypto',
+  commodities: 'episodes_commodities',
+}
+
+export function episodeAssetClassKey(ticker, hint) {
+  const raw = String(hint || '').trim().toLowerCase()
+  if (raw === 'etf' || raw === 'etfs') return 'etfs'
+  if (raw === 'index' || raw === 'indices' || raw === 'indexes') return 'indexes'
+  if (raw === 'forex' || raw === 'fx' || raw === 'currency') return 'forex'
+  if (raw === 'crypto' || raw === 'cryptocurrency') return 'crypto'
+  if (
+    raw === 'commodity' ||
+    raw === 'commodities' ||
+    raw === 'futures'
+  ) {
+    return 'commodities'
+  }
+  if (raw === 'equity' || raw === 'stock' || raw === 'stocks') return 'stocks'
+  const t = String(ticker || '').trim().toUpperCase()
+  if (t.startsWith('^')) return 'indexes'
+  if (t.endsWith('=X') || /^[A-Z]{6}$/.test(t)) return 'forex'
+  if (t.endsWith('=F')) return 'commodities'
+  if (t.endsWith('-USD') || t.endsWith('-USDT')) return 'crypto'
+  return 'stocks'
+}
+
+export function episodeTableFor(ticker, hint) {
+  const key = episodeAssetClassKey(ticker, hint)
+  return EPISODE_CLASS_TABLES[key] || EPISODE_CLASS_TABLES.stocks
+}
+
+function isMissingRelationError(err) {
+  const msg = String(err?.message || err || '')
+  return /schema cache|does not exist|could not find the table/i.test(msg)
+}
+
+async function fromEpisodeTable(supabase, ticker, hint, run) {
+  const table = episodeTableFor(ticker, hint)
+  let res = await run(supabase.from(table), table)
+  if (res?.error && isMissingRelationError(res.error)) {
+    res = await run(supabase.from('episodes'), 'episodes')
+  }
+  return res
+}
+
 export function episodeRowFromMemory(ep) {
   if (!ep) return null
   const episodeNo = num(ep.episodeNo)
@@ -78,10 +129,26 @@ export function episodeRowFromMemory(ep) {
       ep.windowMinutes != null && Number.isFinite(Number(ep.windowMinutes))
         ? Math.round(Number(ep.windowMinutes))
         : null,
-    // Last alert copy (optional columns — stripped if missing)
-    last_notification_title: lastNotif?.title || null,
-    last_notification_body: lastNotif?.body || null,
+    last_alert: (() => {
+      const title = lastNotif?.title || ep.lastNotification?.title || null
+      const body = lastNotif?.body || ep.lastNotification?.body || null
+      const researchId =
+        lastNotif?.researchId ||
+        lastNotif?.research_id ||
+        ep.lastNotification?.researchId ||
+        ep.latestResearchId ||
+        ep.researchId ||
+        null
+      if (!title && !body && !researchId) return null
+      return { title, body, research_id: researchId }
+    })(),
     last_notification_at: iso(lastNotif?.at || ep.lastAlertAt),
+    latest_research_id:
+      lastNotif?.researchId ||
+      lastNotif?.research_id ||
+      ep.latestResearchId ||
+      ep.researchId ||
+      null,
     // Live giveback (ratio 0–1 and percent 0–100) for queries + mobile
     giveback_ratio: (() => {
       const fromEp = num(ep.givebackRatio ?? ep.giveback_ratio)
@@ -101,7 +168,7 @@ export function episodeRowFromMemory(ep) {
       const ratio = num(ep.givebackRatio ?? fullPayload?.measure?.givebackRatio)
       return ratio != null ? ratio * 100 : null
     })(),
-    payload: fullPayload,
+    asset_class: episodeAssetClassKey(ep.ticker, ep.assetClass || ep.asset_class),
     updated_at: new Date().toISOString(),
   }
   // Per-ticker #001 / #002 — set explicitly (not global bigserial)
@@ -111,34 +178,44 @@ export function episodeRowFromMemory(ep) {
 
 export function memoryEpisodeFromRow(row) {
   if (!row) return null
-  const payload =
-    row.payload && typeof row.payload === 'object' ? row.payload : {}
+  const lastAlert =
+    row.last_alert && typeof row.last_alert === 'object' ? row.last_alert : null
+  const researchId =
+    lastAlert?.research_id || row.latest_research_id || null
   return {
-    ...payload,
-    episodeId: row.episode_id || payload.episodeId,
-    episodeNo: row.episode_no ?? payload.episodeNo ?? null,
-    ticker: row.ticker || payload.ticker,
-    direction: row.direction || payload.direction,
-    status: row.status || payload.status,
-    state: row.state || payload.state,
-    detectedWindow: row.detected_window || payload.detectedWindow,
-    episodeStartedAt: row.started_at || payload.episodeStartedAt,
-    endedAt: row.ended_at || payload.endedAt || null,
-    endReason: row.end_reason || payload.endReason || null,
-    givebackRatio: num(row.giveback_ratio ?? payload.givebackRatio),
-    givebackPct: num(
-      row.giveback_pct ??
-        payload.givebackPct ??
-        (row.giveback_ratio != null ? Number(row.giveback_ratio) * 100 : null),
-    ),
-    peakMovePercent: num(row.peak_move_percent ?? payload.peakMovePercent),
-    currentMovePercent: num(row.current_move_percent ?? payload.currentMovePercent),
-    initialMovePercent: num(row.initial_move_percent ?? payload.initialMovePercent),
-    referencePrice: num(row.reference_price ?? payload.referencePrice),
-    referenceTime: row.reference_time || payload.referenceTime || null,
-    exactMinutes: num(row.exact_minutes ?? payload.exactMinutes),
-    exactLabel: row.exact_label || payload.exactLabel || null,
-    windowMinutes: num(row.window_minutes ?? payload.windowMinutes),
+    episodeId: row.episode_id || null,
+    episodeNo: row.episode_no ?? null,
+    ticker: row.ticker,
+    direction: row.direction,
+    status: row.status,
+    state: row.state,
+    detectedWindow: row.detected_window,
+    episodeStartedAt: row.started_at,
+    endedAt: row.ended_at || null,
+    endReason: row.end_reason || null,
+    givebackPct: num(row.giveback_pct),
+    peakMovePercent: num(row.peak_move_percent),
+    currentMovePercent: num(row.current_move_percent),
+    initialMovePercent: num(row.initial_move_percent),
+    referencePrice: num(row.reference_price),
+    referenceTime: row.reference_time || null,
+    triggerPrice: num(row.trigger_price),
+    currentPrice: num(row.current_price),
+    exactMinutes: num(row.exact_minutes),
+    exactLabel: row.exact_label || null,
+    windowMinutes: num(row.window_minutes),
+    assetClass: row.asset_class || null,
+    lastAlertAt: row.last_notification_at || null,
+    lastNotification: lastAlert
+      ? {
+          title: lastAlert.title || null,
+          body: lastAlert.body || null,
+          researchId: researchId,
+          at: row.last_notification_at || null,
+        }
+      : null,
+    latestResearchId: row.latest_research_id || researchId || null,
+    researchId: researchId,
   }
 }
 
@@ -202,32 +279,32 @@ export function ensureEpisodeExactSpan(ep) {
 
 export function memoryEventFromRow(row) {
   if (!row) return null
-  const payload =
-    row.payload && typeof row.payload === 'object' ? row.payload : {}
+  const title = row.notification_title || null
+  const body = row.notification_body || null
   return {
-    ...payload,
-    ticker: row.ticker || payload.ticker,
-    eventType: row.event_type || payload.eventType,
-    state: row.state ?? payload.state ?? null,
-    direction: row.direction || payload.direction,
-    detectedWindow: row.detected_window || payload.detectedWindow,
-    detectedAt: row.detected_at || payload.detectedAt,
-    movePercent: num(row.move_percent ?? payload.movePercent),
-    price: num(row.price ?? payload.price),
-    reason: row.reason ?? payload.reason ?? null,
-    givebackRatio: num(row.giveback_ratio ?? payload.givebackRatio),
-    givebackPct: num(
-      row.giveback_pct ??
-        payload.givebackPct ??
-        (row.giveback_ratio != null ? Number(row.giveback_ratio) * 100 : null),
-    ),
-    episodeId: row.episode_id || payload.episodeId || null,
-    episodeNo: row.episode_no ?? payload.episodeNo ?? null,
-    exactMinutes: num(row.exact_minutes ?? payload.exactMinutes),
-    exactLabel: row.exact_label || payload.exactLabel || null,
-    windowMinutes: num(row.window_minutes ?? payload.windowMinutes),
-    referenceTime: row.reference_time || payload.referenceTime || null,
-    referencePrice: num(row.reference_price ?? payload.referencePrice),
+    ticker: row.ticker,
+    eventType: row.event_type,
+    state: row.state ?? null,
+    direction: row.direction,
+    detectedWindow: row.detected_window,
+    detectedAt: row.detected_at,
+    movePercent: num(row.move_percent),
+    price: num(row.price),
+    reason: row.reason ?? null,
+    givebackPct: num(row.giveback_pct ?? row.giveback_percent),
+    episodeId: row.episode_id || null,
+    episodeNo: row.episode_no ?? null,
+    researchId: row.research_id || null,
+    exactMinutes: num(row.exact_minutes),
+    referenceTime: row.reference_time || null,
+    referencePrice: num(row.reference_price),
+    notifiedAt: row.notified_at || null,
+    shouldNotify: row.should_notify != null ? Boolean(row.should_notify) : undefined,
+    assetClass: row.asset_class || null,
+    notification:
+      title || body
+        ? { title: title || undefined, body: body || undefined }
+        : null,
     supabaseSaved: true,
     supabasePersist: {
       ok: true,
@@ -253,22 +330,145 @@ const SPAN_COLUMNS = [
   'window_minutes',
   'reference_time',
   'reference_price',
-  'last_notification_title',
-  'last_notification_body',
+  'last_alert',
   'last_notification_at',
+  'latest_research_id',
   'notification_title',
   'notification_body',
   'notified_at',
   'should_notify',
-  'giveback_ratio',
   'giveback_pct',
   'measure',
+  'research_id',
+  'short_reason',
+  'asset_class',
   // Optional until schema_momentum_one_active_per_ticker.sql applied
   'idempotency_key',
 ]
 
 /** Columns that may be missing until schema_momentum_mobile_detail.sql is applied */
-const GIVEBACK_COLUMNS = ['giveback_ratio', 'giveback_pct']
+const GIVEBACK_COLUMNS = ['giveback_pct']
+
+const EPISODE_LIGHT_COLUMNS = [
+  'episode_id',
+  'episode_no',
+  'ticker',
+  'direction',
+  'status',
+  'state',
+  'detected_window',
+  'started_at',
+  'ended_at',
+  'end_reason',
+  'peak_move_percent',
+  'current_move_percent',
+  'initial_move_percent',
+  'reference_price',
+  'reference_time',
+  'trigger_price',
+  'current_price',
+  'exact_minutes',
+  'exact_label',
+  'window_minutes',
+  'last_alert',
+  'last_notification_at',
+  'latest_research_id',
+  'giveback_pct',
+  'asset_class',
+  'updated_at',
+].join(',')
+
+const EVENT_LIGHT_COLUMNS = [
+  'id',
+  'episode_id',
+  'episode_no',
+  'ticker',
+  'asset_class',
+  'event_type',
+  'state',
+  'direction',
+  'detected_window',
+  'detected_at',
+  'move_percent',
+  'price',
+  'reason',
+  'exact_minutes',
+  'notification_title',
+  'notification_body',
+  'notified_at',
+  'should_notify',
+  'giveback_pct',
+  'research_id',
+].join(',')
+
+const EVENT_LIGHT_COLUMNS_NO_RESEARCH_ID = [
+  'id',
+  'episode_id',
+  'episode_no',
+  'ticker',
+  'asset_class',
+  'event_type',
+  'state',
+  'direction',
+  'detected_window',
+  'detected_at',
+  'move_percent',
+  'price',
+  'reason',
+  'exact_minutes',
+  'notification_title',
+  'notification_body',
+  'notified_at',
+  'should_notify',
+  'giveback_pct',
+].join(',')
+
+const MATERIAL_MOVE_PP = 0.08
+const EPISODE_HEARTBEAT_MS = 8 * 60_000
+/** episodeId → { status, state, move, peak, at } of last upsert */
+const lastEpisodePersist = new Map()
+
+function episodeNeedsPersist(ep, { closed = false, hasEvents = false } = {}) {
+  if (!ep?.episodeId) return false
+  if (closed) return true
+  const status = String(ep.status || '').toUpperCase()
+  if (status && status !== 'ACTIVE') return true
+  const prev = lastEpisodePersist.get(String(ep.episodeId))
+  if (!prev) return true
+  if (String(prev.status || '') !== status) return true
+  if (String(prev.state || '') !== String(ep.state || '')) return true
+  const move = Number(ep.currentMovePercent)
+  const peak = Number(ep.peakMovePercent)
+  if (
+    Number.isFinite(move) &&
+    Number.isFinite(prev.move) &&
+    Math.abs(move - prev.move) >= MATERIAL_MOVE_PP
+  ) {
+    return true
+  }
+  if (
+    Number.isFinite(peak) &&
+    Number.isFinite(prev.peak) &&
+    Math.abs(peak - prev.peak) >= MATERIAL_MOVE_PP
+  ) {
+    return true
+  }
+  if (Date.now() - prev.at >= EPISODE_HEARTBEAT_MS) return true
+  // New events still persist themselves; skip rewriting the master row.
+  void hasEvents
+  return false
+}
+
+function markEpisodePersistedLocal(ep) {
+  if (!ep?.episodeId) return
+  lastEpisodePersist.set(String(ep.episodeId), {
+    status: String(ep.status || ''),
+    state: String(ep.state || ''),
+    move: Number(ep.currentMovePercent),
+    peak: Number(ep.peakMovePercent),
+    at: Date.now(),
+  })
+}
 
 function stripSpanColumns(row) {
   if (!row || typeof row !== 'object') return row
@@ -287,20 +487,27 @@ export async function upsertEpisode(ep) {
   if (!supabase || !ep?.episodeId) return ep?.episodeNo ?? null
   const row = episodeRowFromMemory(ep)
   if (!row?.episode_id || !row.ticker) return ep?.episodeNo ?? null
-  let { data, error } = await supabase
-    .from('momentum_episodes')
-    .upsert(row, { onConflict: 'episode_id' })
-    .select('episode_no')
-    .maybeSingle()
+  let { data, error } = await fromEpisodeTable(
+    supabase,
+    row.ticker,
+    row.asset_class,
+    (q) =>
+      q.upsert(row, { onConflict: 'episode_id' }).select('episode_no').maybeSingle(),
+  )
   // Until schema_momentum_exact_span.sql is applied, retry without new columns
   // (exactMinutes still lives in payload jsonb for mobile).
   if (error && isMissingColumnError(error)) {
     const slim = stripSpanColumns(row)
-    const retry = await supabase
-      .from('momentum_episodes')
-      .upsert(slim, { onConflict: 'episode_id' })
-      .select('episode_no')
-      .maybeSingle()
+    const retry = await fromEpisodeTable(
+      supabase,
+      row.ticker,
+      row.asset_class,
+      (q) =>
+        q
+          .upsert(slim, { onConflict: 'episode_id' })
+          .select('episode_no')
+          .maybeSingle(),
+    )
     data = retry.data
     error = retry.error
     if (!error) {
@@ -313,6 +520,7 @@ export async function upsertEpisode(ep) {
     console.warn('[momentum persist] episode upsert failed:', error.message)
     return ep?.episodeNo ?? null
   }
+  markEpisodePersistedLocal(ep)
   return data?.episode_no ?? ep?.episodeNo ?? null
 }
 
@@ -332,10 +540,21 @@ export async function insertEvents(ticker, events) {
     if (!detectedAt) continue
     const fullPayload = eventPayloadForSupabase(ev, ev.episode || null)
     const notif = fullPayload.notification || ev.notification || null
+    const givebackPct = (() => {
+      const pct = num(ev.givebackPct ?? fullPayload.givebackPct)
+      if (pct != null) return pct
+      const r = num(ev.givebackRatio ?? fullPayload.givebackRatio)
+      if (r != null) return r * 100
+      return num(fullPayload?.measure?.givebackPercent)
+    })()
     rows.push({
       episode_no: Number.isFinite(Number(ev.episodeNo)) ? Number(ev.episodeNo) : null,
       episode_id: String(ev.episodeId || ''),
       ticker: symbol,
+      asset_class: episodeAssetClassKey(
+        symbol,
+        ev.assetClass || ev.episode?.assetClass,
+      ),
       event_type: String(ev.eventType || 'MOMENTUM_STATE'),
       state: ev.state || fullPayload.state || null,
       direction: ev.direction || null,
@@ -350,11 +569,6 @@ export async function insertEvents(ticker, events) {
         ev.exactMinutes != null && Number.isFinite(Number(ev.exactMinutes))
           ? Math.round(Number(ev.exactMinutes))
           : null,
-      exact_label: ev.exactLabel || null,
-      window_minutes:
-        ev.windowMinutes != null && Number.isFinite(Number(ev.windowMinutes))
-          ? Math.round(Number(ev.windowMinutes))
-          : null,
       reference_time: iso(ev.referenceTime),
       reference_price: num(ev.referencePrice),
       notification_title: notif?.title || fullPayload.notificationTitle || null,
@@ -362,39 +576,35 @@ export async function insertEvents(ticker, events) {
       notified_at: iso(ev.notifiedAt || fullPayload.notifiedAt),
       should_notify:
         ev.shouldNotify != null ? Boolean(ev.shouldNotify) : null,
-      // Prefer explicit event fields, then payload / measure
-      giveback_ratio: (() => {
-        const r = num(ev.givebackRatio ?? fullPayload.givebackRatio)
-        if (r != null) return r
-        const pct = num(ev.givebackPct ?? fullPayload.givebackPct)
-        if (pct != null) return pct / 100
-        const m = num(fullPayload?.measure?.givebackRatio)
-        return m
-      })(),
-      giveback_pct: (() => {
-        const pct = num(ev.givebackPct ?? fullPayload.givebackPct)
-        if (pct != null) return pct
-        const r = num(ev.givebackRatio ?? fullPayload.givebackRatio)
-        if (r != null) return r * 100
-        return num(fullPayload?.measure?.givebackPercent)
-      })(),
+      giveback_pct: givebackPct,
       measure: fullPayload.measure || null,
-      payload: fullPayload,
+      research_id:
+        ev.researchId ||
+        fullPayload.researchId ||
+        ev.research?.researchId ||
+        ev.research?.id ||
+        null,
+      short_reason:
+        ev.shortReason ||
+        (typeof fullPayload.likely_driver === 'string'
+          ? fullPayload.likely_driver
+          : ev.reason) ||
+        null,
       updated_at: new Date().toISOString(),
     })
   }
   if (!rows.length) return []
   let { data, error } = await supabase
-    .from('momentum_episode_events')
+    .from('episodes_events')
     .upsert(rows, { onConflict: 'ticker,event_type,detected_at,episode_id' })
     .select(
-      'id, ticker, event_type, detected_at, episode_id, giveback_ratio, giveback_pct, created_at, updated_at',
+      'id, ticker, event_type, detected_at, episode_id, asset_class, giveback_pct, created_at, updated_at',
     )
   if (error && isMissingColumnError(error)) {
-    // Retry without optional mobile columns (still keep giveback inside payload)
+    // Retry without optional mobile columns
     const slimRows = rows.map((r) => stripSpanColumns(r))
     const retry = await supabase
-      .from('momentum_episode_events')
+      .from('episodes_events')
       .upsert(slimRows, { onConflict: 'ticker,event_type,detected_at,episode_id' })
       .select('id, ticker, event_type, detected_at, episode_id, created_at, updated_at')
     data = retry.data
@@ -425,7 +635,7 @@ export async function deleteResearchRunningEvents(ticker, episodeId) {
   if (!symbol) return
   try {
     let q = supabase
-      .from('momentum_episode_events')
+      .from('episodes_events')
       .delete()
       .eq('ticker', symbol)
       .eq('event_type', 'MOMENTUM_RESEARCH_RUNNING')
@@ -473,6 +683,11 @@ export async function persistTick(ticker, episode, events, closedEpisode = null)
           movePercent: ev.movePercent ?? null,
           exactMinutes: ev.exactMinutes ?? null,
           exactLabel: ev.exactLabel ?? null,
+          researchId:
+            ev.researchId ||
+            ev.research?.researchId ||
+            ev.research?.id ||
+            null,
         }
         if (episode?.episodeId && String(ev.episodeId || episode.episodeId) === String(episode.episodeId)) {
           episode.lastNotification = stamp
@@ -488,12 +703,14 @@ export async function persistTick(ticker, episode, events, closedEpisode = null)
         }
       }
     }
+    const hasEvents = Boolean((events || []).length)
     const toUpsert = []
     if (closedEpisode?.episodeId) toUpsert.push(closedEpisode)
     if (
       episode?.episodeId &&
       (!closedEpisode?.episodeId ||
-        String(episode.episodeId) !== String(closedEpisode.episodeId))
+        String(episode.episodeId) !== String(closedEpisode.episodeId)) &&
+      episodeNeedsPersist(episode, { closed: false, hasEvents })
     ) {
       toUpsert.push(episode)
     }
@@ -584,36 +801,91 @@ export async function loadTickerHistory(ticker, opts = {}) {
   const symbol = String(ticker || '').toUpperCase()
   const episodeLimit = Math.min(80, Math.max(5, Number(opts.episodeLimit) || 40))
   try {
-    const { data: epRows, error: epErr } = await supabase
-      .from('momentum_episodes')
-      .select('*')
-      .eq('ticker', symbol)
-      .order('started_at', { ascending: false })
-      .limit(episodeLimit)
+    const loadEpisodes = (q) =>
+      q
+        .select(EPISODE_LIGHT_COLUMNS)
+        .eq('ticker', symbol)
+        .order('started_at', { ascending: false })
+        .limit(episodeLimit)
+    let epQ = await fromEpisodeTable(supabase, symbol, null, loadEpisodes)
+    if (epQ.error && isMissingColumnError(epQ.error)) {
+      epQ = await fromEpisodeTable(supabase, symbol, null, (q) =>
+        q
+          .select(
+            'episode_id,episode_no,ticker,direction,status,state,detected_window,started_at,ended_at,end_reason,peak_move_percent,current_move_percent,initial_move_percent,reference_price,trigger_price,current_price,updated_at',
+          )
+          .eq('ticker', symbol)
+          .order('started_at', { ascending: false })
+          .limit(episodeLimit),
+      )
+    }
+    if (!epQ.error && !(epQ.data || []).length) {
+      const legacy = await supabase
+        .from('episodes')
+        .select(EPISODE_LIGHT_COLUMNS)
+        .eq('ticker', symbol)
+        .order('started_at', { ascending: false })
+        .limit(episodeLimit)
+      if (!legacy.error && (legacy.data || []).length) epQ = legacy
+    }
+    const epErr = epQ.error
+    const epRows = epQ.data
     if (epErr) {
       console.warn('[momentum persist] load episodes failed:', epErr.message)
       return { ...empty, available: false, error: epErr.message }
     }
     const episodes = (epRows || []).map(memoryEpisodeFromRow).filter(Boolean)
-    const { data: evRows, error: evErr } = await supabase
-      .from('momentum_episode_events')
-      .select('*')
+    let evQ = await supabase
+      .from('episodes_events')
+      .select(EVENT_LIGHT_COLUMNS)
       .eq('ticker', symbol)
       .order('detected_at', { ascending: false })
       .limit(400)
+    if (evQ.error && isMissingColumnError(evQ.error)) {
+      evQ = await supabase
+        .from('episodes_events')
+        .select(EVENT_LIGHT_COLUMNS_NO_RESEARCH_ID)
+        .eq('ticker', symbol)
+        .order('detected_at', { ascending: false })
+        .limit(400)
+    }
+    if (evQ.error && isMissingColumnError(evQ.error)) {
+      evQ = await supabase
+        .from('episodes_events')
+        .select(
+          'id,episode_id,episode_no,ticker,event_type,state,direction,detected_window,detected_at,move_percent,price,reason',
+        )
+        .eq('ticker', symbol)
+        .order('detected_at', { ascending: false })
+        .limit(400)
+    }
+    const evErr = evQ.error
+    const evRows = evQ.data
     if (evErr) {
       console.warn('[momentum persist] load events failed:', evErr.message)
       return { episodes, events: [], maxEpisodeNo: maxNo(episodes), available: true }
     }
     const events = (evRows || []).map(memoryEventFromRow).filter(Boolean)
     // Max episode_no for THIS ticker only (per-ticker #001, #002, …)
-    const { data: maxRow } = await supabase
-      .from('momentum_episodes')
-      .select('episode_no')
-      .eq('ticker', symbol)
-      .order('episode_no', { ascending: false })
-      .limit(1)
-      .maybeSingle()
+    let maxRes = await fromEpisodeTable(supabase, symbol, null, (q) =>
+      q
+        .select('episode_no')
+        .eq('ticker', symbol)
+        .order('episode_no', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+    )
+    if (!maxRes.data) {
+      const legacyMax = await supabase
+        .from('episodes')
+        .select('episode_no')
+        .eq('ticker', symbol)
+        .order('episode_no', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (legacyMax.data) maxRes = legacyMax
+    }
+    const maxRow = maxRes.data
     return {
       episodes,
       events,
@@ -724,13 +996,23 @@ export async function applyEpisodeEdit(ticker, episodeId, patch = {}, eventPatch
   if (!base) {
     const supabase = getSupabaseOrNull()
     if (supabase) {
-      const { data, error } = await supabase
-        .from('momentum_episodes')
-        .select('*')
-        .eq('ticker', key)
-        .eq('episode_id', eid)
-        .maybeSingle()
+      const { data, error } = await fromEpisodeTable(
+        supabase,
+        key,
+        null,
+        (q) =>
+          q.select('*').eq('ticker', key).eq('episode_id', eid).maybeSingle(),
+      )
       if (!error && data) base = memoryEpisodeFromRow(data)
+      if (!base) {
+        const legacy = await supabase
+          .from('episodes')
+          .select('*')
+          .eq('ticker', key)
+          .eq('episode_id', eid)
+          .maybeSingle()
+        if (!legacy.error && legacy.data) base = memoryEpisodeFromRow(legacy.data)
+      }
     }
   }
   if (!base) {
@@ -949,7 +1231,7 @@ export async function applyEpisodeEdit(ticker, episodeId, patch = {}, eventPatch
         update.detected_window = epatch.detectedWindow
       }
 
-      let q = supabase.from('momentum_episode_events').update(update)
+      let q = supabase.from('episodes_events').update(update)
       if (rowId) {
         q = q.eq('id', rowId)
       } else {
@@ -1030,13 +1312,19 @@ async function reopenEpisodeAfterEndEventDeleted(key, episodeId) {
   if (!base) {
     const supabase = getSupabaseOrNull()
     if (supabase) {
-      const { data } = await supabase
-        .from('momentum_episodes')
-        .select('*')
-        .eq('ticker', key)
-        .eq('episode_id', eid)
-        .maybeSingle()
+      const { data } = await fromEpisodeTable(supabase, key, null, (q) =>
+        q.select('*').eq('ticker', key).eq('episode_id', eid).maybeSingle(),
+      )
       if (data) base = memoryEpisodeFromRow(data)
+      if (!base) {
+        const legacy = await supabase
+          .from('episodes')
+          .select('*')
+          .eq('ticker', key)
+          .eq('episode_id', eid)
+          .maybeSingle()
+        if (legacy.data) base = memoryEpisodeFromRow(legacy.data)
+      }
     }
   }
   if (!base) return null
@@ -1190,7 +1478,7 @@ export async function deleteEpisodeEvent(ticker, opts = {}) {
   const supabase = getSupabaseOrNull()
   let deleted = removedMem
   if (supabase) {
-    let q = supabase.from('momentum_episode_events').delete({ count: 'exact' })
+    let q = supabase.from('episodes_events').delete({ count: 'exact' })
     if (rowId) {
       q = q.eq('id', rowId)
     } else {
@@ -1268,11 +1556,12 @@ export async function deleteEpisodeFromSupabase(ticker, episodeId) {
   if (!supabase) {
     return { ok: false, error: 'Supabase not configured' }
   }
+  store.invalidateHydration(key)
 
   try {
     // Events first (no FK required, but cleaner)
     const { error: evErr, count: evCount } = await supabase
-      .from('momentum_episode_events')
+      .from('episodes_events')
       .delete({ count: 'exact' })
       .eq('ticker', key)
       .eq('episode_id', eid)
@@ -1281,11 +1570,16 @@ export async function deleteEpisodeFromSupabase(ticker, episodeId) {
       return { ok: false, error: evErr.message }
     }
 
-    const { error: epErr, count: epCount } = await supabase
-      .from('momentum_episodes')
+    const classDel = await fromEpisodeTable(supabase, key, null, (q) =>
+      q.delete({ count: 'exact' }).eq('ticker', key).eq('episode_id', eid),
+    )
+    const { error: epErr, count: classCount } = classDel
+    const legacyDel = await supabase
+      .from('episodes')
       .delete({ count: 'exact' })
       .eq('ticker', key)
       .eq('episode_id', eid)
+    const epCount = (classCount || 0) + (legacyDel.count || 0)
     if (epErr) {
       console.warn('[momentum persist] delete episode failed:', epErr.message)
       return { ok: false, error: epErr.message }
@@ -1338,6 +1632,12 @@ export async function deleteEpisodeFromSupabase(ticker, episodeId) {
 export async function refreshEpisodesFromSupabase(ticker, opts = {}) {
   const key = store.normalizeMomentumTicker(ticker)
   if (!key) return { ok: false, reason: 'ticker required' }
+  // Automatic TTL hydrate removed — callers must pass force:true
+  // (boot / wake / manual / UI refresh=1 only).
+  const force = Boolean(opts.force)
+  if (!force) {
+    return { ok: true, skipped: true, reason: 'no-auto-hydrate', available: true }
+  }
 
   const hist = await loadTickerHistory(key)
   if (!hist.available) {
@@ -1365,7 +1665,7 @@ export async function refreshEpisodesFromSupabase(ticker, opts = {}) {
 
   store.markHydrated(key)
 
-  if (opts.digests !== false) {
+  if (opts.digests === true) {
     void import('./dailyDigest.js')
       .then((m) => m.hydrateDigests(key))
       .catch(() => {})
@@ -1380,9 +1680,42 @@ export async function refreshEpisodesFromSupabase(ticker, opts = {}) {
   }
 }
 
-/** @deprecated name — always refreshes from Supabase (no one-shot cache). */
-export async function hydrateTicker(ticker) {
-  return refreshEpisodesFromSupabase(ticker)
+/** Hydrate ticker history from Supabase unless TTL still fresh. */
+export async function hydrateTicker(ticker, opts = {}) {
+  return refreshEpisodesFromSupabase(ticker, opts)
+}
+
+const RESEARCH_UNIFIED_SELECT =
+  'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,alert,model_version,citations,cost_usd,cost_usd_display,created_at'
+
+/** Heavy research row — only for detail views. */
+export async function loadResearchById(researchId) {
+  const supabase = getSupabaseOrNull()
+  const id = String(researchId || '').trim()
+  if (!supabase || !id) return null
+  const unified = await supabase
+    .from('research')
+    .select(RESEARCH_UNIFIED_SELECT)
+    .eq('id', id)
+    .maybeSingle()
+  if (!unified.error && unified.data) return unified.data
+  return null
+}
+
+export async function loadResearchByEpisodeId(episodeId) {
+  const supabase = getSupabaseOrNull()
+  const eid = String(episodeId || '').trim()
+  if (!supabase || !eid) return []
+  const { data, error } = await supabase
+    .from('research')
+    .select(
+      'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,alert,model_version,citations,cost_usd,cost_usd_display,created_at',
+    )
+    .eq('episode_id', eid)
+    .order('created_at', { ascending: false })
+    .limit(20)
+  if (error) return []
+  return data || []
 }
 
 /**
@@ -1394,7 +1727,7 @@ export async function saveThresholdsToSupabase(thresholdsMap) {
   const supabase = getSupabaseOrNull()
   if (!supabase) return { ok: false, error: 'Supabase not configured' }
   try {
-    const { error } = await supabase.from('momentum_thresholds').upsert(
+    const { error } = await supabase.from('thresholds').upsert(
       {
         id: 'global',
         thresholds: thresholdsMap && typeof thresholdsMap === 'object' ? thresholdsMap : {},
@@ -1423,7 +1756,7 @@ export async function loadThresholdsFromSupabase() {
   if (!supabase) return null
   try {
     const { data, error } = await supabase
-      .from('momentum_thresholds')
+      .from('thresholds')
       .select('thresholds, updated_at')
       .eq('id', 'global')
       .maybeSingle()

@@ -4,6 +4,7 @@ import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import { BottomToastProvider } from '@/components/ui/bottom-toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { SitePasscodeGate } from '@/components/SitePasscodeGate'
+import { ServiceErrorGate } from '@/components/ServiceErrorGate'
 import { apiUrl, hasExternalApiBase } from '@/lib/apiBase'
 import './index.css'
 import App from './App.tsx'
@@ -82,19 +83,21 @@ createRoot(document.getElementById('root')!).render(
       <BottomToastProvider>
         <BrowserRouter>
           <SitePasscodeGate>
-            <Routes>
-              <Route path="/privacy" element={<PrivacyPage />} />
-              <Route path="/terms" element={<TermsPage />} />
-              <Route path="/support" element={<SupportPage />} />
-              <Route path="/notifications" element={<NotificationsPage />} />
-              <Route path="/momentum-studio" element={<MomentumStudioPage />} />
-              <Route path="/dashboard/database" element={<TickerDatabasePage />} />
-              <Route path="/dashboard/yahoo/:symbol" element={<YahooTickerDashboard />} />
-              <Route path="/dashboard/ticker/manager/:cik" element={<ManagerPortfolioPage />} />
-              <Route path="/dashboard/ticker/politician/:filerId" element={<PoliticianPortfolioPage />} />
-              <Route path="/dashboard/ticker/:symbol" element={<TickerDashboard />} />
-              <Route path="*" element={<App />} />
-            </Routes>
+            <ServiceErrorGate>
+              <Routes>
+                <Route path="/privacy" element={<PrivacyPage />} />
+                <Route path="/terms" element={<TermsPage />} />
+                <Route path="/support" element={<SupportPage />} />
+                <Route path="/notifications" element={<NotificationsPage />} />
+                <Route path="/momentum-studio" element={<MomentumStudioPage />} />
+                <Route path="/dashboard/database" element={<TickerDatabasePage />} />
+                <Route path="/dashboard/yahoo/:symbol" element={<YahooTickerDashboard />} />
+                <Route path="/dashboard/ticker/manager/:cik" element={<ManagerPortfolioPage />} />
+                <Route path="/dashboard/ticker/politician/:filerId" element={<PoliticianPortfolioPage />} />
+                <Route path="/dashboard/ticker/:symbol" element={<TickerDashboard />} />
+                <Route path="*" element={<App />} />
+              </Routes>
+            </ServiceErrorGate>
           </SitePasscodeGate>
         </BrowserRouter>
       </BottomToastProvider>

@@ -1270,3 +1270,18 @@
   scrollbar-width: thin;
   scrollbar-color: #d4d4d8 transparent;
 }
+
+/* Hide scrollbars (keep scroll) — beats the thin-scrollbar rule above */
+.mom-hide-scrollbar,
+[data-momentum-ui="saas"] .mom-hide-scrollbar,
+[data-momentum-dashboard] .mom-hide-scrollbar {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+.mom-hide-scrollbar::-webkit-scrollbar,
+[data-momentum-ui="saas"] .mom-hide-scrollbar::-webkit-scrollbar,
+[data-momentum-dashboard] .mom-hide-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}

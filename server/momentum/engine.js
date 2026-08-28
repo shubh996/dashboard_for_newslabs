@@ -113,7 +113,7 @@ function isOnUnresolvableCooldown(symbol) {
   }
   return true
 }
-/** Last time we refreshed watchlist from device_monitored_tickers */
+/** Last time we refreshed watchlist from device_monitor */
 let lastMonitoredSyncMs = 0
 const MONITORED_SYNC_MIN_MS = 5 * 60_000
 /** Round-robin cursor over non-priority watchlist tickers */
@@ -677,8 +677,10 @@ export async function runMomentumTick(opts = {}) {
     source,
   )
   try {
-    // Restore past episodes + max episode_no before evaluate/start.
-    await hydrateTicker(symbol)
+    // Supabase history hydrate: only boot / wake / manual — never on normal Yahoo poll.
+    if (source === 'boot' || source === 'wake' || source === 'manual') {
+      await hydrateTicker(symbol, { force: true })
+    }
     store.pushLog(
       symbol,
       'info',
@@ -1154,7 +1156,7 @@ export function setMomentumFocus(ticker) {
 }
 
 /**
- * Pull Trigger-enabled tickers from device_monitored_tickers into the loop
+ * Pull Trigger-enabled tickers from device_monitor into the loop
  * so the engine keeps watching even when the dashboard is closed.
  * Replaces (does not merge) so unsubscribed symbols leave the universe.
  */
@@ -1171,7 +1173,7 @@ export async function syncWatchlistFromMonitoredTickers() {
       auth: { persistSession: false, autoRefreshToken: false },
     })
     const { data, error } = await supabase
-      .from('device_monitored_tickers')
+      .from('device_monitor')
       .select('ticker, subscribers')
       .limit(500)
     if (error || !data?.length) return store.listWatchedTickers()
@@ -1249,9 +1251,20 @@ export function startMomentumLoop() {
   }, MOMENTUM_POLL_MS)
   if (typeof timer.unref === 'function') timer.unref()
 
+  // Desk-only: skip watchlist push bulletins / digests (Trigger/9AM side effects).
+  const deskOnly =
+    ['1', 'true', 'yes', 'on'].includes(
+      String(process.env.MOMENTUM_DESK_ONLY || '')
+        .trim()
+        .toLowerCase(),
+    )
   // Market open/close watchlist bulletin (replaces per-ticker daily digests).
   // Daily digest cycle only if explicitly re-enabled (legacy).
-  if ((isDailyDigestEnabled() || isMarketBulletinEnabled()) && !digestTimer) {
+  if (
+    !deskOnly &&
+    (isDailyDigestEnabled() || isMarketBulletinEnabled()) &&
+    !digestTimer
+  ) {
     console.log(
       `[MOMENTUM] market open/close bulletin every 60s` +
         (isDailyDigestEnabled() ? ' · legacy daily digest also on' : ''),

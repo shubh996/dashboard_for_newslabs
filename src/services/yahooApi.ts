@@ -359,8 +359,8 @@ export function fetchYahooSavedTickers(signal?: AbortSignal) {
 }
 
 /**
- * Trigger-app monitored tickers (device_monitored_tickers with enabled subscribers).
- * This is the dashboard Watchlist source of truth — not momentum_research_*.
+ * Trigger-app monitored tickers (device_monitor with enabled subscribers).
+ * This is the dashboard Watchlist source of truth — not the research table.
  */
 export type MomentumMonitoredTickerItem = {
   ticker: string

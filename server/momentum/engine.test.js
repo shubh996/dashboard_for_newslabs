@@ -2325,7 +2325,7 @@ describe('V1 acceptance tests', () => {
   })
 
   it('AT-13/14: without Supabase, no broadcast to all devices', async () => {
-    // Eligibility uses device_monitored_tickers (in-app watchlist), not dashboard tabs.
+    // Eligibility uses device_monitor (in-app watchlist), not dashboard tabs.
     // With no Supabase in unit tests, eligible set is empty — never fan-out to everyone.
     const { loadWatchlistEligibleDevices } = await import('./delivery.js')
     store.setWatchedTickers(['SNDK', 'AAPL'])

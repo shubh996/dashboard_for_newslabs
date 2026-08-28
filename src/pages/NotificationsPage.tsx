@@ -45,7 +45,8 @@ import {
 } from 'lucide-react'
 import { useTheme } from '@/hooks/useTheme'
 import { useBottomToast } from '@/components/ui/bottom-toast'
-import { SndkMomentumPanel } from '@/components/hub/SndkMomentumPanel'
+import { EpisodeDashboard } from '@/components/hub/EpisodeDashboard'
+import { isDeskOnlyMode } from '@/lib/deskOnly'
 import { readPref, writePref } from '@/lib/prefs'
 import {
   fetchYahooQuote,
@@ -11299,7 +11300,7 @@ export default function NotificationsPage() {
         throw new Error(autoSave?.message || 'Backend did not confirm that the data was saved.')
       }
       // Extreme/Pinned → only refresh pinned store. Never reload Users list for that path
-      // (Users is subscriber-backed device_monitored_tickers only).
+      // (Users is subscriber-backed device_monitor only).
       if (monitorScope === 'pinned') {
         void loadPinnedTickers()
       }
@@ -11326,7 +11327,7 @@ export default function NotificationsPage() {
         options?.reloadAfterSave !== false &&
         monitorScope === 'device'
       ) {
-        // Only reload Users list when we actually wrote device_monitored_tickers.
+        // Only reload Users list when we actually wrote device_monitor.
         void loadTickers()
       }
       return result
@@ -14281,7 +14282,7 @@ export default function NotificationsPage() {
   )
 
   /**
-   * Users → device_monitored_tickers (real app subscribers only)
+   * Users → device_monitor (real app subscribers only)
    * Extreme/Pinned → pinned_monitored_tickers (never writes into Users)
    */
   const activeMonitorScope = useCallback(
@@ -14417,6 +14418,13 @@ export default function NotificationsPage() {
 
   // Keep list percentages and the selected ticker price fresh from Yahoo every 5 seconds.
   useEffect(() => {
+    // Desk-only: stop Trigger/9AM live Yahoo quote polling (Momentum desk has its own).
+    if (isDeskOnlyMode()) {
+      setLiveQuotes({})
+      setLiveQuotesForTickerKey('')
+      return
+    }
+
     const symbols = liveTickerKey.split(',').filter(Boolean)
     if (!symbols.length) {
       setLiveQuotes({})
@@ -14838,6 +14846,7 @@ export default function NotificationsPage() {
 
   // Load Extreme tab from Yahoo when opened (and refresh while it stays open).
   useEffect(() => {
+    if (isDeskOnlyMode()) return
     if (stocksListTab !== 'extreme' || section !== 'tickers') return
     void loadExtremeMovers()
     const timer = window.setInterval(() => {
@@ -15022,10 +15031,10 @@ export default function NotificationsPage() {
         isHub ? 'bg-background' : isTrigger ? 'desk-shell' : 'bg-background',
       )}
     >
-      {/* Home: ticker tabs (line) + app switcher · momentum panel */}
+      {/* Home: ticker tabs (line) + app switcher · Episode Dashboard */}
       {isHub ? (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <SndkMomentumPanel
+          <EpisodeDashboard
             onOpenInTrigger={(ticker, label) => {
               const symbol = String(ticker || '')
                 .trim()
@@ -15093,7 +15102,7 @@ export default function NotificationsPage() {
                 <p className="text-[11px] font-semibold tracking-tight text-foreground">
                   Trigger
                 </p>
-                <p className="text-[10px] text-muted-foreground">Momentum desk</p>
+                <p className="text-[10px] text-muted-foreground">Episode Dashboard</p>
               </div>
               <span className="desk-stat" title="Monitored instruments">
                 Instruments <strong>{tickers.length}</strong>
@@ -15385,8 +15394,8 @@ export default function NotificationsPage() {
                 type="button"
                 role="tab"
                 aria-selected={section === 'tickers'}
-                aria-label={isTrigger ? 'Momentum' : 'Tickers'}
-                title={isTrigger ? 'Momentum' : 'Tickers'}
+                aria-label={isTrigger ? 'Episode Dashboard' : 'Tickers'}
+                title={isTrigger ? 'Episode Dashboard' : 'Tickers'}
                 onClick={() => setSection('tickers')}
                 className={cn(
                   'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
@@ -15514,7 +15523,7 @@ export default function NotificationsPage() {
                 >
                   <TrendingUp className="size-4 shrink-0" />
                   <span className="leading-tight">
-                    {isTrigger ? 'Momentum' : 'Tickers'}
+                    {isTrigger ? 'Episode Dashboard' : 'Tickers'}
                     <span
                       className={cn(
                         isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',

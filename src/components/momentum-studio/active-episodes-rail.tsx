@@ -1,18 +1,17 @@
-import { IconTrendingDown, IconTrendingUp } from '@tabler/icons-react'
-import { Loader2 } from 'lucide-react'
+import { Loader2, TrendingDown, TrendingUp } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
+import { EpisodeTimeline } from './episode-timeline'
 import {
   fmtDateTime,
   fmtEpisodeNo,
   fmtPct,
   fmtPrice,
   formatEpisodeState,
-  pctTone,
 } from './format'
 import { TickerLogo } from './ticker-logo'
 import type { ActiveEpisodeRow } from './types'
@@ -21,12 +20,14 @@ import type { MomentumStudioState } from './useMomentumStudio'
 /**
  * 3rd column:
  *  - Default / no focus: all live ACTIVE episodes app-wide
- *  - Entity selected: that ticker’s episodes (active + history)
+ *  - Entity selected: desk-style episode timeline for that ticker
  */
 export function ActiveEpisodesRail({
   studio,
+  className,
 }: {
   studio: MomentumStudioState
+  className?: string
 }) {
   const ticker = String(studio.activeTicker || '').toUpperCase()
   const focused = Boolean(studio.railEntityFocus && ticker)
@@ -42,83 +43,98 @@ export function ActiveEpisodesRail({
       ? studio.quotes[ticker] || studio.quotes[ticker.toUpperCase()]
       : null)
 
-  const entityEpisodes: ActiveEpisodeRow[] = focused
-    ? studio.episodeHistory.filter(
-        (e) => String(e.ticker || '').toUpperCase() === ticker,
-      )
-    : []
-
-  // If history hasn't hydrated for this ticker yet, still show live ACTIVE
   const liveForTicker = studio.activeEpisodeForTicker
-  const entityList =
-    focused && entityEpisodes.length
-      ? entityEpisodes
-      : focused && liveForTicker
-        ? [liveForTicker]
-        : focused
-          ? []
-          : studio.activeEpisodes
-
   const showAllActives = !focused
+  const statusForTicker =
+    String(studio.status?.ticker || '').toUpperCase() === ticker
+      ? studio.status
+      : null
 
   return (
-    <aside className="flex w-[22rem] shrink-0 flex-col border-l bg-background">
-      <div className="flex h-11 shrink-0 items-center justify-between gap-2 px-3">
+    <aside
+      className={cn(
+        'flex w-[24rem] shrink-0 flex-col border-l bg-background',
+        className,
+      )}
+    >
+      <div className="flex h-(--header-height) shrink-0 items-center justify-between gap-2 px-4">
         <div className="min-w-0">
           <p className="text-sm font-medium leading-tight">
-            {showAllActives ? 'Active episodes' : 'Episodes'}
+            {showAllActives ? 'Active episodes' : `${ticker} timeline`}
           </p>
-          <p className="text-[10px] text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             {showAllActives
               ? `${studio.activeEpisodes.length} live`
-              : `${entityList.length} for ${ticker || '—'}`}
+              : 'Desk-style episode story'}
           </p>
           {focused ? (
             <button
               type="button"
-              className="mt-0.5 text-[10px] font-medium text-sky-600 hover:underline dark:text-sky-400"
+              className="mt-0.5 text-xs font-medium text-primary hover:underline"
               onClick={() => studio.clearRailEntityFocus()}
             >
               Show all active
             </button>
           ) : null}
         </div>
-        {focused && ticker ? (
-          <div className="flex min-w-0 max-w-[58%] items-center gap-2">
-            <div className="min-w-0 text-right">
-              <p className="truncate text-sm font-semibold leading-tight">
-                {ticker}
-              </p>
-              {assetName && assetName !== ticker ? (
-                <p className="truncate text-[10px] leading-tight text-muted-foreground">
-                  {assetName}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {showAllActives && studio.activeEpisodes.length > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              disabled={Boolean(studio.endingEpisodeTicker)}
+              title="End all active episodes"
+              onClick={() => void studio.endAllActiveEpisodes()}
+            >
+              {studio.endingEpisodeTicker ? (
+                <>
+                  <Loader2 className="size-3 animate-spin" />
+                  Ending…
+                </>
+              ) : (
+                'End all'
+              )}
+            </Button>
+          ) : null}
+          {focused && ticker ? (
+            <div className="flex min-w-0 max-w-[58%] items-center gap-2">
+              <div className="min-w-0 text-right">
+                <p className="truncate text-sm font-semibold leading-tight">
+                  {ticker}
                 </p>
-              ) : null}
+                {assetName && assetName !== ticker ? (
+                  <p className="truncate text-xs leading-tight text-muted-foreground">
+                    {assetName}
+                  </p>
+                ) : null}
+              </div>
+              <TickerLogo
+                ticker={ticker}
+                quote={quote}
+                companyName={assetName}
+              />
             </div>
-            <TickerLogo
-              ticker={ticker}
-              quote={quote}
-              companyName={assetName}
-            />
-          </div>
-        ) : (
-          <Badge variant="secondary" className="shrink-0 tabular-nums">
-            {studio.activeEpisodes.length}
-          </Badge>
-        )}
+          ) : (
+            <Badge variant="secondary" className="shrink-0 tabular-nums">
+              {studio.activeEpisodes.length}
+            </Badge>
+          )}
+        </div>
       </div>
       <Separator />
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-2 p-2">
-          {showAllActives ? (
-            !studio.activeEpisodes.length ? (
-              <p className="px-2 py-8 text-center text-xs text-muted-foreground">
+      {showAllActives ? (
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="flex flex-col gap-2 p-3">
+            {!studio.activeEpisodes.length ? (
+              <p className="px-2 py-8 text-center text-sm text-muted-foreground">
                 No active episodes
               </p>
             ) : (
               studio.activeEpisodes.map((row) => (
-                <EpisodeRowCard
+                <ActiveEpisodeRowCard
                   key={`${row.ticker}-${row.episodeId || row.episodeNo}`}
                   row={row}
                   selected={
@@ -132,78 +148,46 @@ export function ActiveEpisodesRail({
                   }
                 />
               ))
-            )
-          ) : !entityList.length ? (
-            <div className="flex flex-col items-center gap-2 px-3 py-10 text-center">
-              <p className="text-sm font-medium">No active episode</p>
-              <p className="text-xs text-muted-foreground">
-                {ticker} has no live or history episodes loaded yet.
-              </p>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  void studio.loadEpisodeHistory({ refresh: true })
-                }}
-              >
-                Refresh history
-              </Button>
-            </div>
-          ) : (
-            <>
-              {!liveForTicker ? (
-                <p className="rounded-md border border-dashed px-2 py-2 text-center text-[11px] text-muted-foreground">
-                  No live ACTIVE episode for {ticker}
-                </p>
-              ) : null}
-              {entityList.map((row) => {
-                const live =
-                  String(row.status || '').toUpperCase() === 'ACTIVE'
-                return (
-                  <EpisodeRowCard
-                    key={`${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
-                    row={row}
-                    selected={live}
-                    onSelect={() => studio.selectActiveEpisode(row)}
-                    showStatus
-                    onEnd={
-                      live
-                        ? () => void studio.endActiveEpisode(row.ticker, row)
-                        : undefined
-                    }
-                    ending={
-                      live &&
-                      studio.endingEpisodeTicker ===
-                        String(row.ticker || '').toUpperCase()
-                    }
-                  />
+            )}
+          </div>
+        </ScrollArea>
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <EpisodeTimeline
+            status={statusForTicker}
+            loading={studio.statusLoading}
+            focusEpisodeId={studio.focusedEpisodeId}
+            onEndActive={
+              liveForTicker
+                ? () => void studio.endActiveEpisode(ticker, liveForTicker)
+                : undefined
+            }
+            ending={studio.endingEpisodeTicker === ticker}
+          />
+          <div className="shrink-0 border-t p-3">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="w-full"
+              onClick={() => {
+                const item = studio.tickers.find(
+                  (t) => t.ticker.toUpperCase() === ticker,
                 )
-              })}
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="mt-1"
-                onClick={() => {
-                  const item = studio.tickers.find(
-                    (t) => t.ticker.toUpperCase() === ticker,
-                  )
-                  if (item) studio.setAssetClass(item.assetClass)
-                  studio.setView('watchlist')
-                }}
-              >
-                Open {ticker} in watchlist
-              </Button>
-            </>
-          )}
+                if (item) studio.setAssetClass(item.assetClass)
+                studio.setView('watchlist')
+              }}
+            >
+              Open {ticker} in watchlist
+            </Button>
+          </div>
         </div>
-      </ScrollArea>
+      )}
     </aside>
   )
 }
 
-function EpisodeRowCard({
+export function ActiveEpisodeRowCard({
   row,
   selected,
   onSelect,
@@ -220,7 +204,7 @@ function EpisodeRowCard({
   showStatus?: boolean
 }) {
   const up = row.direction !== 'DOWN'
-  const Trend = up ? IconTrendingUp : IconTrendingDown
+  const Trend = up ? TrendingUp : TrendingDown
   const isLive = String(row.status || 'ACTIVE').toUpperCase() === 'ACTIVE'
   const move = row.currentMovePercent ?? row.peakMovePercent ?? null
   const canEnd = Boolean(onEnd) && isLive
@@ -228,10 +212,10 @@ function EpisodeRowCard({
   return (
     <div
       className={cn(
-        'w-full rounded-lg border px-2.5 py-2 transition-colors',
+        'w-full rounded-xl border bg-card px-3 py-2.5 shadow-xs transition-colors',
         selected
           ? 'border-foreground/20 bg-muted/50'
-          : 'bg-background hover:bg-muted/30',
+          : 'hover:bg-muted/30',
       )}
     >
       <div className="flex items-start justify-between gap-2">
@@ -246,20 +230,25 @@ function EpisodeRowCard({
               {fmtEpisodeNo(row.episodeNo) || ''}
             </span>
           </p>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
+          <p className="mt-0.5 text-xs text-muted-foreground">
             {row.detectedWindow || '—'} · {fmtDateTime(row.episodeStartedAt)}
           </p>
           {!showStatus ? (
-            <p className="mt-1 text-[11px] text-muted-foreground">
+            <p className="mt-1 text-xs text-muted-foreground">
               {String(row.direction || '—')} ·{' '}
               {formatEpisodeState(row.state || row.status)}
-              {row.currentPrice != null ? ` · ${fmtPrice(row.currentPrice)}` : ''}
+              {row.currentPrice != null
+                ? ` · ${fmtPrice(row.currentPrice)}`
+                : ''}
             </p>
           ) : null}
         </button>
         <div className="flex shrink-0 flex-col items-end gap-1.5">
           {showStatus ? (
-            <Badge variant={isLive ? 'default' : 'outline'} className="text-[10px]">
+            <Badge
+              variant={isLive ? 'default' : 'outline'}
+              className="text-[10px]"
+            >
               {formatEpisodeState(row.status || row.state)}
             </Badge>
           ) : (
@@ -269,7 +258,7 @@ function EpisodeRowCard({
             </Badge>
           )}
           {showStatus ? (
-            <span className={cn('text-xs font-semibold tabular-nums', pctTone(move))}>
+            <span className="text-xs font-semibold tabular-nums">
               {fmtPct(move)}
             </span>
           ) : null}
@@ -278,7 +267,7 @@ function EpisodeRowCard({
               type="button"
               size="sm"
               variant="outline"
-              className="h-7 px-2 text-[11px] text-rose-700 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
+              className="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
               disabled={ending}
               title={`End active episode for ${row.ticker}`}
               onClick={(e) => {

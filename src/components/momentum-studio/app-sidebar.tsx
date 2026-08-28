@@ -1,4 +1,9 @@
-import type { ComponentProps, ComponentType, SVGProps } from 'react'
+import type {
+  ComponentProps,
+  ComponentType,
+  ReactNode,
+  SVGProps,
+} from 'react'
 import {
   AtSign,
   BarChart3,
@@ -22,7 +27,6 @@ import {
   LayoutDashboard,
   LineChart,
   Newspaper,
-  PanelLeft,
   Radar,
   ScanSearch,
   Server,
@@ -35,7 +39,6 @@ import {
   Wheat,
 } from 'lucide-react'
 
-import { Button } from '@/components/ui/button'
 import {
   Collapsible,
   CollapsibleContent,
@@ -46,7 +49,6 @@ import {
   SidebarContent,
   SidebarGroup,
   SidebarGroupLabel,
-  SidebarFooter,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuBadge,
@@ -56,10 +58,9 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarRail,
-  useSidebar,
 } from '@/components/ui/sidebar'
 import { fmtEpisodeNo, fmtPct } from './format'
-import { NavUser } from './nav-user'
+import { NavBrand } from './nav-user'
 import type { AssetClassId } from './types'
 import type { MomentumStudioState } from './useMomentumStudio'
 
@@ -77,7 +78,7 @@ const ASSET_ITEMS: {
   { id: 'commodity', label: 'Commodities', icon: Wheat },
 ]
 
-const SUPABASE_PROJECT = 'xufydubsuztxgsylzxub'
+const SUPABASE_PROJECT = 'ebcjsmpqogbwaxypgllh'
 const RAILWAY_API_ORIGIN =
   'https://dashboardfornewslabs-production.up.railway.app'
 const CLOUDFLARE_PAGES_DASH =
@@ -117,10 +118,6 @@ type ServiceCategory = {
   items: ServiceItem[]
 }
 
-/**
- * Every third-party / infra surface the app touches, grouped for nav.
- * Sorted A→Z within each category. Even small logo CDNs are listed.
- */
 const SERVICE_CATEGORIES: ServiceCategory[] = [
   {
     id: 'hosting',
@@ -238,7 +235,10 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         links: [
           { title: 'App / usage', href: 'https://www.firecrawl.dev/app' },
           { title: 'Docs', href: 'https://docs.firecrawl.dev/' },
-          { title: 'API reference', href: 'https://docs.firecrawl.dev/api-reference/introduction' },
+          {
+            title: 'API reference',
+            href: 'https://docs.firecrawl.dev/api-reference/introduction',
+          },
         ],
       },
       {
@@ -266,7 +266,10 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
             title: 'API billing',
             href: 'https://www.perplexity.ai/account/api/billing',
           },
-          { title: 'API settings', href: 'https://www.perplexity.ai/account/api' },
+          {
+            title: 'API settings',
+            href: 'https://www.perplexity.ai/account/api',
+          },
           { title: 'Finance pages', href: 'https://www.perplexity.ai/finance' },
         ],
       },
@@ -282,8 +285,14 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         tooltip: 'Market news provider',
         icon: TrendingUp,
         links: [
-          { title: 'API key support', href: 'https://www.alphavantage.co/support/#api-key' },
-          { title: 'Documentation', href: 'https://www.alphavantage.co/documentation/' },
+          {
+            title: 'API key support',
+            href: 'https://www.alphavantage.co/support/#api-key',
+          },
+          {
+            title: 'Documentation',
+            href: 'https://www.alphavantage.co/documentation/',
+          },
           { title: 'Home', href: 'https://www.alphavantage.co/' },
         ],
       },
@@ -368,9 +377,15 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         tooltip: 'Filings, 13F, insiders, congress',
         icon: Landmark,
         links: [
-          { title: 'Search & access', href: 'https://www.sec.gov/edgar/search-and-access' },
+          {
+            title: 'Search & access',
+            href: 'https://www.sec.gov/edgar/search-and-access',
+          },
           { title: 'data.sec.gov', href: 'https://data.sec.gov/' },
-          { title: 'Company tickers', href: 'https://www.sec.gov/files/company_tickers.json' },
+          {
+            title: 'Company tickers',
+            href: 'https://www.sec.gov/files/company_tickers.json',
+          },
         ],
       },
       {
@@ -387,8 +402,14 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         icon: Globe,
         links: [
           { title: 'Home', href: 'https://tradingeconomics.com/' },
-          { title: 'Commodities', href: 'https://tradingeconomics.com/commodities' },
-          { title: 'Currencies', href: 'https://tradingeconomics.com/currencies' },
+          {
+            title: 'Commodities',
+            href: 'https://tradingeconomics.com/commodities',
+          },
+          {
+            title: 'Currencies',
+            href: 'https://tradingeconomics.com/currencies',
+          },
         ],
       },
       {
@@ -398,8 +419,14 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         icon: CandlestickChart,
         links: [
           { title: 'Home', href: 'https://www.tradingview.com/' },
-          { title: 'Widget docs', href: 'https://www.tradingview.com/widget-docs/' },
-          { title: 'Charting library', href: 'https://www.tradingview.com/charting-library-docs/' },
+          {
+            title: 'Widget docs',
+            href: 'https://www.tradingview.com/widget-docs/',
+          },
+          {
+            title: 'Charting library',
+            href: 'https://www.tradingview.com/charting-library-docs/',
+          },
         ],
       },
       {
@@ -409,7 +436,10 @@ const SERVICE_CATEGORIES: ServiceCategory[] = [
         icon: AtSign,
         links: [
           { title: 'Developer portal', href: 'https://developer.x.com/' },
-          { title: 'Apps', href: 'https://developer.x.com/en/portal/projects-and-apps' },
+          {
+            title: 'Apps',
+            href: 'https://developer.x.com/en/portal/projects-and-apps',
+          },
           { title: 'X home', href: 'https://x.com/' },
         ],
       },
@@ -575,13 +605,38 @@ function ServiceMenuItem({
   )
 }
 
+function SidebarSection({
+  label,
+  children,
+  defaultOpen = false,
+}: {
+  label: string
+  children: ReactNode
+  defaultOpen?: boolean
+}) {
+  return (
+    <Collapsible defaultOpen={defaultOpen} className="group/section">
+      <SidebarGroup>
+        <SidebarGroupLabel asChild>
+          <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 outline-none">
+            <span className="truncate">{label}</span>
+            <ChevronRight className="ml-auto size-3.5 opacity-60 transition-transform duration-200 group-data-[state=open]/section:rotate-90" />
+          </CollapsibleTrigger>
+        </SidebarGroupLabel>
+        <CollapsibleContent>
+          <SidebarMenu>{children}</SidebarMenu>
+        </CollapsibleContent>
+      </SidebarGroup>
+    </Collapsible>
+  )
+}
+
 export function AppSidebar({
   studio,
   ...props
 }: ComponentProps<typeof Sidebar> & {
   studio: MomentumStudioState
 }) {
-  const { toggleSidebar } = useSidebar()
   const userCount = studio.tickers.reduce(
     (n, t) => n + (t.subscriberCount || 0),
     0,
@@ -590,164 +645,133 @@ export function AppSidebar({
   return (
     <Sidebar collapsible="icon" {...props}>
       <SidebarHeader>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="group-data-[collapsible=icon]:hidden"
-              onClick={toggleSidebar}
-              aria-label="Toggle Sidebar"
-            >
-              <PanelLeft />
-              <span className="sr-only">Toggle Sidebar</span>
-            </Button>
-          </SidebarMenuItem>
-        </SidebarMenu>
+        <NavBrand studio={studio} />
       </SidebarHeader>
 
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>Overview</SidebarGroupLabel>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Dashboard"
-                isActive={studio.view === 'overview'}
-                onClick={() => {
-                  studio.clearRailEntityFocus()
-                  studio.setView('overview')
-                }}
-              >
-                <LayoutDashboard />
-                <span>Dashboard</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Settings"
-                onClick={() => studio.setSettingsOpen(true)}
-              >
-                <Settings />
-                <span>Settings</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarGroup>
+        <SidebarSection label="Overview" defaultOpen>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Dashboard"
+              isActive={studio.view === 'overview'}
+              onClick={() => {
+                studio.clearRailEntityFocus()
+                studio.setView('overview')
+              }}
+            >
+              <LayoutDashboard />
+              <span>Dashboard</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Settings"
+              onClick={() => studio.setSettingsOpen(true)}
+            >
+              <Settings />
+              <span>Settings</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarSection>
 
-        <SidebarGroup>
-          <SidebarGroupLabel>Asset class</SidebarGroupLabel>
-          <SidebarMenu>
-            {ASSET_ITEMS.map((item) => {
-              const Icon = item.icon
-              const active =
-                studio.assetClass === item.id && studio.view === 'watchlist'
-              const list = studio.tickers.filter((t) => t.assetClass === item.id)
-              return (
-                <SidebarMenuItem key={item.id}>
-                  <SidebarMenuButton
-                    tooltip={item.label}
-                    isActive={active}
-                    onClick={() => {
-                      studio.setAssetClass(item.id)
-                      studio.setView('watchlist')
-                      if (
-                        !list.some((t) => t.ticker === studio.activeTicker) &&
-                        list[0]
-                      ) {
-                        studio.setActiveTicker(list[0].ticker)
-                      }
-                    }}
-                  >
-                    <Icon />
-                    <span>{item.label}</span>
-                    <SidebarMenuBadge>{list.length}</SidebarMenuBadge>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )
-            })}
-          </SidebarMenu>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel>Active episodes</SidebarGroupLabel>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Active episodes"
-                isActive={studio.view === 'episodes'}
-                onClick={() => {
-                  studio.clearRailEntityFocus()
-                  studio.setView('episodes')
-                }}
-              >
-                <BarChart3 />
-                <span>Active episodes</span>
-                <SidebarMenuBadge>
-                  {studio.activeEpisodes.length}
-                </SidebarMenuBadge>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            {studio.activeEpisodes.slice(0, 8).map((row) => (
-              <SidebarMenuItem
-                key={`${row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
-                className="group-data-[collapsible=icon]:hidden"
-              >
+        <SidebarSection label="Asset class" defaultOpen>
+          {ASSET_ITEMS.map((item) => {
+            const Icon = item.icon
+            const active =
+              studio.assetClass === item.id && studio.view === 'watchlist'
+            const list = studio.tickers.filter((t) => t.assetClass === item.id)
+            return (
+              <SidebarMenuItem key={item.id}>
                 <SidebarMenuButton
-                  size="sm"
-                  isActive={
-                    studio.view === 'episodes' &&
-                    String(row.ticker || '').toUpperCase() ===
-                      String(studio.activeTicker || '').toUpperCase()
-                  }
-                  onClick={() => studio.selectActiveEpisode(row)}
+                  tooltip={item.label}
+                  isActive={active}
+                  onClick={() => {
+                    studio.setAssetClass(item.id)
+                    studio.setView('watchlist')
+                    if (
+                      !list.some((t) => t.ticker === studio.activeTicker) &&
+                      list[0]
+                    ) {
+                      studio.setActiveTicker(list[0].ticker)
+                    }
+                  }}
                 >
-                  <span>{row.ticker}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {fmtEpisodeNo(row.episodeNo) || fmtPct(row.currentMovePercent)}
-                  </span>
+                  <Icon />
+                  <span>{item.label}</span>
+                  <SidebarMenuBadge>{list.length}</SidebarMenuBadge>
                 </SidebarMenuButton>
               </SidebarMenuItem>
-            ))}
-          </SidebarMenu>
-        </SidebarGroup>
+            )
+          })}
+        </SidebarSection>
 
-        <SidebarGroup>
-          <SidebarGroupLabel>Users</SidebarGroupLabel>
-          <SidebarMenu>
-            <SidebarMenuItem>
+        <SidebarSection label="Active episodes" defaultOpen>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Active episodes"
+              isActive={studio.view === 'episodes'}
+              onClick={() => {
+                studio.clearRailEntityFocus()
+                studio.setView('episodes')
+              }}
+            >
+              <BarChart3 />
+              <span>Active episodes</span>
+              <SidebarMenuBadge>
+                {studio.activeEpisodes.length}
+              </SidebarMenuBadge>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          {studio.activeEpisodes.slice(0, 8).map((row) => (
+            <SidebarMenuItem
+              key={`${row.ticker}-${row.episodeNo || row.episodeStartedAt}`}
+              className="group-data-[collapsible=icon]:hidden"
+            >
               <SidebarMenuButton
-                tooltip="Users"
-                isActive={studio.view === 'users'}
-                onClick={() => studio.setView('users')}
+                size="sm"
+                isActive={
+                  studio.view === 'episodes' &&
+                  String(row.ticker || '').toUpperCase() ===
+                    String(studio.activeTicker || '').toUpperCase()
+                }
+                onClick={() => studio.selectActiveEpisode(row)}
               >
-                <Users />
-                <span>Users</span>
-                <SidebarMenuBadge>{userCount}</SidebarMenuBadge>
+                <span>{row.ticker}</span>
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {fmtEpisodeNo(row.episodeNo) ||
+                    fmtPct(row.currentMovePercent)}
+                </span>
               </SidebarMenuButton>
             </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarGroup>
+          ))}
+        </SidebarSection>
+
+        <SidebarSection label="Users" defaultOpen>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Users"
+              isActive={studio.view === 'users'}
+              onClick={() => studio.setView('users')}
+            >
+              <Users />
+              <span>Users</span>
+              <SidebarMenuBadge>{userCount}</SidebarMenuBadge>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarSection>
 
         {SERVICE_CATEGORIES.map((category) => (
-          <SidebarGroup key={category.id}>
-            <SidebarGroupLabel>{category.label}</SidebarGroupLabel>
-            <SidebarMenu>
-              {category.items.map((item) => (
-                <ServiceMenuItem
-                  key={`${category.id}-${item.title}`}
-                  item={item}
-                  studio={studio}
-                />
-              ))}
-            </SidebarMenu>
-          </SidebarGroup>
+          <SidebarSection key={category.id} label={category.label}>
+            {category.items.map((item) => (
+              <ServiceMenuItem
+                key={`${category.id}-${item.title}`}
+                item={item}
+                studio={studio}
+              />
+            ))}
+          </SidebarSection>
         ))}
       </SidebarContent>
-      <SidebarFooter>
-        <NavUser studio={studio} />
-      </SidebarFooter>
       <SidebarRail />
     </Sidebar>
   )

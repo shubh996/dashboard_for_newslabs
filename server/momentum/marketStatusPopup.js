@@ -28,26 +28,20 @@ function formatLondonStamp(iso) {
   }
 }
 
-function currentSessionLabel(life, assetId) {
-  if (life.lifecycle === LIFECYCLE.HOLIDAY_CLOSED) return 'Closed'
-  if (life.lifecycle === LIFECYCLE.FULL_CLOSED) return 'Closed'
-  if (life.lifecycle === LIFECYCLE.MAINTENANCE) return 'Maintenance'
-  if (assetId === 'crypto') return '24/7'
-  if (life.lifecycle === LIFECYCLE.OVERNIGHT) return 'Overnight'
-  if (life.lifecycle === LIFECYCLE.PRE_MARKET) return 'Pre-market'
-  if (life.lifecycle === LIFECYCLE.REGULAR) return 'Regular'
-  if (life.lifecycle === LIFECYCLE.POST_MARKET) return 'Post-market'
-  if (life.lifecycle === LIFECYCLE.DATA_STALE || life.lifecycle === LIFECYCLE.DATA_UNAVAILABLE) {
-    const t = life.tradingSession
-    if (t === LIFECYCLE.OVERNIGHT) return 'Overnight'
-    if (t === LIFECYCLE.PRE_MARKET) return 'Pre-market'
-    if (t === LIFECYCLE.REGULAR) return 'Regular'
-    if (t === LIFECYCLE.POST_MARKET) return 'Post-market'
-    return assetId === 'forex' ? 'Open' : 'Open'
-  }
-  if (assetId === 'forex') return 'Open'
-  if (assetId === 'indices') return 'Futures'
-  return 'Open'
+/**
+ * Session column = exact Yahoo quote.marketState (PREPRE / PRE / REGULAR /
+ * POST / POSTPOST / CLOSED / …). Do not rewrite to Overnight / After-hours.
+ */
+function yahooMarketStateSessionLabel(marketState) {
+  const s = String(marketState || '')
+    .trim()
+    .toUpperCase()
+  return s || null
+}
+
+function currentSessionLabel(_life, _assetId, marketState = null) {
+  // Only Yahoo’s marketState — never invent Pre-market / Overnight / Closed.
+  return yahooMarketStateSessionLabel(marketState) || '—'
 }
 
 function statusLabel(life, fresh, probeError = null) {
@@ -189,14 +183,25 @@ function probeSymbolFromQuote(entry, nowUtc, quote, batchError = null) {
       : gate
   const lastUpdateLondon = formatLondonStamp(gateWithError.quoteTimestampUtc)
   const resumeLondon = formatLondonStamp(gateWithError.nextExpectedOpenUtc)
+  const marketStateRaw =
+    quote?.marketState != null ? String(quote.marketState).trim() : null
+  const marketState = marketStateRaw ? marketStateRaw.toUpperCase() : null
+  const exchangeName =
+    entry.exchange ||
+    quote?.fullExchangeName ||
+    quote?.exchange ||
+    null
   return {
     id: entry.id,
     label: entry.label,
     symbol,
+    region: entry.region || null,
+    exchange: exchangeName,
     profilePolicy: profile?.sessionPolicyId || null,
     calendarState: gateWithError.calendarState,
     sessionName: gateWithError.sessionName,
-    currentSession: currentSessionLabel(life, entry.id),
+    marketState,
+    currentSession: currentSessionLabel(life, entry.id, marketState),
     status: statusLabel(life, gateWithError.freshnessState, batchError),
     lastUpdateLondon,
     resumeAtLondon: resumeLondon,
@@ -211,6 +216,8 @@ function probeSymbolFromQuote(entry, nowUtc, quote, batchError = null) {
     probeOnly: true,
     probeError: batchError,
     price: livePriceFromQuote(quote),
+    /** Full Yahoo quote object used for this probe (for JSON download). */
+    yahooQuote: quote && typeof quote === 'object' ? quote : null,
   }
 }
 

@@ -274,6 +274,7 @@ export function YahooInteractiveChart({
   compact = false,
   timeZone,
   showTimeZone = true,
+  disableCache = false,
 }: {
   ticker: string
   /** Optional already-fetched chart payload used as a daily seed for longer ranges. */
@@ -295,6 +296,8 @@ export function YahooInteractiveChart({
   timeZone?: string | null
   /** Append short zone name (EDT/BST/IST…). Default true when timeZone resolves. */
   showTimeZone?: boolean
+  /** Momentum desk: never reuse in-memory chart series — always refetch. */
+  disableCache?: boolean
 }) {
   const [range, setRange] = useState<YahooChartRange>(defaultRange)
   const [barInterval, setBarInterval] = useState<YahooChartInterval>(() => defaultIntervalFor(defaultRange))
@@ -307,14 +310,17 @@ export function YahooInteractiveChart({
   const cacheRef = useRef<Record<string, unknown>>({})
   const fetchedRef = useRef<Record<string, boolean>>({})
 
-  const seedDailyCaches = useCallback((seed: unknown) => {
-    if (!seed) return
-    // Bulk-fetched series is typically daily — only seed daily (or coarser) slots.
-    for (const r of ['3mo', '6mo', 'ytd', '1y'] as YahooChartRange[]) {
-      const key = cacheKey(r, '1d')
-      if (!cacheRef.current[key]) cacheRef.current[key] = seed
-    }
-  }, [])
+  const seedDailyCaches = useCallback(
+    (seed: unknown) => {
+      if (disableCache || !seed) return
+      // Bulk-fetched series is typically daily — only seed daily (or coarser) slots.
+      for (const r of ['3mo', '6mo', 'ytd', '1y'] as YahooChartRange[]) {
+        const key = cacheKey(r, '1d')
+        if (!cacheRef.current[key]) cacheRef.current[key] = seed
+      }
+    },
+    [disableCache],
+  )
 
   useEffect(() => {
     seedDailyCaches(initialChart)
@@ -323,34 +329,39 @@ export function YahooInteractiveChart({
   const loadChart = useCallback(
     async (nextRange: YahooChartRange, nextInterval: YahooChartInterval) => {
       const key = cacheKey(nextRange, nextInterval)
-      const cached = cacheRef.current[key]
+      const cached = disableCache ? undefined : cacheRef.current[key]
       if (cached) {
         setChart(cached)
         setActiveInterval(nextInterval)
         setError(null)
       }
 
-      // Always fetch dedicated series for intraday intervals; for daily+ fetch once per key.
-      const mustFetch = isIntradayInterval(nextInterval) || !fetchedRef.current[key]
+      // Always fetch when cache disabled; otherwise intraday always / daily once per key.
+      const mustFetch =
+        disableCache ||
+        isIntradayInterval(nextInterval) ||
+        !fetchedRef.current[key]
       if (!mustFetch && cached) return
 
       setLoading(!cached)
       setError(null)
       try {
         const body = await fetchYahooChart(ticker, nextRange, nextInterval)
-        cacheRef.current[key] = body.chart
-        fetchedRef.current[key] = true
+        if (!disableCache) {
+          cacheRef.current[key] = body.chart
+          fetchedRef.current[key] = true
+        }
         setChart(body.chart)
         setActiveInterval(body.interval || nextInterval)
       } catch (err) {
-        if (!cacheRef.current[key]) {
+        if (!cached) {
           setError(err instanceof Error ? err.message : 'Failed to load chart')
         }
       } finally {
         setLoading(false)
       }
     },
-    [ticker],
+    [ticker, disableCache],
   )
 
   // Reset when ticker changes.
@@ -363,7 +374,7 @@ export function YahooInteractiveChart({
     setBarInterval(nextInterval)
     void loadChart(range, nextInterval)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-bootstrap only on ticker change
-  }, [ticker])
+  }, [ticker, disableCache])
 
   // Range or interval change.
   useEffect(() => {
@@ -654,7 +665,9 @@ export function YahooInteractiveChart({
         <div
           className={cn(
             'relative w-full overflow-hidden text-muted-foreground',
-            borderless ? 'rounded-md bg-transparent p-0' : 'rounded-lg border bg-muted/20 p-2',
+            borderless
+              ? 'rounded-none bg-transparent p-0'
+              : 'rounded-lg border bg-muted/20 p-2',
           )}
         >
           {hoverIndex != null && active ? (

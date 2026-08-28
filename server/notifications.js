@@ -1,6 +1,6 @@
 /**
  * Notifications dashboard APIs:
- * - list monitored tickers from device_monitored_tickers
+ * - list monitored tickers from device_monitor
  * - scrape Perplexity finance via Firecrawl for equity "Notable Price Movement"
  * - scrape Trading Economics via Firecrawl for non-equity (commodity / forex / crypto / index)
  * - save ONLY new/changed dates under a ticker-scoped date map:
@@ -789,13 +789,7 @@ async function loadPerplexityUsageDaily({ supabase, days = 30 } = {}) {
 
   // 3) Research tables (historical saves)
   if (supabase && byDay.size === 0) {
-    const tables = [
-      'momentum_research_monitored_stocks',
-      'momentum_research_commodities',
-      'momentum_research_forex',
-      'momentum_research_crypto',
-      'momentum_research_indexes',
-    ]
+    const tables = ['research']
     for (const table of tables) {
       try {
         const { data, error } = await supabase
@@ -2454,8 +2448,8 @@ function buildNotablePayload({
   }
 }
 
-/** Users list → device_monitored_tickers · Extreme/Pinned → pinned_monitored_tickers */
-const MONITOR_TABLE_DEVICE = 'device_monitored_tickers'
+/** Users list → device_monitor · Extreme/Pinned → pinned_monitored_tickers */
+const MONITOR_TABLE_DEVICE = 'device_monitor'
 const MONITOR_TABLE_PINNED = 'pinned_monitored_tickers'
 
 function normalizeMonitorScope(value) {
@@ -2843,7 +2837,7 @@ async function persistTickerDates(supabase, ticker, payload, scope = 'device') {
         `Check the row exists and that the service role can UPDATE (RLS). ` +
         (monitorScope === 'pinned'
           ? 'Run supabase/schema_pinned_monitored_tickers.sql if the table is missing.'
-          : 'Check the ticker exists in device_monitored_tickers.'),
+          : 'Check the ticker exists in device_monitor.'),
     )
   }
   return data
@@ -3166,10 +3160,19 @@ function buildAudienceDevices(rows, appKey = 'nineam') {
           enabled_tickers: new Set(),
           disabled_tickers: new Set(),
           crypto_tickers: new Set(),
+          subscriber_updated_at: null,
         })
       }
       const entry = byToken.get(token)
       if (!entry.device_id && sub.device_id) entry.device_id = sub.device_id
+      const subUpdated = sub.updated_at || sub.token_updated_at || null
+      if (
+        subUpdated &&
+        (!entry.subscriber_updated_at ||
+          String(subUpdated) > String(entry.subscriber_updated_at))
+      ) {
+        entry.subscriber_updated_at = subUpdated
+      }
 
       if (!ticker) continue
       if (isSubscriberEnabled(sub)) {
@@ -3209,6 +3212,7 @@ function buildAudienceDevices(rows, appKey = 'nineam') {
       pro_crypto: cryptoTickers.length > 0,
       enabled_count: enabledTickers.length,
       disabled_count: disabledTickers.length,
+      subscriber_updated_at: entry.subscriber_updated_at,
     }
   })
 
@@ -3294,6 +3298,38 @@ export function extractLikelyDriver(text) {
       .trim()
   }
 
+  return ''
+}
+
+/**
+ * Pull "Secondary driver: …" from the same structured Perplexity reason.
+ * @param {string|null|undefined} text
+ * @returns {string}
+ */
+export function extractSecondaryDriver(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const normalized = raw.replace(
+    /\*{0,2}\s*secondary\s*driver\s*\*{0,2}\s*:/gi,
+    'Secondary driver:',
+  )
+  const sectionMatch = normalized.match(
+    /secondary\s*driver\s*:\s*([\s\S]*?)(?=(?:\n\s*)?(?:\*{0,2}\s*)?(?:move\s*classification|confidence|volume|tap\s+to\s+see|likely\s*driver)(?:\s*\*{0,2})?\s*:|$)/i,
+  )
+  if (sectionMatch?.[1]) {
+    return sectionMatch[1]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  const lineMatch = normalized.match(/secondary\s*driver\s*:\s*(.+)/i)
+  if (lineMatch?.[1]) {
+    return lineMatch[1]
+      .split(/\n/)[0]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
   return ''
 }
 
@@ -3761,7 +3797,7 @@ export async function sendExpoPush(messages) {
 }
 
 /**
- * Enabled Expo recipients for one ticker from device_monitored_tickers.subscribers.
+ * Enabled Expo recipients for one ticker from device_monitor.subscribers.
  * This is the mobile in-app watchlist (synced to Supabase) — source of truth for delivery.
  * Only devices with that exact ticker + app + valid Expo token + notifications on.
  *
@@ -3775,14 +3811,14 @@ export async function loadExpoRecipientsForTicker(supabase, ticker, appKey = 'tr
   if (!symbol || !supabase) return []
 
   let { data: rows, error } = await supabase
-    .from('device_monitored_tickers')
+    .from('device_monitor')
     .select('ticker, company_name, subscribers')
     .eq('ticker', symbol)
 
   if (error) throw error
   if (!rows?.length) {
     ;({ data: rows, error } = await supabase
-      .from('device_monitored_tickers')
+      .from('device_monitor')
       .select('ticker, company_name, subscribers')
       .ilike('ticker', symbol))
     if (error) throw error
@@ -3859,7 +3895,7 @@ export function buildTriggerEpisodePushData({
 /**
  * Send a Trigger episode push via the same Expo pipeline as `/api/notifications/alert/:ticker`.
  * Eligibility: device must currently have `ticker` in its in-app watchlist
- * (device_monitored_tickers.subscribers) for the Trigger app with push enabled.
+ * (device_monitor.subscribers) for the Trigger app with push enabled.
  *
  * @param {{
  *   supabase: import('@supabase/supabase-js').SupabaseClient|null,
@@ -4472,34 +4508,15 @@ export async function scrapePerplexityNotableMovements(ticker) {
 }
 
 /**
- * Map asset class → Supabase table for Perplexity momentum research saves.
- * Five isolated tables (stocks / commodities / forex / crypto / indexes).
+ * All Perplexity research now lives in unified `research`.
+ * Kept as a named helper so older callers still compile.
  */
-export function momentumResearchTableForAssetClass(assetClass) {
-  const cls = String(assetClass || 'equity')
-    .trim()
-    .toLowerCase()
-  if (cls === 'commodity') return 'momentum_research_commodities'
-  if (cls === 'forex' || cls === 'fx' || cls === 'currency') {
-    return 'momentum_research_forex'
-  }
-  if (cls === 'crypto' || cls === 'cryptocurrency') {
-    return 'momentum_research_crypto'
-  }
-  if (cls === 'index' || cls === 'indices' || cls === 'etf') {
-    return 'momentum_research_indexes'
-  }
-  // equity / stock / default
-  return 'momentum_research_monitored_stocks'
+export function momentumResearchTableForAssetClass(_assetClass) {
+  return 'research'
 }
 
 function extractSecondaryDriverFromReason(reason) {
-  const text = String(reason || '')
-  const m = text.match(
-    /^secondary\s*driver\s*:\s*(.+?)(?=\n\s*(?:move\s*classification|confidence)\s*:|\n\s*$)/ims,
-  )
-  if (!m) return null
-  return m[1].replace(/\s+/g, ' ').trim() || null
+  return extractSecondaryDriver(reason) || null
 }
 
 /**
@@ -4510,74 +4527,59 @@ export async function saveMomentumResearchRow(supabase, payload = {}) {
     return { ok: false, error: 'Supabase not configured' }
   }
   const assetClass = String(payload.asset_class || 'equity').toLowerCase()
-  const table = momentumResearchTableForAssetClass(assetClass)
-  const movePercent = Number(payload.move_percent)
+  const table = 'research'
   const costUsd = Number(
     payload.cost?.total_cost ??
       payload.cost_usd ??
       String(payload.cost_usd_display || '')
         .replace(/[^0-9.eE+-]/g, ''),
   )
-  const row = {
-    ticker: String(payload.ticker || '').toUpperCase(),
-    company_name: payload.company_name || null,
-    asset_class: assetClass,
-    event_date: payload.event_date || todayIsoEastern(),
-    window_key: payload.window_key || null,
-    window_label: payload.window_label || null,
-    exact_label: payload.exact_label || null,
-    exact_minutes: Number.isFinite(Number(payload.exact_minutes))
-      ? Number(payload.exact_minutes)
-      : null,
-    move_percent: Number.isFinite(movePercent) ? movePercent : null,
-    user_movement: payload.user_movement || null,
-    market_session: payload.market_session || null,
-    live_price:
-      payload.live_price != null && Number.isFinite(Number(payload.live_price))
-        ? Number(payload.live_price)
-        : null,
-    reference_price:
-      payload.reference_price != null &&
-      Number.isFinite(Number(payload.reference_price))
-        ? Number(payload.reference_price)
-        : null,
-    reference_time: payload.reference_time || null,
-    headline: payload.headline || null,
-    likely_driver: payload.likely_driver || null,
-    secondary_driver:
-      payload.secondary_driver ||
-      extractSecondaryDriverFromReason(payload.reason) ||
-      null,
-    reason: String(payload.reason || '').trim() || '(empty)',
-    push_title: payload.push_title || null,
-    push_body: payload.push_body || null,
-    model: payload.model || null,
-    model_version: payload.model_version || null,
-    request_id: payload.request_id || null,
-    provider: payload.provider || 'perplexity',
-    citations: Array.isArray(payload.citations) ? payload.citations : [],
-    search_results: Array.isArray(payload.search_results)
-      ? payload.search_results
-      : [],
-    tools: Array.isArray(payload.tools) ? payload.tools : [],
-    tokens: payload.tokens || null,
-    cost: payload.cost || null,
-    cost_usd: Number.isFinite(costUsd) ? costUsd : null,
-    cost_usd_display: payload.cost_usd_display || null,
-    prompt: payload.prompt || null,
-    input_facts: payload.input_facts || null,
-    process_steps: Array.isArray(payload.process_steps)
-      ? payload.process_steps
-      : null,
-  }
-
-  if (!row.ticker) {
+  const ticker = String(payload.ticker || '').toUpperCase()
+  const episodeId = String(
+    payload.episode_id || payload.episodeId || '',
+  ).trim() || null
+  if (!ticker) {
     return { ok: false, error: 'ticker required to save research', table }
   }
 
+  const likelyDriver =
+    payload.likely_driver ||
+    extractLikelyDriver(payload.reason) ||
+    null
+  const secondaryDriver =
+    payload.secondary_driver ||
+    extractSecondaryDriver(payload.reason) ||
+    null
+  const alertTitle =
+    payload.alert?.title || payload.push_title || null
+  const alertBody =
+    payload.alert?.body || payload.push_body || likelyDriver || null
+
   const { data, error } = await supabase
     .from(table)
-    .insert(row)
+    .insert({
+      episode_id: episodeId,
+      ticker,
+      asset_class: assetClass,
+      likely_driver: likelyDriver,
+      secondary_driver: secondaryDriver,
+      alert: {
+        title: alertTitle || '',
+        body: alertBody || '',
+      },
+      model_version:
+        payload.model_version || payload.model || null,
+      request_id: payload.request_id || null,
+      citations: Array.isArray(payload.citations) ? payload.citations : [],
+      tokens: payload.tokens || null,
+      cost: payload.cost || null,
+      cost_usd: Number.isFinite(costUsd) ? costUsd : null,
+      cost_usd_display: payload.cost_usd_display || null,
+      process_steps: Array.isArray(payload.process_steps)
+        ? payload.process_steps
+        : null,
+      source_table: table,
+    })
     .select('id, created_at')
     .maybeSingle()
 
@@ -4589,6 +4591,7 @@ export async function saveMomentumResearchRow(supabase, payload = {}) {
       code: error.code || null,
     }
   }
+
   return {
     ok: true,
     table,
@@ -4609,14 +4612,14 @@ export function createNotificationsRouter({ getSupabase }) {
         let error = null
 
         ;({ data, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, company_name, created_at, updated_at, notable_price_movements, subscribers')
           .order('ticker', { ascending: true }))
 
-        // Column may not exist until schema_device_monitored_tickers.sql is applied.
+        // Column may not exist until schema_device_monitor.sql is applied.
         if (error && /notable_price_movements/i.test(error.message || '')) {
           ;({ data, error } = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .select('ticker, company_name, created_at, updated_at, subscribers')
             .order('ticker', { ascending: true }))
         }
@@ -4733,7 +4736,7 @@ export function createNotificationsRouter({ getSupabase }) {
     },
 
     /**
-     * Ensure a ticker exists in device_monitored_tickers so scrape/save work.
+     * Ensure a ticker exists in device_monitor so scrape/save work.
      * Used by the dashboard sidebar: Yahoo search → + add.
      * Body: { ticker, company_name? }
      */
@@ -4802,7 +4805,7 @@ export function createNotificationsRouter({ getSupabase }) {
         let lastError = null
         for (const row of candidates) {
           const result = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .insert(row)
             .select('ticker, company_name, created_at, updated_at')
             .limit(1)
@@ -4886,7 +4889,7 @@ export function createNotificationsRouter({ getSupabase }) {
 
         // Extreme/Pinned: only write to pinned_monitored_tickers when the row already
         // exists (user clicked Pin) or the client explicitly asks to create.
-        // Never create a Users/device_monitored_tickers row from this path.
+        // Never create a Users/device_monitor row from this path.
         // Never auto-pin just because Extreme scrape ran.
         let loaded = await loadTickerDates(supabase, ticker, monitorScope)
         const createPinnedIfMissing =
@@ -5692,34 +5695,389 @@ export function createNotificationsRouter({ getSupabase }) {
      * fully stopped ones — so the dashboard can show Notifications on/off correctly.
      * Alertable subset = devices where enabled === true (subscription_status on|partial).
      */
+    /**
+     * Remove a device's subscriber rows from device_monitor.
+     * Body: { app?, device_id?, expo_push_token?, tickers?: string[], all?: boolean }
+     * - tickers: remove only those symbols
+     * - all: true → remove this device from every ticker it appears on
+     */
+    async unsubscribeDeviceTickers(request, response) {
+      try {
+        const appKey = normalizeNotificationApp(
+          request.body?.app || request.body?.app_key || request.query?.app,
+        )
+        const deviceId = String(request.body?.device_id || '').trim()
+        const token = String(
+          request.body?.expo_push_token || request.body?.to || '',
+        ).trim()
+        if (!deviceId && !token) {
+          response.status(400).json({
+            error: 'Provide device_id and/or expo_push_token',
+          })
+          return
+        }
+
+        const all = request.body?.all === true
+        const tickerFilter = Array.isArray(request.body?.tickers)
+          ? [
+              ...new Set(
+                request.body.tickers
+                  .map((t) => normalizeTicker(t))
+                  .filter(Boolean),
+              ),
+            ]
+          : []
+        if (!all && !tickerFilter.length) {
+          response.status(400).json({
+            error: 'Provide tickers[] or all: true',
+          })
+          return
+        }
+
+        const supabase = getSupabase()
+        const { data, error } = await supabase
+          .from('device_monitor')
+          .select('ticker, subscribers')
+        if (error) throw error
+
+        const matchSub = (sub) => {
+          if (!sub || typeof sub !== 'object') return false
+          // Only touch rows for the selected app (legacy untagged = nineam).
+          if (subscriberNotificationApp(sub) !== appKey) return false
+          const sid = String(sub.device_id || '').trim()
+          const stok = String(sub.expo_push_token || '').trim()
+          if (deviceId && sid && sid === deviceId) return true
+          if (token && stok && stok === token) return true
+          return false
+        }
+
+        const wanted = all ? null : new Set(tickerFilter)
+        const updated = []
+        const skipped = []
+
+        for (const row of data || []) {
+          const ticker = normalizeTicker(row.ticker)
+          if (!ticker) continue
+          if (wanted && !wanted.has(ticker)) continue
+
+          const subs = Array.isArray(row.subscribers) ? row.subscribers : []
+          if (!subs.some(matchSub)) {
+            if (wanted) skipped.push(ticker)
+            continue
+          }
+
+          const nextSubs = subs.filter((sub) => !matchSub(sub))
+          const { error: upErr } = await supabase
+            .from('device_monitor')
+            .update({
+              subscribers: nextSubs,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('ticker', ticker)
+          if (upErr) throw upErr
+          updated.push({
+            ticker,
+            removed: subs.length - nextSubs.length,
+            remaining_subscribers: nextSubs.length,
+          })
+        }
+
+        response.json({
+          ok: true,
+          app_key: appKey,
+          device_id: deviceId || null,
+          expo_push_token: token || null,
+          mode: all ? 'all' : 'selected',
+          updated_count: updated.length,
+          updated,
+          skipped,
+        })
+      } catch (error) {
+        response.status(500).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to unsubscribe device tickers',
+        })
+      }
+    },
+
     async listDevices(request, response) {
       try {
         const appKey = normalizeNotificationApp(request.query?.app)
         const supabase = getSupabase()
         const { data, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, company_name, subscribers')
 
         if (error) throw error
 
         const devices = buildAudienceDevices(data || [], appKey)
-        const alertable = devices.filter((d) => d.enabled)
-        const stopped = devices.filter((d) => !d.enabled)
+
+        // Enrich with device profile rows when present (Trigger vs 9AM tables).
+        // Also include profile-only devices with zero monitored tickers so they
+        // still appear in Users / Audience lists.
+        const profileTable = 'device_profiles'
+
+        /** @type {Map<string, any>} */
+        const profileByDeviceId = new Map()
+        /** @type {Map<string, any>} */
+        const profileByToken = new Map()
+        /** @type {any[]} */
+        let allProfileRows = []
+
+        {
+          const { data: allProfiles, error: allProfilesError } = await supabase
+            .from(profileTable)
+            .select('*')
+            .limit(2000)
+          if (allProfilesError) {
+            console.warn(
+              `[notifications] ${profileTable} full list skipped:`,
+              allProfilesError.message,
+            )
+          } else if (allProfiles?.length) {
+            allProfileRows = allProfiles
+          }
+        }
+
+        for (const row of allProfileRows) {
+          if (row?.device_id) profileByDeviceId.set(String(row.device_id), row)
+          if (row?.expo_push_token) {
+            profileByToken.set(String(row.expo_push_token).trim(), row)
+          }
+        }
+
+        // Merge profile-only devices (0 tickers) that are missing from audience.
+        const seenKeys = new Set(
+          devices.map(
+            (d) =>
+              String(d.device_id || '').trim() ||
+              String(d.expo_push_token || '').trim(),
+          ),
+        )
+        for (const row of allProfileRows) {
+          const token = String(row?.expo_push_token || '').trim()
+          const deviceId = String(row?.device_id || '').trim()
+          const key = deviceId || token
+          if (!key || seenKeys.has(key)) continue
+          // Prefer device_id key; also skip if token already present under another id
+          if (token && seenKeys.has(token)) continue
+          if (deviceId && seenKeys.has(deviceId)) continue
+          seenKeys.add(key)
+          if (token) seenKeys.add(token)
+          if (deviceId) seenKeys.add(deviceId)
+          devices.push({
+            device_id: deviceId || null,
+            expo_push_token: token || null,
+            app_key: appKey,
+            enabled: false,
+            subscription_status: 'off',
+            tickers: [],
+            enabled_tickers: [],
+            disabled_tickers: [],
+            crypto_tickers: [],
+            pro_crypto: false,
+            enabled_count: 0,
+            disabled_count: 0,
+            subscriber_updated_at: null,
+          })
+        }
+
+        const enriched = devices.map((device) => {
+          const profile =
+            (device.device_id && profileByDeviceId.get(String(device.device_id))) ||
+            (device.expo_push_token &&
+              profileByToken.get(String(device.expo_push_token).trim())) ||
+            null
+
+          return {
+            ...device,
+            user_id: profile?.user_id ?? null,
+            platform: profile?.platform ?? null,
+            device_model: profile?.device_model ?? null,
+            manufacturer: profile?.manufacturer ?? null,
+            os_version: profile?.os_version ?? null,
+            app_version: profile?.app_version ?? null,
+            build_number: profile?.build_number ?? null,
+            timezone: profile?.timezone ?? null,
+            locale: profile?.locale ?? null,
+            notifications_enabled:
+              profile?.notifications_enabled ?? device.enabled ?? null,
+            permission_status: profile?.permission_status ?? null,
+            last_seen_at:
+              profile?.last_seen_at ??
+              profile?.updated_at ??
+              device.subscriber_updated_at ??
+              null,
+            token_updated_at:
+              profile?.token_updated_at ??
+              device.subscriber_updated_at ??
+              profile?.updated_at ??
+              null,
+            created_at: profile?.created_at ?? null,
+            profile_updated_at: profile?.updated_at ?? null,
+          }
+        })
+
+        // Keep alertable first, then partial, then off (incl. zero-ticker profiles).
+        const rank = { on: 0, partial: 1, off: 2 }
+        enriched.sort((a, b) => {
+          const dr =
+            (rank[a.subscription_status] ?? 9) -
+            (rank[b.subscription_status] ?? 9)
+          if (dr !== 0) return dr
+          return String(a.device_id || a.expo_push_token || '').localeCompare(
+            String(b.device_id || b.expo_push_token || ''),
+          )
+        })
+
+        const alertable = enriched.filter((d) => d.enabled)
+        const stopped = enriched.filter((d) => !d.enabled)
 
         response.json({
           ok: true,
           app_key: appKey,
-          count: devices.length,
+          count: enriched.length,
           alertable_count: alertable.length,
           stopped_count: stopped.length,
-          // Full list for Audience UI (on + partial + off).
-          devices,
+          // Full list for Audience UI (on + partial + off + zero-ticker profiles).
+          devices: enriched,
           // Back-compat for any caller that only wants push-ready tokens.
           recipients: collectPushRecipients(data || [], appKey),
         })
       } catch (error) {
         response.status(500).json({
           error: error instanceof Error ? error.message : 'Failed to load devices',
+        })
+      }
+    },
+
+    /**
+     * Recent push / alert activity for one Trigger device.
+     * Scans in-memory momentum event rings for pushResult recipients matching
+     * device_id or expo_push_token. Also returns empty list when none match.
+     *
+     * GET /api/notifications/devices/activity?device_id=&expo_push_token=&limit=80
+     */
+    async listDeviceActivity(request, response) {
+      try {
+        const deviceId = String(request.query?.device_id || '').trim()
+        const token = String(request.query?.expo_push_token || '').trim()
+        const limit = Math.min(
+          Math.max(Number(request.query?.limit || 80), 1),
+          200,
+        )
+        if (!deviceId && !token) {
+          response.status(400).json({
+            ok: false,
+            error: 'device_id or expo_push_token required',
+          })
+          return
+        }
+
+        const store = await import('./momentum/store.js')
+        const tickers =
+          typeof store.listKnownTickers === 'function'
+            ? store.listKnownTickers()
+            : typeof store.listWatchedTickers === 'function'
+              ? store.listWatchedTickers()
+              : []
+
+        /** @type {Array<Record<string, unknown>>} */
+        const activities = []
+        const deviceIdLower = deviceId.toLowerCase()
+
+        for (const ticker of tickers) {
+          const events =
+            typeof store.listEvents === 'function'
+              ? store.listEvents(ticker, 160)
+              : []
+          for (const ev of events || []) {
+            const push = ev?.pushResult || null
+            if (!push) continue
+            const recipients = Array.isArray(push.recipients)
+              ? push.recipients
+              : []
+            const deviceIds = Array.isArray(push.device_ids)
+              ? push.device_ids.map((id) => String(id || ''))
+              : []
+
+            let matched = false
+            let matchStatus = ''
+            let matchError = null
+
+            if (deviceId && deviceIds.some((id) => id === deviceId)) {
+              matched = true
+            }
+            for (const r of recipients) {
+              const rid = String(r?.device_id || '')
+              const rtok = String(r?.expo_push_token || '').trim()
+              if (
+                (deviceId && rid === deviceId) ||
+                (token && rtok && rtok === token) ||
+                (deviceIdLower &&
+                  rid &&
+                  rid.toLowerCase() === deviceIdLower)
+              ) {
+                matched = true
+                matchStatus = String(r?.status || '')
+                matchError = r?.error || null
+                break
+              }
+            }
+            if (!matched) continue
+
+            const at =
+              push.at ||
+              ev.notifiedAt ||
+              ev.detectedAt ||
+              new Date().toISOString()
+            const title =
+              ev.notification?.title ||
+              `${String(ev.eventType || 'ALERT').replace(/^MOMENTUM_/, '')} · ${ticker}`
+            const body = ev.notification?.body || null
+            activities.push({
+              id: `${ticker}-${at}-${String(ev.eventType || 'push')}`,
+              kind: 'push',
+              at,
+              ticker,
+              title,
+              body,
+              eventType: ev.eventType || null,
+              direction: ev.direction || null,
+              movePercent:
+                ev.movePercent != null && Number.isFinite(Number(ev.movePercent))
+                  ? Number(ev.movePercent)
+                  : null,
+              detectedWindow: ev.detectedWindow || null,
+              delivery_status: matchStatus || (push.skipped ? 'skipped' : 'sent'),
+              delivery_error: matchError,
+              push_skipped: Boolean(push.skipped),
+              push_reason: push.reason || null,
+            })
+          }
+        }
+
+        activities.sort((a, b) => {
+          const tb = Date.parse(String(b.at || '')) || 0
+          const ta = Date.parse(String(a.at || '')) || 0
+          return tb - ta
+        })
+
+        response.json({
+          ok: true,
+          device_id: deviceId || null,
+          count: Math.min(activities.length, limit),
+          activities: activities.slice(0, limit),
+        })
+      } catch (error) {
+        response.status(500).json({
+          ok: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to load device activity',
         })
       }
     },
@@ -5890,7 +6248,7 @@ export function createNotificationsRouter({ getSupabase }) {
         }
 
         const { data: rows, error: rowsError } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('subscribers')
         if (rowsError) throw rowsError
 
@@ -6108,7 +6466,7 @@ export function createNotificationsRouter({ getSupabase }) {
       try {
         const supabase = getSupabase()
         const { data: rows, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, subscribers, notable_price_movements')
         if (error) throw error
 
@@ -6266,7 +6624,7 @@ export function createNotificationsRouter({ getSupabase }) {
     /**
      * Read-only preview of the exact notable-movement notification copy.
      * Accepts an optional event so a dashboard card can preview that card only.
-     * Extreme / Pinned: works even when ticker is not in device_monitored_tickers.
+     * Extreme / Pinned: works even when ticker is not in device_monitor.
      */
     async previewAlert(request, response) {
       try {
@@ -6283,14 +6641,14 @@ export function createNotificationsRouter({ getSupabase }) {
 
         const supabase = getSupabase()
         let { data: rows, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, company_name, subscribers, notable_price_movements')
           .eq('ticker', ticker)
 
         if (error) throw error
         if (!rows?.length) {
           ;({ data: rows, error } = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .select('ticker, company_name, subscribers, notable_price_movements')
             .ilike('ticker', ticker))
           if (error) throw error
@@ -6301,7 +6659,7 @@ export function createNotificationsRouter({ getSupabase }) {
           request.body?.event && typeof request.body.event === 'object'
         if (!rows?.length && !hasEventBody && !String(request.body?.title || '').trim()) {
           response.status(404).json({
-            error: `Ticker ${ticker} not found in device_monitored_tickers`,
+            error: `Ticker ${ticker} not found in device_monitor`,
           })
           return
         }
@@ -6335,7 +6693,7 @@ export function createNotificationsRouter({ getSupabase }) {
         let recipients = collectPushRecipients(rows, appKey)
         if (allRecipients) {
           const { data: allRows, error: allError } = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .select('subscribers')
           if (allError) throw allError
           recipients = collectPushRecipients(allRows || [], appKey)
@@ -6383,14 +6741,14 @@ export function createNotificationsRouter({ getSupabase }) {
 
         const supabase = getSupabase()
         let { data: rows, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, company_name, subscribers, notable_price_movements')
           .eq('ticker', ticker)
 
         if (error) throw error
         if (!rows?.length) {
           ;({ data: rows, error } = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .select('ticker, company_name, subscribers, notable_price_movements')
             .ilike('ticker', ticker))
           if (error) throw error
@@ -6418,7 +6776,7 @@ export function createNotificationsRouter({ getSupabase }) {
             !hasTitleOverride
           ) {
             response.status(404).json({
-              error: `Ticker ${ticker} not found in device_monitored_tickers`,
+              error: `Ticker ${ticker} not found in device_monitor`,
             })
             return
           }
@@ -6428,7 +6786,7 @@ export function createNotificationsRouter({ getSupabase }) {
         let recipients = collectPushRecipients(rows, appKey)
         if (allRecipients || (!recipients.length && (selectedIds.length || selectedTokens.length))) {
           const { data: allRows, error: allError } = await supabase
-            .from('device_monitored_tickers')
+            .from('device_monitor')
             .select('subscribers')
           if (allError) throw allError
           recipients = collectPushRecipients(allRows || [], appKey)
@@ -7505,15 +7863,9 @@ export function createNotificationsRouter({ getSupabase }) {
           return
         }
 
-        const likelyLine = summary
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .find((l) => /^likely driver:\s*/i.test(l))
-        // Dashes → commas before Supabase save + push
-        const likelyDriver = formatDashesToCommas(
-          likelyLine
-            ? likelyLine.replace(/^likely driver:\s*/i, '').trim()
-            : '',
+        const likelyDriver = formatDashesToCommas(extractLikelyDriver(summary))
+        const secondaryDriver = formatDashesToCommas(
+          extractSecondaryDriver(summary),
         )
         summary = formatDashesToCommas(summary)
         const headlineLine = formatDashesToCommas(
@@ -7607,6 +7959,8 @@ export function createNotificationsRouter({ getSupabase }) {
             ticker,
             company_name: companyName || null,
             asset_class: cls,
+            episode_id:
+              request.body?.episode_id || request.body?.episodeId || null,
             event_date: eventDate,
             window_key: windowKey,
             window_label: windowLabel,
@@ -7620,16 +7974,12 @@ export function createNotificationsRouter({ getSupabase }) {
             reference_time: referenceTime,
             headline: headlineLine || null,
             likely_driver: likelyDriver || null,
-            reason: summary,
+            secondary_driver: secondaryDriver || null,
             push_title: pushTitle,
             push_body: pushBody,
-            model,
-            model_version: modelVersion,
+            model_version: modelVersion || model,
             request_id: requestId,
-            provider: 'perplexity',
             citations,
-            search_results: searchResults,
-            tools: toolsUsed,
             tokens: {
               prompt: usageRaw?.prompt_tokens ?? null,
               completion: usageRaw?.completion_tokens ?? null,
@@ -7637,8 +7987,6 @@ export function createNotificationsRouter({ getSupabase }) {
             },
             cost: costInfo,
             cost_usd_display: costUsdDisplay,
-            prompt: fullPrompt,
-            input_facts: inputFacts,
             process_steps: processSteps,
           })
           processSteps.push({
@@ -7674,6 +8022,8 @@ export function createNotificationsRouter({ getSupabase }) {
           ticker,
           company_name: companyName || null,
           asset_class: cls,
+          episode_id:
+            request.body?.episode_id || request.body?.episodeId || null,
           event_date: eventDate,
           window_key: windowKey,
           window_label: windowLabel,
@@ -7701,6 +8051,7 @@ export function createNotificationsRouter({ getSupabase }) {
           prompt: fullPrompt,
           reason: summary,
           likely_driver: likelyDriver || null,
+          secondary_driver: secondaryDriver || null,
           headline: headlineLine || null,
           push_title: pushTitle,
           push_body: pushBody,
@@ -7820,7 +8171,7 @@ export function createNotificationsRouter({ getSupabase }) {
         const days = Math.min(90, Math.max(1, Number(request.query?.days) || 30))
         const supabase = getSupabase()
         const { data: rows, error } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, notable_price_movements')
         if (error) throw error
         const daily = aggregateGeminiSpendByDay(rows || [], { days })
@@ -7968,7 +8319,7 @@ export function createNotificationsRouter({ getSupabase }) {
         runId = runRow.id
 
         const { data: rows, error: listErr } = await supabase
-          .from('device_monitored_tickers')
+          .from('device_monitor')
           .select('ticker, company_name, subscribers, notable_price_movements')
         if (listErr) throw listErr
 
@@ -8753,6 +9104,12 @@ export function mountNotificationsRoutes(app, { getSupabase }) {
   )
   app.get('/api/notifications/firecrawl/credits', (req, res) => handlers.credits(req, res))
   app.get('/api/notifications/devices', (req, res) => handlers.listDevices(req, res))
+  app.get('/api/notifications/devices/activity', (req, res) =>
+    handlers.listDeviceActivity(req, res),
+  )
+  app.post('/api/notifications/devices/unsubscribe', (req, res) =>
+    handlers.unsubscribeDeviceTickers(req, res),
+  )
   app.get('/api/notifications/app-settings', (req, res) => handlers.getAppSettings(req, res))
   app.put('/api/notifications/app-settings', (req, res) => handlers.updateAppSettings(req, res))
   app.get('/api/notifications/news', (req, res) => handlers.listNews(req, res))

@@ -3,6 +3,11 @@ import { Moon, RefreshCw, Settings, Sun } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { SidebarTrigger } from '@/components/ui/sidebar'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import type { ThemeMode } from '@/hooks/useTheme'
 import type { MomentumStudioState } from './useMomentumStudio'
 
@@ -38,39 +43,56 @@ export function SiteHeader({
         />
         <h1 className="min-w-0 truncate text-base font-medium">{title}</h1>
         <div className="ml-auto flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onToggleTheme}
-            className="hidden sm:flex"
-          >
-            {theme === 'dark' ? <Sun /> : <Moon />}
-            <span className="sr-only">Toggle theme</span>
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => {
-              void studio.loadWatchlist()
-              if (studio.activeTicker) void studio.loadStatus(studio.activeTicker)
-              void studio.loadActiveEpisodes()
-            }}
-          >
-            <RefreshCw />
-            <span className="sr-only">Refresh</span>
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => studio.setSettingsOpen(true)}
-          >
-            <Settings />
-            <span className="sr-only">Settings</span>
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={onToggleTheme}
+                className="hidden sm:flex"
+                aria-label="Toggle theme"
+              >
+                {theme === 'dark' ? <Sun /> : <Moon />}
+                <span className="sr-only">Toggle theme</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Toggle theme</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Refresh"
+                onClick={() => {
+                  void studio.loadWatchlist()
+                  if (studio.activeTicker)
+                    void studio.loadStatus(studio.activeTicker)
+                  void studio.loadActiveEpisodes()
+                }}
+              >
+                <RefreshCw />
+                <span className="sr-only">Refresh</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Refresh</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Settings"
+                onClick={() => studio.setSettingsOpen(true)}
+              >
+                <Settings />
+                <span className="sr-only">Settings</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Settings</TooltipContent>
+          </Tooltip>
           <Button variant="ghost" asChild size="sm" className="hidden sm:flex">
-            <a href="/notifications" className="dark:text-foreground">
-              Original desk
-            </a>
+            <a href="/notifications">Original desk</a>
           </Button>
         </div>
       </div>

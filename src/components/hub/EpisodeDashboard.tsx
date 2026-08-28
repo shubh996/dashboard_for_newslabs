@@ -1,5 +1,5 @@
 /**
- * Developer debug panel for multi-ticker momentum engine.
+ * Episode Dashboard — multi-ticker momentum / episode desk.
  * Home-tab only · left status + collapsible right activity log.
  * Every watchlist tab gets live quote, chart, rolling returns, episode, logs.
  */
@@ -14,12 +14,9 @@ import {
 } from 'react'
 import {
   Activity,
-  ArrowDownRight,
-  ArrowUpRight,
   BarChart3,
   BellRing,
   Bitcoin,
-  Bookmark,
   Check,
   Clock,
   ChevronDown,
@@ -32,17 +29,18 @@ import {
   LayoutDashboard,
   LineChart,
   Loader2,
+  PieChart,
   Moon,
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Sun,
   Terminal,
   Trash2,
   Users,
-  TrendingUp,
   Wheat,
   X,
   Zap,
@@ -55,6 +53,14 @@ import {
   usEquitySessionFromEtClock,
 } from '@/lib/usEquitySession'
 import { YahooInteractiveChart } from '@/components/yahoo/YahooInteractiveChart'
+import {
+  DeskUserActivitiesPanel,
+  DeskUserListButton,
+  DeskUserProfilePanel,
+  deskDeviceKey,
+  type DeskDevice,
+  type DeskUserActivity,
+} from '@/components/hub/desk-users'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -87,7 +93,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
-  fetchYahooMostActives,
   fetchMomentumMonitoredTickers,
   fetchYahooQuote,
   fetchYahooQuotes,
@@ -95,11 +100,14 @@ import {
   resolveYahooLogoUrl,
   searchYahooSaved,
   type YahooLiveQuote,
-  type YahooMostActiveItem,
 } from '@/services/yahooApi'
 import type { YahooSearchResult } from '@/types/yahoo'
 import { resolveYahooActiveSession } from '@/lib/yahooMarketSession'
-import { YahooFinanceWithMarketState } from '@/components/yahoo/YahooMarketStateLabel'
+import {
+  YahooFinanceWithMarketState,
+  YahooMarketStateLabel,
+} from '@/components/yahoo/YahooMarketStateLabel'
+import { CompanyLogo } from '@/components/hub/company-logo'
 import { timeZoneSuffix } from '@/lib/localTimeZone'
 import {
   formatExchangeTime,
@@ -203,17 +211,61 @@ type ActiveEpisodeRow = {
   exactLabel?: string | null
   lastMaterialProgressAt?: string | null
   marketSession?: string | null
+  endReason?: string | null
+  endedAt?: string | null
+  supabaseSaved?: boolean
+  supabasePersist?: {
+    ok?: boolean
+    action?: 'saved' | 'updated' | string
+    at?: string | null
+    id?: string | null
+  } | null
+}
+
+/** Stable key for desk episode list focus / keyboard nav. */
+function deskEpisodeNavKey(row: ActiveEpisodeRow | null | undefined): string {
+  if (!row) return ''
+  const eid = row.episodeId != null ? String(row.episodeId).trim() : ''
+  if (eid) return `id:${eid}`
+  const ticker = String(row.ticker || '')
+    .trim()
+    .toUpperCase()
+  return `t:${ticker}|s:${row.episodeStartedAt || ''}|n:${row.episodeNo ?? ''}`
+}
+
+function deskEpisodeRowsMatch(
+  a: ActiveEpisodeRow | null | undefined,
+  b: ActiveEpisodeRow | null | undefined,
+): boolean {
+  if (!a || !b) return false
+  const aId = a.episodeId != null ? String(a.episodeId).trim() : ''
+  const bId = b.episodeId != null ? String(b.episodeId).trim() : ''
+  if (aId && bId) return aId === bId
+  return (
+    String(a.ticker || '')
+      .trim()
+      .toUpperCase() ===
+      String(b.ticker || '')
+        .trim()
+        .toUpperCase() &&
+    a.episodeStartedAt === b.episodeStartedAt &&
+    (a.episodeNo ?? null) === (b.episodeNo ?? null)
+  )
 }
 
 /** Scheduled OPEN / MIDDAY / CLOSE market summary (not an episode). */
 /** Perplexity research payload attached to a timeline event */
 type EventResearch = {
+  researchId?: string | null
+  episodeId?: string | null
   status?: 'running' | 'done' | 'error' | string | null
   reason?: string | null
   likely_driver?: string | null
   secondary_driver?: string | null
+  alert?: { title?: string | null; body?: string | null } | null
   provider?: string | null
   model?: string | null
+  model_version?: string | null
   citations?: string[]
   search_results?: Array<{
     title?: string | null
@@ -298,6 +350,7 @@ type MomentumEvent = {
   } | null
   /** Perplexity research findings (manual research or attached) */
   research?: EventResearch | null
+  researchId?: string | null
   likely_driver?: string | null
 }
 
@@ -561,6 +614,142 @@ function CalcTooltipContent({
     >
       {children}
     </TooltipContent>
+  )
+}
+
+/**
+ * All-episodes Move column hover: how the shown % was calculated + Supabase source.
+ */
+function EpisodeListMoveCalcBody({
+  row,
+  shownMove,
+  shownKind,
+}: {
+  row: ActiveEpisodeRow
+  shownMove: number
+  shownKind: 'current' | 'peak' | 'initial'
+}) {
+  const dir = String(row.direction || 'UP').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP'
+  const ref = Number(row.referencePrice)
+  const live = Number(row.currentPrice)
+  const peak = Number(row.peakPrice)
+  const trough = Number(row.troughPrice)
+  const extreme =
+    shownKind === 'peak'
+      ? dir === 'DOWN'
+        ? trough
+        : peak
+      : live
+  const fmtP = (n: number | null | undefined) =>
+    n != null && Number.isFinite(Number(n)) ? fmtPrice(Number(n)) : '—'
+
+  let formula: string | null = null
+  let computed: number | null = null
+  if (Number.isFinite(ref) && ref !== 0 && Number.isFinite(extreme)) {
+    computed = ((extreme - ref) / ref) * 100
+    formula = `((${fmtP(extreme)} − ${fmtP(ref)}) ÷ ${fmtP(ref)}) × 100 ≈ ${fmtPct(computed)}`
+  }
+
+  const fromSupabase = Boolean(
+    row.supabaseSaved || row.supabasePersist?.ok || row.episodeId,
+  )
+  const persistAction = String(row.supabasePersist?.action || '').toLowerCase()
+  const kindLabel =
+    shownKind === 'peak'
+      ? 'Peak move'
+      : shownKind === 'initial'
+        ? 'Initial move'
+        : 'Current move'
+
+  return (
+    <div className="flex w-[min(20rem,88vw)] flex-col gap-2.5 text-left text-[13px] leading-relaxed">
+      <div className="min-w-0 space-y-1">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-background/65">
+          {kindLabel} · how calculated
+        </p>
+        <p className="text-[14px] font-semibold leading-snug text-background">
+          Episode move vs reference price from when this episode opened (
+          {dir === 'DOWN' ? 'DOWN' : 'UP'}).
+        </p>
+      </div>
+      <p className="text-[12px] leading-snug text-background/75">
+        {shownKind === 'peak'
+          ? dir === 'DOWN'
+            ? 'Peak move uses the trough (lowest live) vs reference.'
+            : 'Peak move uses the peak (highest live) vs reference.'
+          : 'Current move uses the latest live / event price vs reference.'}{' '}
+        Window: {row.detectedWindow || '—'}.
+      </p>
+      {formula ? (
+        <div className="rounded-lg bg-background/10 px-3 py-2.5 font-mono text-[12px] leading-snug text-background">
+          {formula}
+        </div>
+      ) : (
+        <div className="rounded-lg bg-background/10 px-3 py-2.5 text-[12px] leading-snug text-background/80">
+          Shown:{' '}
+          <span className="font-semibold tabular-nums text-background">
+            {fmtPct(shownMove)}
+          </span>
+          . Prices for the formula are not on this row.
+        </div>
+      )}
+      <div className="space-y-1 border-t border-background/15 pt-2 text-[12px] text-background/70">
+        <p>
+          Reference:{' '}
+          <span className="font-semibold tabular-nums text-background">
+            {fmtP(Number.isFinite(ref) ? ref : null)}
+          </span>
+          {row.referenceTime
+            ? ` · ${fmtDateTime(row.referenceTime) || ''}`
+            : ''}
+        </p>
+        <p>
+          {shownKind === 'peak'
+            ? dir === 'DOWN'
+              ? 'Trough'
+              : 'Peak'
+            : 'Live / event'}
+          :{' '}
+          <span className="font-semibold tabular-nums text-background">
+            {fmtP(Number.isFinite(extreme) ? extreme : null)}
+          </span>
+        </p>
+        <p>
+          Move:{' '}
+          <span className="font-semibold tabular-nums text-background">
+            {fmtPct(shownMove)}
+          </span>
+          {computed != null && Number.isFinite(computed)
+            ? ` · recomputed ${fmtPct(computed)}`
+            : ''}
+        </p>
+      </div>
+      <div className="border-t border-background/15 pt-2 text-[12px] leading-snug text-background/75">
+        {fromSupabase ? (
+          <p>
+            <span className="font-semibold text-emerald-300">Supabase</span>
+            {' · '}
+            {persistAction === 'updated'
+              ? 'updated / saved row loaded from Supabase'
+              : 'saved episode row (loaded from or written to Supabase)'}
+            {row.supabasePersist?.at
+              ? ` · ${fmtDateTime(row.supabasePersist.at) || row.supabasePersist.at}`
+              : ''}
+            {row.episodeId ? (
+              <span className="mt-0.5 block font-mono text-[10px] text-background/55">
+                {String(row.episodeId)}
+              </span>
+            ) : null}
+          </p>
+        ) : (
+          <p>
+            <span className="font-semibold text-sky-300">Live engine</span>
+            {' · '}
+            calculated in-memory; not yet confirmed on a Supabase episode row.
+          </p>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -1494,10 +1683,120 @@ function shortEventType(
   return type.replace(/^MOMENTUM_/, '').replace(/_/g, ' ')
 }
 
+function mapApiResearchRow(row: Record<string, unknown> | null | undefined): EventResearch | null {
+  if (!row || typeof row !== 'object') return null
+  const citations = Array.isArray(row.citations)
+    ? (row.citations as string[])
+    : undefined
+  const costUsd =
+    typeof row.cost_usd === 'number' && Number.isFinite(row.cost_usd)
+      ? row.cost_usd
+      : null
+  const alertRaw = row.alert
+  const alert =
+    alertRaw && typeof alertRaw === 'object' && !Array.isArray(alertRaw)
+      ? {
+          title: String((alertRaw as { title?: string }).title || '') || null,
+          body: String((alertRaw as { body?: string }).body || '') || null,
+        }
+      : null
+  return {
+    researchId: row.id != null ? String(row.id) : null,
+    episodeId: row.episode_id != null ? String(row.episode_id) : null,
+    likely_driver: (row.likely_driver as string) || null,
+    secondary_driver: (row.secondary_driver as string) || null,
+    alert,
+    model_version: (row.model_version as string) || (row.model as string) || null,
+    citations,
+    completedAt: (row.created_at as string) || null,
+    cost_usd_display:
+      (row.cost_usd_display as string) ||
+      (costUsd != null ? `$${costUsd}` : null),
+  }
+}
+
+function mergeEventResearch(
+  base: EventResearch,
+  full: EventResearch | null,
+): EventResearch {
+  if (!full) return base
+  return {
+    ...base,
+    ...full,
+    status: full.status || base.status,
+    reason: full.reason || base.reason,
+    likely_driver: full.likely_driver || base.likely_driver,
+    secondary_driver: full.secondary_driver || base.secondary_driver,
+    alert: full.alert || base.alert,
+    model_version: full.model_version || base.model_version || full.model || base.model,
+    citations: full.citations?.length ? full.citations : base.citations,
+    researchId: full.researchId || base.researchId,
+    episodeId: full.episodeId || base.episodeId,
+  }
+}
+
+const onDemandResearchCache = new Map<string, EventResearch>()
+
+function clearOnDemandResearchCache() {
+  onDemandResearchCache.clear()
+}
+
+function useOnDemandResearch(
+  ev: MomentumEvent | undefined,
+  enabled: boolean,
+): { full: EventResearch | null; loading: boolean } {
+  const rid = ev?.researchId || ev?.research?.researchId || null
+  const eid = ev?.episodeId || null
+  const cacheKey = rid ? `r:${rid}` : eid ? `e:${eid}` : ''
+  const [full, setFull] = useState<EventResearch | null>(() =>
+    cacheKey ? onDemandResearchCache.get(cacheKey) || null : null,
+  )
+  const [loading, setLoading] = useState(false)
+  useEffect(() => {
+    if (!enabled) return
+    if (cacheKey && onDemandResearchCache.has(cacheKey)) {
+      setFull(onDemandResearchCache.get(cacheKey) || null)
+      return
+    }
+    const url = rid
+      ? `/api/momentum/research/${encodeURIComponent(String(rid))}`
+      : eid
+        ? `/api/momentum/episodes/${encodeURIComponent(String(eid))}/research`
+        : null
+    if (!url) return
+    let cancelled = false
+    setLoading(true)
+    void deskFetch(url)
+      .then((res) => res.json().catch(() => ({})))
+      .then((body: { research?: unknown }) => {
+        if (cancelled) return
+        const raw = body?.research
+        const row = Array.isArray(raw) ? raw[0] : raw
+        const mapped = mapApiResearchRow(row as Record<string, unknown>)
+        if (mapped && cacheKey) onDemandResearchCache.set(cacheKey, mapped)
+        if (mapped?.researchId) {
+          onDemandResearchCache.set(`r:${mapped.researchId}`, mapped)
+        }
+        setFull(mapped)
+      })
+      .catch(() => {
+        if (!cancelled) setFull(null)
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [enabled, rid, eid, cacheKey])
+  return { full, loading }
+}
+
 function extractEventResearch(ev: MomentumEvent): EventResearch | null {
   if (ev.research && (ev.research.reason || ev.research.likely_driver)) {
     return {
       ...ev.research,
+      researchId: ev.research.researchId || ev.researchId || null,
       reason: ev.research.reason || ev.reason || null,
       likely_driver:
         ev.research.likely_driver || ev.likely_driver || null,
@@ -1509,6 +1808,7 @@ function extractEventResearch(ev: MomentumEvent): EventResearch | null {
     (ev.reason || ev.likely_driver)
   ) {
     return {
+      researchId: ev.researchId || null,
       reason: ev.reason || null,
       likely_driver: ev.likely_driver || null,
       provider: 'perplexity',
@@ -1654,21 +1954,10 @@ function buildTimelineSteps(events: MomentumEvent[]): TimelineStep[] {
       continue
     }
 
-    const isStateOnly =
-      type === 'MOMENTUM_STATE' ||
-      type === 'MOMENTUM_STATE_CHANGED' ||
-      type.endsWith('_STATE')
+    // Timeline UI shows only Research + Push pills — skip Started/Holding/Ended
+    // backend state rows. Still surface Perplexity / push attached to those events.
     const isStart = isStartEventType(type)
 
-    steps.push({
-      id: `ev-${ev.detectedAt}-${type}-${i}`,
-      kind: 'backend',
-      ev,
-      label: shortEventType(type, ev),
-      isStateOnly,
-    })
-
-    // STARTED only: attach research when present (reason for the start)
     if (isStart) {
       const research = extractEventResearch(ev)
       if (research) {
@@ -1682,8 +1971,6 @@ function buildTimelineSteps(events: MomentumEvent[]): TimelineStep[] {
       }
     }
 
-    // Push-worthy → Alert row (accel / reverse / manual start alert).
-    // Never invent Perplexity for accelerating / holding / state.
     if (ev.shouldNotify) {
       steps.push({
         id: `alert-from-${ev.notifiedAt || ev.detectedAt}-${i}`,
@@ -1916,18 +2203,697 @@ function buildEpisodeExplainSections(
   }
 }
 
+type TimelineDetailState =
+  | {
+      kind: 'alert'
+      at: string
+      notification: { title?: string; body?: string } | null
+      ev: MomentumEvent
+    }
+  | {
+      kind: 'perplexity'
+      at: string
+      research: EventResearch
+      ev: MomentumEvent
+    }
+  | {
+      kind: 'event'
+      at: string
+      ev: MomentumEvent
+    }
+
+/** Inline body for timeline popup content (alert / Perplexity / measure). */
+function TimelineDetailInlineBody({
+  detail,
+  assetClass,
+  currency,
+  liveEpisode,
+}: {
+  detail: TimelineDetailState
+  assetClass?: string | null
+  currency?: string | null
+  liveEpisode?: Episode | null
+}) {
+  if (detail.kind === 'event') {
+    const explain = buildEventMeasureExplain(detail.ev, {
+      assetClass,
+      currency,
+      liveEpisode,
+    })
+    return (
+      <div className="space-y-2">
+        <p className="text-[13px] font-semibold text-foreground">{explain.title}</p>
+        <p className="text-[12px] leading-relaxed text-foreground/90">
+          {explain.summary}
+        </p>
+        {explain.formula ? (
+          <div className="rounded-lg border border-border bg-muted/30 px-2.5 py-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Formula
+            </p>
+            <p className="mt-1 font-mono text-[12px] leading-snug text-foreground">
+              {explain.formula}
+            </p>
+          </div>
+        ) : null}
+        <div className="rounded-lg border border-border bg-background px-2.5 py-2">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Numbers
+          </p>
+          <dl className="space-y-1">
+            {explain.rows.map((row) => (
+              <div
+                key={row.label}
+                className="flex min-w-0 items-start justify-between gap-2 text-[11px]"
+              >
+                <dt className="shrink-0 text-muted-foreground">{row.label}</dt>
+                <dd className="min-w-0 text-right font-medium tabular-nums text-foreground">
+                  {row.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+        {explain.note ? (
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            {explain.note}
+          </p>
+        ) : null}
+      </div>
+    )
+  }
+
+  if (detail.kind === 'alert') {
+    return (
+      <div className="space-y-2">
+        <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Title
+          </p>
+          <p className="mt-0.5 text-[13px] font-semibold leading-snug text-foreground">
+            {detail.notification?.title || '—'}
+          </p>
+          <p className="mt-2 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Body
+          </p>
+          <p className="mt-0.5 whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/90">
+            {detail.notification?.body || '—'}
+          </p>
+        </div>
+        {detail.ev.pushResult ? (
+          <div className="rounded-lg border border-border bg-background px-2.5 py-2 text-[10px] text-muted-foreground">
+            <p className="font-semibold text-foreground">Delivery</p>
+            <p className="mt-0.5 tabular-nums">
+              {detail.ev.pushResult.skipped
+                ? `Skipped · ${detail.ev.pushResult.reason || 'n/a'}`
+                : `ok ${detail.ev.pushResult.sent_ok ?? '—'} / ${detail.ev.pushResult.recipient_count ?? '—'} devices`}
+              {detail.ev.pushResult.sent_failed
+                ? ` · failed ${detail.ev.pushResult.sent_failed}`
+                : ''}
+              {detail.ev.pushResult.source
+                ? ` · ${detail.ev.pushResult.source}`
+                : ''}
+            </p>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
+  // perplexity
+  return (
+    <div className="space-y-2">
+      {detail.research.likely_driver ? (
+        <div className="rounded-lg border border-violet-500/30 bg-violet-500/5 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-violet-800 dark:text-violet-300">
+            Likely driver
+          </p>
+          <p className="mt-0.5 text-[12px] font-medium leading-snug text-foreground">
+            {detail.research.likely_driver}
+          </p>
+        </div>
+      ) : null}
+      {detail.research.secondary_driver ? (
+        <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Secondary driver
+          </p>
+          <p className="mt-0.5 text-[12px] font-medium leading-snug text-foreground">
+            {detail.research.secondary_driver}
+          </p>
+        </div>
+      ) : null}
+      {detail.research.alert?.title || detail.research.alert?.body ? (
+        <div className="rounded-lg border border-sky-500/25 bg-sky-500/5 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-sky-800 dark:text-sky-300">
+            Alert
+          </p>
+          {detail.research.alert?.title ? (
+            <p className="mt-0.5 text-[12px] font-semibold leading-snug text-foreground">
+              {detail.research.alert.title}
+            </p>
+          ) : null}
+          {detail.research.alert?.body ? (
+            <p className="mt-1 text-[11px] leading-relaxed text-foreground/90">
+              {detail.research.alert.body}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+        {detail.research.model_version || detail.research.model ? (
+          <span className="font-mono text-[9px]">
+            {detail.research.model_version || detail.research.model}
+          </span>
+        ) : null}
+        {detail.research.cost_usd_display ? (
+          <span>{detail.research.cost_usd_display}</span>
+        ) : null}
+      </div>
+      {detail.research.citations?.length ? (
+        <div className="rounded-lg border border-border px-2.5 py-2">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Sources
+          </p>
+          <ul className="mt-1 max-h-24 space-y-0.5 overflow-y-auto text-[10px]">
+            {(detail.research.citations || []).slice(0, 8).map((url, i) => (
+              <li key={i} className="truncate">
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
+                >
+                  {url}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** Dialog body that fetches the full research row only when opened. */
+function PerplexityDialogPanel({
+  ev,
+  research,
+  at,
+}: {
+  ev: MomentumEvent
+  research: EventResearch
+  at?: string
+}) {
+  const { full, loading } = useOnDemandResearch(ev, true)
+  const merged = mergeEventResearch(research, full)
+  return (
+    <>
+      <DialogHeader className="shrink-0 border-b border-border px-5 py-4 pr-12 text-left">
+        <DialogTitle className="flex items-center gap-2 text-base">
+          <PerplexityLogo className="size-4" />
+          Perplexity reason
+        </DialogTitle>
+        <DialogDescription className="text-[12px] text-muted-foreground">
+          Exact research output used for this step
+          {at ? ` · ${fmtDateTime(at) || fmtTime(at)}` : ''}
+        </DialogDescription>
+      </DialogHeader>
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
+        {loading ? (
+          <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <Loader2 className="size-3 animate-spin" />
+            Updating from Supabase…
+          </p>
+        ) : null}
+        {merged.likely_driver ? (
+          <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-violet-800 dark:text-violet-300">
+              Likely driver
+            </p>
+            <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
+              {merged.likely_driver}
+            </p>
+          </div>
+        ) : null}
+        {merged.secondary_driver ? (
+          <div className="rounded-xl border border-border bg-muted/30 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Secondary driver
+            </p>
+            <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
+              {merged.secondary_driver}
+            </p>
+          </div>
+        ) : null}
+        {merged.alert?.title || merged.alert?.body ? (
+          <div className="rounded-xl border border-sky-500/25 bg-sky-500/5 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-sky-800 dark:text-sky-300">
+              Alert
+            </p>
+            {merged.alert?.title ? (
+              <p className="mt-1 text-[15px] font-semibold leading-snug text-foreground">
+                {merged.alert.title}
+              </p>
+            ) : null}
+            {merged.alert?.body ? (
+              <p className="mt-1 whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+                {merged.alert.body}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+          {merged.model_version || merged.model ? (
+            <span className="font-mono text-[10px]">
+              {merged.model_version || merged.model}
+            </span>
+          ) : null}
+          {merged.cost_usd_display ? (
+            <span>{merged.cost_usd_display}</span>
+          ) : null}
+        </div>
+        {merged.citations?.length ? (
+          <div className="rounded-lg border border-border px-3 py-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Sources
+            </p>
+            <ul className="mt-1 max-h-28 space-y-1 overflow-y-auto text-[11px]">
+              {(merged.citations || []).slice(0, 8).map((url, i) => (
+                <li key={i} className="truncate">
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
+                  >
+                    {url}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+    </>
+  )
+}
+
+/** Status pill tones for the numbered episode timeline (screenshot-style). */
+function timelineStepPillClass(kind: 'backend' | 'perplexity' | 'alert', label: string): string {
+  const l = label.toLowerCase()
+  if (kind === 'alert') {
+    return 'bg-sky-500/15 text-sky-800 dark:text-sky-200'
+  }
+  if (kind === 'perplexity') {
+    if (l.includes('fail') || l.includes('error')) {
+      return 'bg-rose-500/15 text-rose-800 dark:text-rose-200'
+    }
+    if (l.includes('run')) {
+      return 'bg-violet-500/20 text-violet-900 dark:text-violet-200'
+    }
+    return 'bg-violet-500/15 text-violet-800 dark:text-violet-200'
+  }
+  if (l.includes('start')) {
+    return 'bg-sky-500/15 text-sky-800 dark:text-sky-200'
+  }
+  if (l.includes('hold')) {
+    return 'bg-muted text-muted-foreground'
+  }
+  if (l.includes('strong') && l.includes('weak')) {
+    return 'bg-amber-500/20 text-amber-900 dark:text-amber-200'
+  }
+  if (l.includes('weak')) {
+    return 'bg-amber-500/15 text-amber-800 dark:text-amber-200'
+  }
+  if (l.includes('accelerat') || l.includes('re-accelerat')) {
+    return 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-200'
+  }
+  if (l.includes('end') || l.includes('revers') || l.includes('expir')) {
+    return 'bg-rose-500/15 text-rose-800 dark:text-rose-200'
+  }
+  return 'bg-muted text-muted-foreground'
+}
+
+
+/** Compact clock for timeline rail markers — e.g. "8:57 AM" (no zone). */
+function fmtTimelineRailClock(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  return (
+    formatExchangeTime(iso, momentumDisplayTimeZone, {
+      hour12: true,
+      withZone: false,
+    }) || '—'
+  )
+}
+
+/** Split "8:57 AM" → { clock: "8:57", meridiem: "AM" } for stacked rail badges. */
+function splitTimelineRailClock(iso: string | null | undefined): {
+  clock: string
+  meridiem: string
+} {
+  const full = fmtTimelineRailClock(iso)
+  const m = full.match(/^(\d{1,2}:\d{2})\s*(AM|PM)$/i)
+  if (m) return { clock: m[1], meridiem: m[2].toUpperCase() }
+  return { clock: full, meridiem: '' }
+}
+
+/** One timeline step: 2-row header + right chevron toggles formula/numbers card. */
+function EpisodeTimelineStepRow({
+  step,
+  isLast,
+  group,
+  assetClass,
+  currency,
+  liveEpisode,
+  matchesLive,
+}: {
+  step: TimelineStep
+  isLast: boolean
+  group: EpisodeEventGroup
+  assetClass?: string | null
+  currency?: string | null
+  liveEpisode?: Episode | null
+  matchesLive?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const perplexityEv = step.kind === 'perplexity' ? step.ev : undefined
+  const perplexityRunning =
+    step.kind === 'perplexity' &&
+    String(step.research.status || '').toLowerCase() === 'running'
+  const { full: onDemandResearch, loading: onDemandLoading } =
+    useOnDemandResearch(
+      perplexityEv,
+      Boolean(open && perplexityEv && !perplexityRunning),
+    )
+  const stepAt = step.kind === 'backend' ? step.ev.detectedAt : step.at
+  const railClock = fmtTimelineRailClock(stepAt)
+  const railParts = splitTimelineRailClock(stepAt)
+
+  let title: ReactNode = null
+  let pill: ReactNode = null
+  let whenLine: ReactNode = null
+  let detail: ReactNode = null
+  let canExpand = true
+
+  if (step.kind === 'backend') {
+    const { ev, label } = step
+    const moveLabel =
+      !step.isStateOnly || Number.isFinite(ev.movePercent)
+        ? `${ev.direction} ${fmtPct(ev.movePercent)}`
+        : null
+    title = (
+      <>
+        <span className="text-[15px] font-semibold leading-tight text-foreground">
+          {label}
+        </span>
+        {moveLabel ? (
+          <span
+            className={cn(
+              'text-[13px] font-semibold tabular-nums',
+              ev.direction === 'UP' ? 'text-emerald-600' : 'text-rose-600',
+            )}
+          >
+            {moveLabel}
+          </span>
+        ) : null}
+      </>
+    )
+    pill = (
+      <span
+        className={cn(
+          'rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize',
+          timelineStepPillClass('backend', label),
+        )}
+      >
+        {label}
+      </span>
+    )
+    whenLine = (
+      <>
+        {fmtEpisodeWhen(
+          ev.detectedAt,
+          ev.marketSession || group.marketSession,
+        )}
+        {ev.price != null
+          ? ` · ${fmtPrice(ev.price, assetClass, currency)}`
+          : ''}
+      </>
+    )
+    detail = (
+      <div className="mt-2.5 rounded-xl border border-border/70 bg-muted/20 px-2.5 py-2">
+        <TimelineDetailInlineBody
+          detail={{ kind: 'event', at: ev.detectedAt, ev }}
+          assetClass={assetClass}
+          currency={currency}
+          liveEpisode={matchesLive ? liveEpisode : null}
+        />
+      </div>
+    )
+  } else if (step.kind === 'perplexity') {
+    const running =
+      String(step.research.status || '').toLowerCase() === 'running'
+    const failed =
+      String(step.research.status || '').toLowerCase() === 'error' ||
+      Boolean(step.research.error)
+    const label = running
+      ? 'Perplexity running'
+      : failed
+        ? 'Perplexity failed'
+        : 'Perplexity done'
+    title = (
+      <span className="inline-flex items-center gap-1.5 text-[15px] font-semibold leading-tight text-foreground">
+        {running ? (
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-violet-700 dark:text-violet-300" />
+        ) : (
+          <PerplexityLogo className="size-3.5 shrink-0" />
+        )}
+        {label}
+      </span>
+    )
+    pill = (
+      <span
+        className={cn(
+          'rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize',
+          timelineStepPillClass('perplexity', label),
+        )}
+      >
+        {running ? 'live' : failed ? 'error' : 'research'}
+      </span>
+    )
+    whenLine = fmtEpisodeWhen(
+      step.at,
+      step.ev?.marketSession || group.marketSession,
+    )
+    if (running) {
+      canExpand = false
+      detail = (
+        <p className="mt-2 text-[12px] text-violet-800/80 dark:text-violet-300/80">
+          Researching likely driver…
+        </p>
+      )
+    } else {
+      const research = mergeEventResearch(step.research, onDemandResearch)
+      detail = (
+        <div className="mt-2.5 rounded-xl border border-violet-500/25 bg-violet-500/5 px-2.5 py-2">
+          {onDemandLoading ? (
+            <p className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <Loader2 className="size-3 animate-spin" />
+              Updating from Supabase…
+            </p>
+          ) : null}
+          <TimelineDetailInlineBody
+            detail={{
+              kind: 'perplexity',
+              at: step.at,
+              research,
+              ev: step.ev,
+            }}
+          />
+        </div>
+      )
+    }
+  } else {
+    const titleText = step.notification?.title || 'Push notification'
+    title = (
+      <span className="inline-flex items-center gap-1.5 text-[15px] font-semibold leading-tight text-foreground">
+        <BellRing className="size-3.5 shrink-0 text-sky-600" />
+        Alert sent
+      </span>
+    )
+    pill = (
+      <span
+        className={cn(
+          'rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide',
+          timelineStepPillClass('alert', 'Alert sent'),
+        )}
+      >
+        push
+      </span>
+    )
+    whenLine = (
+      <>
+        <span className="tabular-nums">
+          {fmtEpisodeWhen(
+            step.at,
+            step.ev?.marketSession || group.marketSession,
+          )}
+        </span>
+        {titleText ? ` · ${titleText}` : ''}
+      </>
+    )
+    detail = (
+      <div className="mt-2.5 rounded-xl border border-sky-500/25 bg-sky-500/5 px-2.5 py-2">
+        <TimelineDetailInlineBody
+          detail={{
+            kind: 'alert',
+            at: step.at,
+            notification: step.notification,
+            ev: step.ev,
+          }}
+        />
+      </div>
+    )
+  }
+
+  const showDetail = canExpand ? open : true
+
+  return (
+    <li className="flex gap-3">
+      <div className="relative flex w-[4.25rem] shrink-0 flex-col items-center self-stretch">
+        <span
+          className="z-10 inline-flex w-full items-center justify-center px-0.5 py-0.5 text-center"
+          title={railClock}
+          aria-label={railClock}
+        >
+          <span className="whitespace-nowrap text-[13px] font-bold leading-tight tabular-nums text-foreground">
+            {railParts.clock}
+            {railParts.meridiem ? (
+              <>
+                {' '}
+                <span className="text-[12px] font-bold tracking-wide">
+                  {railParts.meridiem}
+                </span>
+              </>
+            ) : null}
+          </span>
+        </span>
+        {!isLast ? (
+          <span className="mt-1.5 w-px flex-1 bg-border" aria-hidden />
+        ) : null}
+      </div>
+      <div className={cn('min-w-0 flex-1', !isLast && 'pb-5')}>
+        <div className="flex min-w-0 items-stretch gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              {title}
+              {pill}
+            </div>
+            <p className="mt-1 text-[13px] text-muted-foreground">{whenLine}</p>
+          </div>
+          {canExpand ? (
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              className="inline-flex shrink-0 items-center self-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              title={open ? 'Hide formula & numbers' : 'Show formula & numbers'}
+              aria-expanded={open}
+              aria-label={
+                open ? 'Collapse step details' : 'Expand step details'
+              }
+            >
+              {open ? (
+                <ChevronUp className="size-4" strokeWidth={2} />
+              ) : (
+                <ChevronDown className="size-4" strokeWidth={2} />
+              )}
+            </button>
+          ) : null}
+        </div>
+        {showDetail ? detail : null}
+      </div>
+    </li>
+  )
+}
+
+/**
+ * Time-stamped vertical A→Z timeline (rail shows clock) with full
+ * formula / numbers / alert / Perplexity detail kept under each step.
+ */
+function EpisodeAzTimelineInline({
+  group,
+  assetClass,
+  currency,
+  liveEpisode,
+  matchesLive,
+}: {
+  group: EpisodeEventGroup
+  assetClass?: string | null
+  currency?: string | null
+  liveEpisode?: Episode | null
+  matchesLive?: boolean
+}) {
+  const storySteps = buildTimelineSteps(group.events)
+  const isActive = group.status === 'ACTIVE'
+  if (!storySteps.length) {
+    return (
+      <p className="px-1 py-2 text-[11px] text-muted-foreground">
+        No timeline steps yet for this episode.
+      </p>
+    )
+  }
+
+  return (
+    <div className="min-w-0">
+      <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1">
+        <p className="text-[13px] font-semibold tracking-tight text-foreground">
+          Timeline · A→Z
+        </p>
+        <span
+          className={cn(
+            'rounded-full px-2 py-0.5 text-[11px] font-semibold',
+            isActive
+              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+              : 'bg-muted text-muted-foreground',
+          )}
+        >
+          {isActive ? 'Active' : 'Ended'} · {storySteps.length} steps
+        </span>
+      </div>
+
+      <ol className="m-0 list-none space-y-0 p-0">
+        {storySteps.map((step, index) => (
+          <EpisodeTimelineStepRow
+            key={step.id}
+            step={step}
+            isLast={index === storySteps.length - 1}
+            group={group}
+            assetClass={assetClass}
+            currency={currency}
+            liveEpisode={liveEpisode}
+            matchesLive={matchesLive}
+          />
+        ))}
+      </ol>
+    </div>
+  )
+}
+
+
 /** Collapsible plain-English explanation + full step-by-step build under episode. */
 function EpisodeExplainCollapse({
   group,
   accelPoints,
   inactivityMinutes,
+  defaultOpen = false,
 }: {
   group: EpisodeEventGroup
   accelPoints?: number | null
   inactivityMinutes?: number | null
+  /** Open by default (e.g. focused episode in the 3rd column). */
+  defaultOpen?: boolean
 }) {
-  // Always start collapsed — “How this move built · N steps · ACTIVE”
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(defaultOpen)
   const sections = buildEpisodeExplainSections(group, {
     accelPoints,
     inactivityMinutes,
@@ -1940,13 +2906,13 @@ function EpisodeExplainCollapse({
           e.stopPropagation()
           setOpen((v) => !v)
         }}
-        className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
         aria-expanded={open}
       >
         {open ? (
-          <ChevronUp className="size-3" strokeWidth={2} />
+          <ChevronUp className="size-3.5" strokeWidth={2} />
         ) : (
-          <ChevronDown className="size-3" strokeWidth={2} />
+          <ChevronDown className="size-3.5" strokeWidth={2} />
         )}
         {open
           ? 'Hide how this move built'
@@ -1955,10 +2921,10 @@ function EpisodeExplainCollapse({
             }`}
       </button>
       {open ? (
-        <div className="mt-1.5 space-y-0 overflow-hidden rounded-xl border border-border/70 bg-background/80 text-[11px] leading-snug">
+        <div className="mt-1.5 space-y-0 overflow-hidden rounded-xl border border-border/70 bg-background/80 text-[12px] leading-snug">
           <div className="space-y-1.5 border-b border-border/60 px-2.5 py-2">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                 1 · How this move built (step by step)
               </p>
               {sections.isActive ? (
@@ -2125,6 +3091,7 @@ type MomentumStatus = {
   snapshot: {
     marketSession?: string
     currentPrice?: number
+    returns?: Record<string, number | null | undefined>
     previousClose?: number | null
     previousCloseTime?: string | null
     lastSessionKind?: string | null
@@ -2305,6 +3272,8 @@ function thresholdClassKey(assetClass?: string | null): string {
   const c = String(assetClass || 'equity').toLowerCase()
   if (c === 'indexes' || c === 'indices') return 'index'
   if (c === 'stock' || c === 'stocks') return 'equity'
+  // ETFs share equity episode / threshold bands
+  if (c === 'etf' || c === 'etfs' || c === 'fund') return 'equity'
   return c || 'equity'
 }
 
@@ -2405,11 +3374,23 @@ function saveLocalThresholdDraft(
 
 const LOG_COLLAPSE_KEY = 'sndk-momentum-log-collapsed'
 const RIGHT_RAIL_WIDTH_KEY = 'momentum-right-rail-width-v1'
+/** Floor so the rail stays usable while dragging. */
+const RIGHT_RAIL_MIN_WIDTH = 200
+/**
+ * Leave enough room for the left entity rail + a usable center column.
+ * Upper bound is otherwise free so the user can drag as wide as they want.
+ */
+function rightRailMaxWidth(): number {
+  if (typeof window === 'undefined') return 1200
+  return Math.max(RIGHT_RAIL_MIN_WIDTH, window.innerWidth - 320)
+}
 
 function loadRightRailWidth(): number {
   try {
     const n = Number(localStorage.getItem(RIGHT_RAIL_WIDTH_KEY))
-    if (Number.isFinite(n) && n >= 240 && n <= 520) return Math.round(n)
+    if (Number.isFinite(n) && n >= RIGHT_RAIL_MIN_WIDTH) {
+      return Math.round(Math.min(n, rightRailMaxWidth()))
+    }
   } catch {
     /* ignore */
   }
@@ -2423,6 +3404,143 @@ function saveRightRailWidth(px: number) {
     /* ignore */
   }
 }
+
+const ALL_EPISODES_CACHE_KEY = 'sndk-momentum-all-episodes-v2'
+const TICKER_STATUS_CACHE_PREFIX = 'sndk-momentum-status-v1:'
+const TICKER_STATUS_CACHE_INDEX_KEY = 'sndk-momentum-status-index-v1'
+const ALL_EPISODES_PAGE_SIZE = 40
+const TICKER_STATUS_CACHE_MAX = 24
+
+type EpisodeListCachePayload = {
+  episodes: ActiveEpisodeRow[]
+  activeEpisodes: ActiveEpisodeRow[]
+  total: number
+  hasMore: boolean
+  nextOffset: number | null
+  at: string
+}
+
+function readJsonCache<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    return JSON.parse(raw) as T
+  } catch {
+    return null
+  }
+}
+
+function writeJsonCache(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function readEpisodeListCache(): EpisodeListCachePayload | null {
+  const cached = readJsonCache<EpisodeListCachePayload>(ALL_EPISODES_CACHE_KEY)
+  if (!cached || !Array.isArray(cached.episodes)) return null
+  return cached
+}
+
+function writeEpisodeListCache(payload: EpisodeListCachePayload) {
+  writeJsonCache(ALL_EPISODES_CACHE_KEY, payload)
+}
+
+function tickerStatusCacheKey(ticker: string): string {
+  return `${TICKER_STATUS_CACHE_PREFIX}${String(ticker || '').trim().toUpperCase()}`
+}
+
+function readTickerStatusCache(ticker: string): MomentumStatus | null {
+  const symbol = String(ticker || '').trim().toUpperCase()
+  if (!symbol) return null
+  const cached = readJsonCache<MomentumStatus>(tickerStatusCacheKey(symbol))
+  if (!cached || typeof cached !== 'object') return null
+  return cached
+}
+
+function writeTickerStatusCache(ticker: string, status: MomentumStatus) {
+  const symbol = String(ticker || '').trim().toUpperCase()
+  if (!symbol) return
+  writeJsonCache(tickerStatusCacheKey(symbol), status)
+  try {
+    const index = readJsonCache<string[]>(TICKER_STATUS_CACHE_INDEX_KEY) || []
+    const next = [symbol, ...index.filter((t) => t !== symbol)]
+    const overflow = next.slice(TICKER_STATUS_CACHE_MAX)
+    for (const old of overflow) {
+      localStorage.removeItem(tickerStatusCacheKey(old))
+    }
+    writeJsonCache(
+      TICKER_STATUS_CACHE_INDEX_KEY,
+      next.slice(0, TICKER_STATUS_CACHE_MAX),
+    )
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearDeskLocalCaches() {
+  try {
+    localStorage.removeItem(ALL_EPISODES_CACHE_KEY)
+    const index = readJsonCache<string[]>(TICKER_STATUS_CACHE_INDEX_KEY) || []
+    for (const t of index) {
+      localStorage.removeItem(tickerStatusCacheKey(t))
+    }
+    localStorage.removeItem(TICKER_STATUS_CACHE_INDEX_KEY)
+    // Best-effort sweep of any leftover status keys
+    for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith(TICKER_STATUS_CACHE_PREFIX)) {
+        localStorage.removeItem(key)
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  clearOnDemandResearchCache()
+}
+
+function UpdatingFromSupabaseNote({
+  show,
+  className,
+}: {
+  show: boolean
+  className?: string
+}) {
+  if (!show) return null
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1.5 text-[11px] text-muted-foreground',
+        className,
+      )}
+    >
+      <Loader2 className="size-3 animate-spin" />
+      Updating from Supabase
+    </span>
+  )
+}
+
+/** Desk network helper — always bypass HTTP + browser caches. */
+function deskFetch(input: string, init?: RequestInit): Promise<Response> {
+  const method = String(init?.method || 'GET').toUpperCase()
+  let url = input
+  if (method === 'GET' || method === 'HEAD') {
+    const sep = url.includes('?') ? '&' : '?'
+    url = `${url}${sep}_=${Date.now()}`
+  }
+  return fetch(url, {
+    ...init,
+    cache: 'no-store',
+    headers: {
+      ...(init?.headers || {}),
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    },
+  })
+}
+
 const WATCHLIST_KEY = 'momentum-watchlist-v2'
 /** Last selected watch tab (Silver, SpaceX, …) — restored on load */
 const ACTIVE_TICKER_KEY = 'momentum-active-ticker-v1'
@@ -2541,12 +3659,11 @@ type WatchTab = {
   label: string
   /** equity | crypto | commodity | forex | other */
   assetClass?: string
-  /** Enabled Trigger subscribers (device_monitored_tickers) */
+  /** Enabled Trigger subscribers (device_monitor) */
   subscriberCount?: number | null
 }
 
-/** Seed list only for equities / crypto / indexes.
- *  Commodity + forex come from momentum_research_commodities / _forex (no hardcodes). */
+/** Seed list only for equities / crypto / indexes. */
 const DEFAULT_WATCHLIST: WatchTab[] = [
   { ticker: 'SNDK', label: 'SNDK', assetClass: 'equity' },
   { ticker: 'TSLA', label: 'SpaceX', assetClass: 'equity' },
@@ -2597,6 +3714,51 @@ function normalizeWatchTicker(raw: string): string {
   return s
 }
 
+/** Common US ETF tickers — Yahoo quoteType is better when available. */
+const KNOWN_ETF_TICKERS = new Set([
+  'SPY',
+  'QQQ',
+  'IWM',
+  'DIA',
+  'VOO',
+  'VTI',
+  'VEA',
+  'VWO',
+  'EFA',
+  'EEM',
+  'ARKK',
+  'XLF',
+  'XLE',
+  'XLK',
+  'XLV',
+  'XLI',
+  'XLY',
+  'XLP',
+  'XLU',
+  'XLB',
+  'XLRE',
+  'GLD',
+  'SLV',
+  'TLT',
+  'IEF',
+  'HYG',
+  'LQD',
+  'AGG',
+  'BND',
+  'UNG',
+  'USO',
+  'SMH',
+  'SOXX',
+  'BOTZ',
+  'JETS',
+  'KWEB',
+  'FXI',
+  'INDA',
+  'EWJ',
+  'EWZ',
+  'MCHI',
+])
+
 function detectAssetClass(ticker: string): string {
   const t = ticker.toUpperCase()
   if (t.endsWith('-USD') || t.endsWith('-USDT') || /^(BTC|ETH|SOL|XRP|DOGE|ADA)/.test(t)) {
@@ -2605,16 +3767,18 @@ function detectAssetClass(ticker: string): string {
   if (t.endsWith('=X') || /^[A-Z]{6}=X$/.test(t)) return 'forex'
   if (t.endsWith('=F') || /^(GC|CL|SI|NG|HG|ZC|ZW)=F$/.test(t)) return 'commodity'
   if (t.startsWith('^')) return 'index'
+  if (KNOWN_ETF_TICKERS.has(t)) return 'etf'
   return 'equity'
 }
 
 /** Left-rail filter: icon-only pills */
 const ASSET_CLASS_TABS: {
-  id: 'equity' | 'index' | 'forex' | 'crypto' | 'commodity'
+  id: 'equity' | 'etf' | 'index' | 'forex' | 'crypto' | 'commodity'
   label: string
   Icon: LucideIcon
 }[] = [
   { id: 'equity', label: 'Stocks', Icon: LineChart },
+  { id: 'etf', label: 'ETFs', Icon: PieChart },
   { id: 'index', label: 'Indices', Icon: BarChart3 },
   { id: 'forex', label: 'Forex', Icon: DollarSign },
   { id: 'crypto', label: 'Crypto', Icon: Bitcoin },
@@ -2623,172 +3787,21 @@ const ASSET_CLASS_TABS: {
 
 type AssetClassTabId = (typeof ASSET_CLASS_TABS)[number]['id']
 
-type MarketListId =
-  | 'watchlist'
-  | 'most_actives'
-  | 'trending'
-  | 'gainers'
-  | 'losers'
-  | 'markets'
-
-const EQUITY_LIST_TABS: { id: MarketListId; label: string; Icon: LucideIcon }[] = [
-  { id: 'watchlist', label: 'Watchlist', Icon: Bookmark },
-  { id: 'most_actives', label: 'Most active', Icon: Activity },
-  { id: 'trending', label: 'Trending', Icon: TrendingUp },
-  { id: 'gainers', label: 'Gainers', Icon: ArrowUpRight },
-  { id: 'losers', label: 'Losers', Icon: ArrowDownRight },
-]
-
-const OTHER_LIST_TABS: { id: MarketListId; label: string; Icon: LucideIcon }[] = [
-  { id: 'watchlist', label: 'Watchlist', Icon: Bookmark },
-  { id: 'markets', label: 'Markets', Icon: Activity },
-]
-
-type MarketListHoverRow = {
-  /** Distinct mark for each momentum / research / list source */
-  kind: 'bookmark' | 'push' | 'momentum' | 'research' | 'events' | 'yahoo'
-  label: string
-  detail: string
-}
-
-/** Hover copy for column-1 market list tabs (icon-only UI). */
-function marketListTabHover(tab: {
-  id: MarketListId
-  label: string
-}): { title: string; blurb?: string; rows: MarketListHoverRow[] } {
-  switch (tab.id) {
-    case 'watchlist':
-      return {
-        title: 'Watchlist',
-        blurb:
-          'Tickers users consciously monitor in the Trigger app — categorized by asset class.',
-        rows: [
-          {
-            kind: 'push',
-            label: 'App subscribers (source of truth)',
-            detail: 'Supabase · device_monitored_tickers · enabled subscribers',
-          },
-          {
-            kind: 'momentum',
-            label: 'Momentum engine (per ticker)',
-            detail: 'Supabase · momentum_episodes + momentum_episode_events',
-          },
-          {
-            kind: 'research',
-            label: 'Research history (not the list)',
-            detail:
-              'Supabase · momentum_research_* — research work only, not watchlist',
-          },
-        ],
-      }
-    case 'most_actives':
-      return {
-        title: 'Most active',
-        rows: [
-          {
-            kind: 'yahoo',
-            label: 'Yahoo Finance',
-            detail: 'Most-active list for this asset class',
-          },
-        ],
-      }
-    case 'trending':
-      return {
-        title: 'Trending',
-        rows: [
-          {
-            kind: 'yahoo',
-            label: 'Yahoo Finance',
-            detail: 'Trending tickers for this asset class',
-          },
-        ],
-      }
-    case 'gainers':
-      return {
-        title: 'Gainers',
-        rows: [
-          {
-            kind: 'yahoo',
-            label: 'Yahoo Finance',
-            detail: 'Day gainers for this asset class',
-          },
-        ],
-      }
-    case 'losers':
-      return {
-        title: 'Losers',
-        rows: [
-          {
-            kind: 'yahoo',
-            label: 'Yahoo Finance',
-            detail: 'Day losers for this asset class',
-          },
-        ],
-      }
-    case 'markets':
-      return {
-        title: 'Markets',
-        rows: [
-          {
-            kind: 'yahoo',
-            label: 'Yahoo Finance',
-            detail: 'Markets overview for this asset class',
-          },
-        ],
-      }
-    default:
-      return { title: tab.label, rows: [] }
-  }
-}
-
-function MarketListHoverKindIcon({
-  kind,
-  className,
-}: {
-  kind: MarketListHoverRow['kind']
-  className?: string
-}) {
-  const cls = cn('size-3 shrink-0', className)
-  switch (kind) {
-    case 'bookmark':
-      return <Bookmark className={cls} strokeWidth={2} />
-    case 'push':
-      return <BellRing className={cls} strokeWidth={2} />
-    case 'momentum':
-      return <Zap className={cls} strokeWidth={2} />
-    case 'events':
-      return <Activity className={cls} strokeWidth={2} />
-    case 'research':
-      return (
-        <PerplexityLogo className={cn('size-3 shrink-0 dark:invert-0 invert', className)} />
-      )
-    case 'yahoo':
-      return <LineChart className={cls} strokeWidth={2} />
-    default:
-      return <Info className={cls} strokeWidth={2} />
-  }
-}
-
-function listTabsForClass(assetClass: AssetClassTabId) {
-  return assetClass === 'equity' ? EQUITY_LIST_TABS : OTHER_LIST_TABS
-}
-
 const ASSET_CLASS_FILTER_KEY = 'momentum-asset-class-filter-v1'
 
-function loadAssetClassFilter(): AssetClassTabId {
-  try {
-    const raw = localStorage.getItem(ASSET_CLASS_FILTER_KEY)
-    if (raw && ASSET_CLASS_TABS.some((t) => t.id === raw)) {
-      return raw as AssetClassTabId
-    }
-  } catch {
-    /* ignore */
-  }
-  return 'equity'
+function loadAssetClassFilter(): AssetClassTabId | null {
+  // Desk opens with no bottom tab selected (active-episodes left rail).
+  // Persisted class is only restored when the user explicitly picks a tab.
+  void ASSET_CLASS_FILTER_KEY
+  return null
 }
 
-function saveAssetClassFilter(id: AssetClassTabId) {
+function saveAssetClassFilter(id: AssetClassTabId | null) {
   try {
+    if (!id) {
+      localStorage.removeItem(ASSET_CLASS_FILTER_KEY)
+      return
+    }
     localStorage.setItem(ASSET_CLASS_FILTER_KEY, id)
   } catch {
     /* ignore */
@@ -2806,7 +3819,7 @@ function tabAssetClass(tab: WatchTab): string {
     return 'commodity'
   }
   if (raw === 'index' || raw === 'indices' || raw === 'indexes') return 'index'
-  if (raw === 'etf') return 'equity'
+  if (raw === 'etf' || raw === 'etfs' || raw === 'fund') return 'etf'
   return 'equity'
 }
 
@@ -3576,121 +4589,7 @@ function tradingViewSymbolUrl(ticker: string) {
   return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(t)}`
 }
 
-/** Best-effort company logo: TradingView CDN slug → Yahoo/IEX chain */
-function companyLogoCandidates(
-  ticker: string,
-  companyName?: string | null,
-  quote?: YahooLiveQuote | null,
-): string[] {
-  const out: string[] = []
-  const name = String(companyName || quote?.longName || quote?.shortName || '')
-    .trim()
-    .toLowerCase()
-  const slug = name
-    .replace(/&/g, ' and ')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-inc$|-corp$|-corporation$|-ltd$|-plc$|-co$/g, '')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
-  if (slug) {
-    out.push(`https://s3-symbol-logo.tradingview.com/${slug}--big.svg`)
-    out.push(`https://s3-symbol-logo.tradingview.com/${slug}.svg`)
-  }
-  const yahoo = resolveYahooLogoUrl(quote, ticker)
-  if (yahoo) out.push(yahoo)
-  const clean = String(ticker || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9.-]/g, '')
-  if (clean) {
-    out.push(`https://storage.googleapis.com/iex/api/logos/${clean}.png`)
-    out.push(`https://assets.parqet.com/logos/symbol/${clean}`)
-  }
-  return [...new Set(out.filter(Boolean))]
-}
 
-/** Circular company logo with multi-CDN fallback chain */
-function CompanyLogo({
-  ticker,
-  companyName,
-  quote,
-  size = 'md',
-  className,
-  asLink = false,
-}: {
-  ticker: string
-  companyName?: string | null
-  quote?: YahooLiveQuote | null
-  size?: 'sm' | 'md' | 'lg'
-  className?: string
-  /** Wrap in TradingView chart link (detail header) */
-  asLink?: boolean
-}) {
-  const [attempt, setAttempt] = useState(0)
-  const candidates = companyLogoCandidates(ticker, companyName, quote)
-  // Reset chain when ticker/name sources change
-  useEffect(() => {
-    setAttempt(0)
-  }, [ticker, companyName, quote?.logoUrl, quote?.longName, quote?.shortName])
-  const src = attempt < candidates.length ? candidates[attempt] : null
-  const dim =
-    size === 'sm' ? 'size-7' : size === 'lg' ? 'size-11' : 'size-9'
-  const textSize =
-    size === 'sm' ? 'text-[9px]' : size === 'lg' ? 'text-[11px]' : 'text-[10px]'
-  const inner = (
-    <>
-      {src ? (
-        <img
-          key={src}
-          src={src}
-          alt=""
-          className="size-full rounded-full object-cover"
-          loading="lazy"
-          referrerPolicy="no-referrer"
-          onError={() =>
-            setAttempt((i) => (i + 1 < candidates.length ? i + 1 : i + 1))
-          }
-        />
-      ) : (
-        <span
-          className={cn(
-            'font-mono font-semibold text-muted-foreground',
-            textSize,
-          )}
-        >
-          {String(ticker || '??')
-            .replace(/[^A-Za-z0-9]/g, '')
-            .slice(0, 2)
-            .toUpperCase() || '??'}
-        </span>
-      )}
-    </>
-  )
-  const shellClass = cn(
-    'inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-muted/40',
-    dim,
-    className,
-  )
-  if (asLink) {
-    return (
-      <a
-        href={tradingViewSymbolUrl(ticker)}
-        target="_blank"
-        rel="noopener noreferrer"
-        className={shellClass}
-        title={`Open ${ticker} on TradingView`}
-        aria-label={`${companyName || ticker} logo`}
-      >
-        {inner}
-      </a>
-    )
-  }
-  return (
-    <span className={shellClass} aria-hidden={!src}>
-      {inner}
-    </span>
-  )
-}
 
 /** Compact poll countdown chip */
 function PollTimerBadge({
@@ -3757,11 +4656,15 @@ type MarketStatusRow = {
   id: string
   label: string
   symbol: string
+  region?: string | null
+  exchange?: string | null
   uiStatus: string
   engineLabel: string
   engineGate?: string
   calendarState: string
   freshnessState: string
+  /** Raw Yahoo quote.marketState (PRE / PREPRE / REGULAR / POST / …). */
+  marketState?: string | null
   currentSession?: string
   status?: string
   lastUpdateLondon?: string | null
@@ -3770,288 +4673,93 @@ type MarketStatusRow = {
   quoteAgeSec?: number | null
   nextExpectedOpenUtc?: string | null
   reason?: string
+  price?: number | null
   child?: MarketStatusRow | null
 }
 
-/** Hover tip for Market sessions popup cells (Dialog needs z above modal). */
-function MarketSessionHoverTip({
-  title,
-  lines,
-  children,
-  side = 'top',
-}: {
-  title: string
-  lines: string[]
-  children: ReactNode
-  side?: 'top' | 'bottom' | 'left' | 'right'
-}) {
-  const body = lines.filter(Boolean)
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div
-          tabIndex={0}
-          className="inline-block max-w-full cursor-help rounded-sm outline-none decoration-muted-foreground/50 underline-offset-2 hover:underline focus-visible:ring-1 focus-visible:ring-ring/50"
-        >
-          {children}
-        </div>
-      </TooltipTrigger>
-      <CalcTooltipContent side={side} className="!z-[200]">
-        <p className="text-[11px] font-semibold leading-snug text-white">
-          {title}
-        </p>
-        {body.map((line, i) => (
-          <p
-            key={i}
-            className="mt-1 text-[11px] leading-relaxed text-white/75"
-          >
-            {line}
-          </p>
-        ))}
-      </CalcTooltipContent>
-    </Tooltip>
-  )
-}
-
-const MARKET_PROBE_INFO: Record<
-  string,
-  { title: string; lines: string[] }
-> = {
-  stocks: {
-    title: 'US Stocks (SPY)',
-    lines: [
-      'Headline probe for US equities. Engine runs only while Yahoo marketState is REGULAR (same rule for NSE/LSE/…). Pre/AH/closed → episodes end.',
-      'Calendar hours are America/New_York. This row never starts or stops the engine.',
-    ],
-  },
-  forex: {
-    title: 'Forex (EURUSD=X)',
-    lines: [
-      'Headline FX spot probe. Session policy: 24×5 (Sun ~5:00pm – Fri ~5:00pm ET).',
-      'Used only for the market-status summary — independent of equity engines.',
-    ],
-  },
-  crypto: {
-    title: 'Crypto (BTC-USD)',
-    lines: [
-      'Headline crypto probe. Session policy: 24×7 — no weekly full close.',
-      'If data is delayed, Trigger pauses calculations until a fresh quote returns.',
-    ],
-  },
-  commodities: {
-    title: 'Commodities (GC=F)',
-    lines: [
-      'Headline gold futures probe (CME). Session policy: ~23×5 with daily maintenance 5–6pm ET.',
-      'Maintenance is not a weekly full close — the episode clock pauses, the episode stays open.',
-    ],
-  },
-  indices: {
-    title: 'Indices (ES=F + cash)',
-    lines: [
-      'Futures probe ES=F (CME ~23×5) plus cash index ^GSPC (RTH only).',
-      'Futures and cash can disagree (e.g. futures open, cash closed) — that is shown as Mixed / child status.',
-    ],
-  },
-}
-
-function sessionHoverInfo(
-  session: string | undefined,
-  row: MarketStatusRow,
-): { title: string; lines: string[] } {
-  const s = String(session || row.uiStatus || '').trim()
-  const cal = String(row.calendarState || '').toUpperCase()
-  const base = {
-    Overnight: {
-      title: 'Session · Overnight',
-      lines: [
-        'US equity overnight session (after 8:00pm ET until pre-market).',
-        'Tradable on Yahoo extended hours — not a full market close.',
-      ],
-    },
-    'Pre-market': {
-      title: 'Session · Pre-market',
-      lines: [
-        'US equity pre-market (about 4:00am–9:30am ET).',
-        'Expected open for monitoring; delayed data is still not “closed”.',
-      ],
-    },
-    Regular: {
-      title: 'Session · Regular',
-      lines: [
-        'US cash regular hours (9:30am–4:00pm ET).',
-        'Primary cash equity session.',
-      ],
-    },
-    'Post-market': {
-      title: 'Session · Post-market',
-      lines: [
-        'US equity after-hours on Yahoo (marketState POST).',
-        'Momentum skips evaluate and ends active episodes whenever Yahoo is not REGULAR.',
-      ],
-    },
-    Open: {
-      title: 'Session · Open',
-      lines: [
-        'Calendar expects this market to be live right now.',
-        row.reason || 'Check Status for whether Yahoo data is fresh or delayed.',
-      ],
-    },
-    '24/7': {
-      title: 'Session · 24/7',
-      lines: [
-        'Crypto has no weekly full-close window.',
-        'Monitoring continues whenever Yahoo prints are fresh.',
-      ],
-    },
-    Maintenance: {
-      title: 'Session · Maintenance',
-      lines: [
-        'Daily CME maintenance (typically 5:00–6:00pm ET Mon–Thu).',
-        'Not FULL_CLOSED — heavy work pauses; open episodes are kept.',
-      ],
-    },
-    Closed: {
-      title: 'Session · Closed',
-      lines: [
-        cal === 'HOLIDAY'
-          ? 'Exchange holiday — market is fully closed.'
-          : cal === 'EARLY_CLOSE'
-            ? 'Early-close day — session has ended for the day.'
-            : 'Weekly / weekend full close for this instrument’s session policy.',
-        row.resumeAtLondon
-          ? `Next expected open (London): ${row.resumeAtLondon}.`
-          : 'Monitoring resumes automatically at the next expected open.',
-      ],
-    },
-    Futures: {
-      title: 'Session · Futures',
-      lines: [
-        'Index futures are in their continuous CME session.',
-        'Cash index hours are separate (see child row).',
-      ],
-    },
-  } as Record<string, { title: string; lines: string[] }>
-
-  if (base[s]) return base[s]
-  return {
-    title: `Session · ${s || 'Unknown'}`,
-    lines: [
-      row.reason ||
-        'Expected session name from the calendar (not inferred from delayed data).',
-      cal ? `Calendar state: ${cal}.` : '',
-    ].filter(Boolean),
+function marketSessionToneClass(session: string | undefined | null): string {
+  const s = String(session || '').trim().toUpperCase()
+  if (s === 'REGULAR' || s === 'OPEN') {
+    return 'text-emerald-600 dark:text-emerald-400'
   }
-}
-
-function statusHoverInfo(row: MarketStatusRow): {
-  title: string
-  lines: string[]
-} {
-  const status = String(row.status || row.engineLabel || '').trim()
-  const fresh = String(row.freshnessState || '').toUpperCase()
-  const gate = String(row.engineGate || '').toUpperCase()
-  const lines: string[] = []
-
-  if (status === 'Live') {
-    lines.push(
-      'Calendar is open and the Yahoo quote is fresh enough to use.',
-      'Engine gate would be RUN for this instrument class.',
-    )
-  } else if (status === 'Rate limited') {
-    lines.push(
-      'Yahoo returned HTTP 429 (too many requests). Trigger is backing off — not a market close.',
-      'Wait ~1 minute and hit Refresh. Reduce concurrent polls if this keeps happening.',
-    )
-  } else if (status === 'Unavailable') {
-    lines.push(
-      'Yahoo probe failed (network/error). Calendar may still be open.',
-      'Retry with Refresh. This is not treated as a weekly full close.',
-    )
-  } else if (status === 'Delayed') {
-    lines.push(
-      'Market is expected to be open, but the latest Yahoo print is stale or missing.',
-      'This is not a market close — Trigger pauses calculations until fresh data returns.',
-    )
-  } else if (status === 'Closed') {
-    lines.push(
-      'Market is fully closed for this session policy (weekend, holiday, or early close).',
-      'Heavy polling / episode eval sleeps until the next expected open.',
-    )
-  } else if (status === 'Maintenance') {
-    lines.push(
-      'CME daily maintenance window — temporary pause, not a weekly full close.',
-    )
-  } else {
-    lines.push(
-      row.reason ||
-        'Combined calendar + data freshness label for this probe.',
-    )
-  }
-
-  if (fresh) lines.push(`Freshness: ${fresh}.`)
-  if (gate) lines.push(`Engine gate: ${gate} (${row.engineLabel || gate}).`)
-  if (row.uiStatus && row.uiStatus !== status) {
-    lines.push(`UI status detail: ${row.uiStatus}.`)
-  }
-
-  return { title: `Status · ${status || 'Unknown'}`, lines }
-}
-
-function latestDataHoverInfo(row: MarketStatusRow): {
-  title: string
-  lines: string[]
-} {
-  const london = row.lastUpdateLondon
-  const age =
-    row.quoteAgeSec != null && Number.isFinite(row.quoteAgeSec)
-      ? Math.round(row.quoteAgeSec)
-      : null
-  const lines: string[] = []
-
-  if (london) {
-    lines.push(
-      `Last Yahoo quote time shown in Europe/London: ${london}.`,
-      'London is display-only — session policy always uses America/New_York.',
-    )
-  } else if (age != null) {
-    lines.push(`Last quote age: about ${age}s (no London stamp available).`)
-  } else {
-    lines.push(
-      'No usable quote timestamp from Yahoo for this probe right now (shown as —).',
-      'Missing data is treated as delayed / unavailable, not as a market close.',
-    )
-  }
-
-  if (row.quoteTimestampUtc) {
-    lines.push(`UTC: ${row.quoteTimestampUtc}.`)
-  }
-  if (row.resumeAtLondon) {
-    lines.push(`Next expected open (London): ${row.resumeAtLondon}.`)
-  } else if (
-    String(row.calendarState || '').toUpperCase() === 'OPEN' ||
-    String(row.currentSession || '') === '24/7'
+  if (
+    s === 'PRE' ||
+    s === 'PREPRE' ||
+    s === 'POST' ||
+    s === 'POSTPOST'
   ) {
-    lines.push('No “resumes” time — calendar already expects the market open.')
+    return 'text-amber-600 dark:text-amber-400'
   }
-
-  return {
-    title: london || age != null ? 'Latest data' : 'Latest data · unavailable',
-    lines,
+  if (s === 'CLOSED' || s === 'CLOSE' || s === '—' || !s) {
+    return 'text-muted-foreground'
   }
+  return 'text-foreground'
 }
 
-/** Footer session label — device clock in America/New_York (not Yahoo). */
+/** Flag / mark for market-sessions cards (probe id → emoji). */
+function marketSessionFlag(row: {
+  id?: string
+  region?: string | null
+  symbol?: string
+}): string {
+  const id = String(row.id || '').toLowerCase()
+  const byId: Record<string, string> = {
+    'us-stocks': '🇺🇸',
+    'us-nasdaq': '🇺🇸',
+    'cash-index': '🇺🇸',
+    canada: '🇨🇦',
+    brazil: '🇧🇷',
+    'uk-stocks': '🇬🇧',
+    'uk-ftse': '🇬🇧',
+    germany: '🇩🇪',
+    france: '🇫🇷',
+    switzerland: '🇨🇭',
+    'india-nse': '🇮🇳',
+    'india-bse': '🇮🇳',
+    japan: '🇯🇵',
+    china: '🇨🇳',
+    'hong-kong': '🇭🇰',
+    korea: '🇰🇷',
+    singapore: '🇸🇬',
+    australia: '🇦🇺',
+    dubai: '🇦🇪',
+    'south-africa': '🇿🇦',
+    forex: '💱',
+    crypto: '🪙',
+    commodities: '🥇',
+    indices: '📈',
+  }
+  if (byId[id]) return byId[id]
+  const region = String(row.region || '').toLowerCase()
+  if (region.includes('america')) return '🌎'
+  if (region.includes('europe')) return '🇪🇺'
+  if (region.includes('asia')) return '🌏'
+  if (region.includes('africa')) return '🌍'
+  if (region.includes('middle')) return '🌍'
+  return '🏳️'
+}
+
+/** Footer session label — exact Yahoo marketState when known (else ET clock). */
 function MarketStatusBadge({
   nowMs,
   className,
   onClick,
+  yahooMarketState,
 }: {
   nowMs: number
   className?: string
   onClick?: () => void
+  /** Raw Yahoo marketState for US probe (SPY), e.g. POST / REGULAR / CLOSED */
+  yahooMarketState?: string | null
 }) {
   const market = usEquitySessionFromEtClock(nowMs)
-  const isRegular = market.tone === 'open'
+  const yahoo = String(yahooMarketState || '')
+    .trim()
+    .toUpperCase()
+  const label = yahoo || market.label
+  const isRegular = yahoo
+    ? yahoo === 'REGULAR' || yahoo === 'OPEN'
+    : market.tone === 'open'
   const londonOpen = formatEtWallInTimeZone(9, 30, UK_ZONE, nowMs)
   const londonClose = formatEtWallInTimeZone(16, 0, UK_ZONE, nowMs)
   return (
@@ -4063,16 +4771,22 @@ function MarketStatusBadge({
         onClick && 'cursor-pointer hover:opacity-80',
         className,
       )}
-      title={`US equities · ${market.label} · hours are America/New_York. Regular in London today: ${londonOpen}–${londonClose} (converted, not ET+5). Click for all markets.`}
+      title={
+        yahoo
+          ? `Yahoo marketState · ${yahoo} (US SPY probe). Regular cash in London today: ${londonOpen}–${londonClose}.`
+          : `US equities · ${market.label} · hours are America/New_York. Regular in London today: ${londonOpen}–${londonClose}.`
+      }
     >
       <span
         className={cn(
-          'font-semibold tracking-tight',
-          marketStatusToneClass(market.tone),
+          'font-mono font-semibold tracking-tight',
+          yahoo
+            ? marketSessionToneClass(yahoo)
+            : marketStatusToneClass(market.tone),
           isRegular && 'sndk-market-live-blink',
         )}
       >
-        {market.label}
+        {label}
       </span>
     </button>
   )
@@ -5282,7 +5996,7 @@ function EpisodeStatusGuideButton({
   )
 }
 
-export function SndkMomentumPanel({
+export function EpisodeDashboard({
   appSwitcher: _appSwitcher,
   onOpenInTrigger,
   onOpenTriggerApp,
@@ -5303,19 +6017,13 @@ export function SndkMomentumPanel({
 } = {}) {
   void _appSwitcher
   const [watchlist, setWatchlist] = useState<WatchTab[]>(() => loadWatchlist())
-  const [assetClassTab, setAssetClassTab] = useState<AssetClassTabId>(() =>
-    loadAssetClassFilter(),
+  const [assetClassTab, setAssetClassTab] = useState<AssetClassTabId | null>(
+    () => loadAssetClassFilter(),
   )
-  const [mostActivesByClass, setMostActivesByClass] = useState<
-    Partial<Record<string, WatchTab[]>>
-  >({})
-  const [mostActivesLoading, setMostActivesLoading] = useState(false)
-  const [mostActivesError, setMostActivesError] = useState<string | null>(null)
-  const [marketListTab, setMarketListTab] = useState<MarketListId>('watchlist')
   const [, setSavedTickers] = useState<WatchTab[]>([])
   /**
-   * App-monitored tickers from device_monitored_tickers (enabled subscribers).
-   * Categorized client-side into Stocks / Indices / Forex / Crypto / Commodities.
+   * App-monitored tickers from device_monitor (enabled subscribers).
+   * Categorized client-side into Stocks / ETFs / Indices / Forex / Crypto / Commodities.
    */
   const [monitoredByClass, setMonitoredByClass] = useState<
     Partial<Record<AssetClassTabId, WatchTab[]>>
@@ -5337,51 +6045,8 @@ export function SndkMomentumPanel({
     saveActiveTicker(t)
   }, [])
 
-  const userClassWatchlist = watchlist.filter(
-    (tab) => tabAssetClass(tab) === assetClassTab,
-  )
-
-  const availableListTabs = listTabsForClass(assetClassTab)
-  const activeListTab = availableListTabs.some((t) => t.id === marketListTab)
-    ? marketListTab
-    : 'watchlist'
-
-  const displayedEntities = useMemo(() => {
-    if (activeListTab === 'watchlist') {
-      // Source of truth: device_monitored_tickers (conscious Trigger subscribers)
-      const monitored = monitoredByClass[assetClassTab] || []
-      if (monitored.length) return monitored
-      // Fallback while loading / empty Supabase: local dashboard list only
-      return userClassWatchlist
-    }
-    const key = `${assetClassTab}:${activeListTab}`
-    return mostActivesByClass[key] || []
-  }, [
-    activeListTab,
-    assetClassTab,
-    mostActivesByClass,
-    monitoredByClass,
-    userClassWatchlist,
-  ])
-
-  const selectAssetClassTab = useCallback(
-    (id: string) => {
-      if (!ASSET_CLASS_TABS.some((t) => t.id === id)) return
-      const next = id as AssetClassTabId
-      setAssetClassTab(next)
-      saveAssetClassFilter(next)
-      setMarketListTab('watchlist')
-      const inClass = watchlist.filter((tab) => tabAssetClass(tab) === next)
-      if (!inClass.length) return
-      const stillActive = inClass.some(
-        (tab) => tab.ticker.toUpperCase() === activeTicker.toUpperCase(),
-      )
-      if (!stillActive) {
-        selectTicker(inClass[0].ticker)
-      }
-    },
-    [watchlist, activeTicker, selectTicker],
-  )
+  /** Left rail shows all live episodes until an asset-class tab is chosen. */
+  const leftShowsActiveEpisodes = assetClassTab == null
 
   useEffect(() => {
     let cancelled = false
@@ -5411,9 +6076,8 @@ export function SndkMomentumPanel({
     }
   }, [])
 
-  // Watchlist: load all consciously monitored tickers, split by asset class
+  // Desk + asset tabs: load monitored tickers (device_monitor)
   useEffect(() => {
-    if (activeListTab !== 'watchlist') return
     let cancelled = false
     const ac = new AbortController()
     setMonitoredLoading(true)
@@ -5423,10 +6087,11 @@ export function SndkMomentumPanel({
     })
       .then((body) => {
         if (cancelled) return
-        setMonitoredSourceTable(body.table || 'device_monitored_tickers')
+        setMonitoredSourceTable(body.table || 'device_monitor')
         if (body.byClass) setMonitoredCounts(body.byClass)
         const buckets: Partial<Record<AssetClassTabId, WatchTab[]>> = {
           equity: [],
+          etf: [],
           index: [],
           forex: [],
           crypto: [],
@@ -5435,7 +6100,16 @@ export function SndkMomentumPanel({
         for (const row of body.items || []) {
           const ticker = normalizeWatchTicker(row.ticker)
           if (!ticker) continue
-          const cls = (row.assetClass || detectAssetClass(ticker)) as AssetClassTabId
+          const rawCls = String(row.assetClass || detectAssetClass(ticker))
+            .trim()
+            .toLowerCase()
+          const cls = (
+            rawCls === 'etf' || rawCls === 'etfs' || rawCls === 'fund'
+              ? 'etf'
+              : buckets[rawCls as AssetClassTabId]
+                ? rawCls
+                : detectAssetClass(ticker)
+          ) as AssetClassTabId
           const key: AssetClassTabId = buckets[cls] ? cls : 'equity'
           const list = buckets[key] || (buckets[key] = [])
           list.push({
@@ -5463,75 +6137,7 @@ export function SndkMomentumPanel({
       cancelled = true
       ac.abort()
     }
-  }, [activeListTab])
-
-  useEffect(() => {
-    if (activeListTab === 'watchlist') {
-      setMostActivesLoading(false)
-      setMostActivesError(null)
-      return
-    }
-    let cancelled = false
-    const ac = new AbortController()
-    const listKey = `${assetClassTab}:${activeListTab}`
-    setMostActivesLoading(true)
-    setMostActivesError(null)
-    void fetchYahooMostActives(assetClassTab, {
-      count: 20,
-      list: activeListTab,
-      signal: ac.signal,
-    })
-      .then((body) => {
-        if (cancelled) return
-        const items = (body.items || [])
-          .map((row: YahooMostActiveItem) => {
-            const ticker = normalizeWatchTicker(row.ticker || row.symbol)
-            if (!ticker) return null
-            return {
-              ticker,
-              label: String(row.label || ticker).trim() || ticker,
-              assetClass: row.assetClass || assetClassTab,
-            } as WatchTab
-          })
-          .filter((row): row is WatchTab => Boolean(row))
-        setMostActivesByClass((prev) => ({ ...prev, [listKey]: items }))
-        const quotesPatch: Record<string, YahooLiveQuote> = {}
-        for (const row of body.items || []) {
-          const ticker = normalizeWatchTicker(row.ticker || row.symbol)
-          if (!ticker) continue
-          quotesPatch[ticker] = {
-            symbol: ticker,
-            shortName: row.label || null,
-            longName: row.longName || null,
-            regularMarketPrice: row.regularMarketPrice,
-            regularMarketChange: row.regularMarketChange,
-            regularMarketChangePercent: row.regularMarketChangePercent,
-            regularMarketPreviousClose: null,
-            currency: row.currency || null,
-            marketState: row.marketState || null,
-            exchange: row.exchange || null,
-          }
-          quotesPatch[ticker.toUpperCase()] = quotesPatch[ticker]
-        }
-        if (Object.keys(quotesPatch).length) {
-          setWatchQuotes((prev) => ({ ...prev, ...quotesPatch }))
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return
-        if (err instanceof DOMException && err.name === 'AbortError') return
-        setMostActivesError(
-          err instanceof Error ? err.message : 'Failed to load Yahoo list',
-        )
-      })
-      .finally(() => {
-        if (!cancelled) setMostActivesLoading(false)
-      })
-    return () => {
-      cancelled = true
-      ac.abort()
-    }
-  }, [assetClassTab, activeListTab])
+  }, [assetClassTab])
 
   const [addOpen, setAddOpen] = useState(false)
   const [addTicker, setAddTicker] = useState('')
@@ -5549,6 +6155,8 @@ export function SndkMomentumPanel({
   const [error, setError] = useState<UiError | null>(null)
   /** Expanded Yahoo chart strip under pricing (click mini chart / toggle) */
   const [chartExpanded, setChartExpanded] = useState(false)
+  /** 3rd-column mini chart → expanded chart under the quote card */
+  const [railChartExpanded, setRailChartExpanded] = useState(false)
   const [logCollapsed, setLogCollapsed] = useState(() => {
     try {
       return localStorage.getItem(LOG_COLLAPSE_KEY) === '1'
@@ -5620,45 +6228,75 @@ export function SndkMomentumPanel({
     x: number
     y: number
   } | null>(null)
-  /** Right rail content: activity log, subscribers, recent events, thresholds, or all active episodes */
+  /** Right rail content: activity log, subscribers, recent events, thresholds, all active episodes, or Yahoo chart */
   const [rightRailMode, setRightRailMode] = useState<
-    'logs' | 'subscribers' | 'events' | 'settings' | 'activeEpisodes'
-  >('logs')
+    'logs' | 'subscribers' | 'events' | 'settings' | 'activeEpisodes' | 'yahoo'
+  >('yahoo')
   /** Main panel under chart: rolling-return table vs active-episode story */
   const [mainPanelTab, setMainPanelTab] = useState<'returns' | 'episode'>(
-    'returns',
+    'episode',
   )
   /** All ACTIVE episodes across tickers (settings → Active episodes rail) */
   const [activeEpisodesList, setActiveEpisodesList] = useState<
     ActiveEpisodeRow[]
-  >([])
+  >(() => readEpisodeListCache()?.activeEpisodes || [])
   const [activeEpisodesLoading, setActiveEpisodesLoading] = useState(false)
+  const [activeEpisodesUpdatingFromSupabase, setActiveEpisodesUpdatingFromSupabase] =
+    useState(false)
   const [activeEpisodesError, setActiveEpisodesError] = useState('')
   /** Expanded cards in the Active episodes rail (by episodeId or ticker) */
   const [activeEpisodeExpanded, setActiveEpisodeExpanded] = useState<
     Record<string, boolean>
   >({})
+  /**
+   * Episodes-first desk: null = center shows all episode history;
+   * set when user clicks a left-rail active episode → center detail + Yahoo rail.
+   */
+  const [deskEpisodeFocus, setDeskEpisodeFocus] =
+    useState<ActiveEpisodeRow | null>(null)
+  /** Left desk tab while on Active-episodes home (assetClassTab == null). */
+  const [deskLeftTab, setDeskLeftTab] = useState<'episodes' | 'users'>(
+    'episodes',
+  )
+  const [deskDevices, setDeskDevices] = useState<DeskDevice[]>([])
+  const [deskDevicesLoading, setDeskDevicesLoading] = useState(false)
+  const [deskDevicesError, setDeskDevicesError] = useState('')
+  const [deskUserFocus, setDeskUserFocus] = useState<DeskDevice | null>(null)
+  const [deskUserActivities, setDeskUserActivities] = useState<
+    DeskUserActivity[]
+  >([])
+  const [deskUserActivitiesLoading, setDeskUserActivitiesLoading] =
+    useState(false)
+  const [allEpisodesList, setAllEpisodesList] = useState<ActiveEpisodeRow[]>(
+    () => readEpisodeListCache()?.episodes || [],
+  )
+  const [allEpisodesLoading, setAllEpisodesLoading] = useState(
+    () => !(readEpisodeListCache()?.episodes || []).length,
+  )
+  const [allEpisodesUpdatingFromSupabase, setAllEpisodesUpdatingFromSupabase] =
+    useState(false)
+  const [tickerUpdatingFromSupabase, setTickerUpdatingFromSupabase] =
+    useState(false)
+  const [allEpisodesLoadingMore, setAllEpisodesLoadingMore] = useState(false)
+  const [allEpisodesError, setAllEpisodesError] = useState('')
+  const [allEpisodesHasMore, setAllEpisodesHasMore] = useState(
+    () => Boolean(readEpisodeListCache()?.hasMore),
+  )
+  const [allEpisodesTotal, setAllEpisodesTotal] = useState(
+    () => readEpisodeListCache()?.total || 0,
+  )
+  const [allEpisodesNextOffset, setAllEpisodesNextOffset] = useState<
+    number | null
+  >(() => readEpisodeListCache()?.nextOffset ?? null)
+  const [allEpisodesFetchedAt, setAllEpisodesFetchedAt] = useState(
+    () => readEpisodeListCache()?.at || '',
+  )
+  /** All episodes ticker filter (client-side). */
+  const [allEpisodesSearchOpen, setAllEpisodesSearchOpen] = useState(false)
+  const [allEpisodesQuery, setAllEpisodesQuery] = useState('')
   /** Detail popup for timeline Alert / Perplexity / state measure explain */
-  const [timelineDetail, setTimelineDetail] = useState<
-    | {
-        kind: 'alert'
-        at: string
-        notification: { title?: string; body?: string } | null
-        ev: MomentumEvent
-      }
-    | {
-        kind: 'perplexity'
-        at: string
-        research: EventResearch
-        ev: MomentumEvent
-      }
-    | {
-        kind: 'event'
-        at: string
-        ev: MomentumEvent
-      }
-    | null
-  >(null)
+  const [timelineDetail, setTimelineDetail] =
+    useState<TimelineDetailState | null>(null)
   const [marketStatusOpen, setMarketStatusOpen] = useState(false)
   const [marketStatusLoading, setMarketStatusLoading] = useState(false)
   const [marketStatusError, setMarketStatusError] = useState('')
@@ -5666,7 +6304,7 @@ export function SndkMomentumPanel({
     [],
   )
   const [marketStatusFooter, setMarketStatusFooter] = useState('')
-  const [marketStatusDebug, setMarketStatusDebug] = useState<string | null>(
+  const marketStatusHoverCloseRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   )
 
@@ -5674,25 +6312,57 @@ export function SndkMomentumPanel({
     setMarketStatusLoading(true)
     setMarketStatusError('')
     try {
-      const res = await fetch('/api/momentum/market-status')
+      const res = await deskFetch('/api/momentum/market-status')
       const body = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`)
       setMarketStatusRows(Array.isArray(body.markets) ? body.markets : [])
       setMarketStatusFooter(String(body.footer || ''))
-      if (opts?.open !== false) setMarketStatusOpen(true)
+      if (opts?.open) setMarketStatusOpen(true)
     } catch (err) {
       setMarketStatusError(
         err instanceof Error ? err.message : 'Market status failed',
       )
-      if (opts?.open !== false) setMarketStatusOpen(true)
+      if (opts?.open) setMarketStatusOpen(true)
     } finally {
       setMarketStatusLoading(false)
     }
   }, [])
 
+  const cancelMarketStatusHoverClose = useCallback(() => {
+    if (marketStatusHoverCloseRef.current) {
+      clearTimeout(marketStatusHoverCloseRef.current)
+      marketStatusHoverCloseRef.current = null
+    }
+  }, [])
+
+  const openMarketStatusFromHover = useCallback(() => {
+    cancelMarketStatusHoverClose()
+    setMarketStatusOpen(true)
+    // Refresh quietly when opening (or if we have no rows yet)
+    void loadMarketStatusPopup({ open: false })
+  }, [cancelMarketStatusHoverClose, loadMarketStatusPopup])
+
+  /** Leave trigger/panel → close shortly (gap so pointer can enter the panel). */
+  const scheduleMarketStatusHoverClose = useCallback(() => {
+    cancelMarketStatusHoverClose()
+    marketStatusHoverCloseRef.current = setTimeout(() => {
+      setMarketStatusOpen(false)
+      marketStatusHoverCloseRef.current = null
+    }, 160)
+  }, [cancelMarketStatusHoverClose])
+
+  // Prefetch session data on load — do NOT auto-open the popup
   useEffect(() => {
-    void loadMarketStatusPopup({ open: true })
+    void loadMarketStatusPopup({ open: false })
   }, [loadMarketStatusPopup])
+
+  useEffect(() => {
+    return () => {
+      if (marketStatusHoverCloseRef.current) {
+        clearTimeout(marketStatusHoverCloseRef.current)
+      }
+    }
+  }, [])
   /** Manual end / exit of the live episode from Recent Events */
   const [endingEpisode, setEndingEpisode] = useState(false)
   /** When ending from the Active episodes rail — which ticker is in-flight. */
@@ -5828,12 +6498,114 @@ export function SndkMomentumPanel({
         null,
       market_session: sessionCode,
       asset_class: activeAssetClass,
+      episode_id: status?.episode?.episodeId || deskEpisodeFocus?.episodeId || null,
     }
   }
+
+  /**
+   * Left-rail entity list for an asset class:
+   * device_monitor ∪ momentum episodes / episode events.
+   * No Yahoo Most Active / Gainers / research-history lists.
+   */
+  const displayedEntities = useMemo(() => {
+    if (assetClassTab == null) return []
+    const byTicker = new Map<string, WatchTab>()
+
+    const upsert = (tab: WatchTab) => {
+      const ticker = normalizeWatchTicker(tab.ticker)
+      if (!ticker) return
+      if (tabAssetClass({ ...tab, ticker }) !== assetClassTab) return
+      const prev = byTicker.get(ticker)
+      if (!prev) {
+        byTicker.set(ticker, {
+          ...tab,
+          ticker,
+          label: String(tab.label || ticker).trim() || ticker,
+          assetClass: assetClassTab,
+        })
+        return
+      }
+      const nextCount =
+        tab.subscriberCount != null && Number.isFinite(Number(tab.subscriberCount))
+          ? Number(tab.subscriberCount)
+          : null
+      const prevCount =
+        prev.subscriberCount != null && Number.isFinite(Number(prev.subscriberCount))
+          ? Number(prev.subscriberCount)
+          : null
+      byTicker.set(ticker, {
+        ...prev,
+        label:
+          (tab.label && tab.label !== ticker ? tab.label : prev.label) || ticker,
+        subscriberCount:
+          nextCount != null
+            ? prevCount != null
+              ? Math.max(prevCount, nextCount)
+              : nextCount
+            : prevCount,
+        assetClass: assetClassTab,
+      })
+    }
+
+    for (const row of monitoredByClass[assetClassTab] || []) upsert(row)
+
+    for (const row of activeEpisodesList) {
+      const ticker = normalizeWatchTicker(row.ticker)
+      if (!ticker) continue
+      upsert({
+        ticker,
+        label: ticker,
+        assetClass: detectAssetClass(ticker),
+      })
+    }
+    for (const row of allEpisodesList) {
+      const ticker = normalizeWatchTicker(row.ticker)
+      if (!ticker) continue
+      upsert({
+        ticker,
+        label: ticker,
+        assetClass: detectAssetClass(ticker),
+      })
+    }
+
+    return [...byTicker.values()].sort((a, b) =>
+      a.ticker.localeCompare(b.ticker),
+    )
+  }, [
+    assetClassTab,
+    monitoredByClass,
+    activeEpisodesList,
+    allEpisodesList,
+  ])
+
+  const entityListLoading =
+    assetClassTab != null &&
+    monitoredLoading &&
+    !displayedEntities.length
+
+  const episodeFallbackTab = useMemo((): WatchTab | null => {
+    const t = String(activeTicker || '')
+      .trim()
+      .toUpperCase()
+    if (!t) return null
+    const fromEp = activeEpisodesList.find(
+      (row) => String(row.ticker || '').toUpperCase() === t,
+    )
+    const label =
+      watchlist.find((w) => w.ticker.toUpperCase() === t)?.label ||
+      fromEp?.ticker ||
+      t
+    return {
+      ticker: t,
+      label: String(label || t),
+      assetClass: detectAssetClass(t),
+    }
+  }, [activeTicker, activeEpisodesList, watchlist])
 
   const activeTab =
     displayedEntities.find((t) => t.ticker === activeTicker) ||
     watchlist.find((t) => t.ticker === activeTicker) ||
+    episodeFallbackTab ||
     displayedEntities[0] ||
     watchlist[0] ||
     DEFAULT_WATCHLIST[0]
@@ -5861,7 +6633,7 @@ export function SndkMomentumPanel({
     try {
       // Match /api/momentum/monitored-tickers?app=trigger audience definition
       const app = 'trigger' as const
-      const res = await fetch(
+      const res = await deskFetch(
         `/api/notifications/devices?app=${encodeURIComponent(app)}&_=${Date.now()}`,
       )
       const body = await res.json().catch(() => ({}))
@@ -5915,6 +6687,230 @@ export function SndkMomentumPanel({
       /* ignore */
     }
   }, [])
+
+  const selectAssetClassTab = useCallback(
+    (id: string) => {
+      if (!ASSET_CLASS_TABS.some((t) => t.id === id)) return
+      const next = id as AssetClassTabId
+      // Re-tap active tab → clear selection → back to all active episodes
+      if (assetClassTab === next) {
+        setAssetClassTab(null)
+        saveAssetClassFilter(null)
+        setDeskEpisodeFocus(null)
+        setMainPanelTab('episode')
+        setLogCollapsedPersist(false)
+        return
+      }
+      setAssetClassTab(next)
+      saveAssetClassFilter(next)
+      setDeskEpisodeFocus(null)
+      const inClass = [
+        ...(monitoredByClass[next] || []),
+        ...watchlist.filter((tab) => tabAssetClass(tab) === next),
+      ]
+      if (!inClass.length) return
+      const stillActive = inClass.some(
+        (tab) => tab.ticker.toUpperCase() === activeTicker.toUpperCase(),
+      )
+      if (!stillActive) {
+        selectTicker(inClass[0].ticker)
+      }
+    },
+    [
+      assetClassTab,
+      watchlist,
+      monitoredByClass,
+      activeTicker,
+      selectTicker,
+      setLogCollapsedPersist,
+    ],
+  )
+
+  const selectActiveEpisodeFromLeft = useCallback(
+    (row: ActiveEpisodeRow) => {
+      const ticker = String(row.ticker || '')
+        .trim()
+        .toUpperCase()
+      if (!ticker) return
+      setDeskLeftTab('episodes')
+      setDeskUserFocus(null)
+      setDeskEpisodeFocus(row)
+      selectTicker(ticker)
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+      setRailChartExpanded(false)
+    },
+    [selectTicker, setLogCollapsedPersist],
+  )
+
+  const clearDeskEpisodeFocus = useCallback(() => {
+    setDeskEpisodeFocus(null)
+  }, [])
+
+  const loadDeskDevices = useCallback(async () => {
+    setDeskDevicesLoading(true)
+    setDeskDevicesError('')
+    try {
+      const res = await deskFetch(
+        `/api/notifications/devices?app=trigger&_=${Date.now()}`,
+      )
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        devices?: DeskDevice[]
+        error?: string
+      }
+      if (!res.ok) throw new Error(body.error || `Status ${res.status}`)
+      const list = Array.isArray(body.devices) ? body.devices : []
+      setDeskDevices(list)
+      setDeskUserFocus((prev) => {
+        if (!prev) return prev
+        const key = deskDeviceKey(prev)
+        return list.find((d) => deskDeviceKey(d) === key) || prev
+      })
+    } catch (err) {
+      setDeskDevices([])
+      setDeskDevicesError(
+        err instanceof Error ? err.message : 'Failed to load users',
+      )
+    } finally {
+      setDeskDevicesLoading(false)
+    }
+  }, [])
+
+  const selectDeskUser = useCallback(
+    (device: DeskDevice) => {
+      setDeskUserFocus(device)
+      setDeskEpisodeFocus(null)
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+    },
+    [setLogCollapsedPersist],
+  )
+
+  const loadDeskUserActivities = useCallback(async (device: DeskDevice) => {
+    setDeskUserActivitiesLoading(true)
+    try {
+      const q = new URLSearchParams({ limit: '80' })
+      if (device.device_id) q.set('device_id', String(device.device_id))
+      if (device.expo_push_token) {
+        q.set('expo_push_token', String(device.expo_push_token))
+      }
+      const res = await deskFetch(
+        `/api/notifications/devices/activity?${q}&_=${Date.now()}`,
+      )
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        activities?: DeskUserActivity[]
+      }
+      setDeskUserActivities(
+        res.ok && Array.isArray(body.activities) ? body.activities : [],
+      )
+    } catch {
+      setDeskUserActivities([])
+    } finally {
+      setDeskUserActivitiesLoading(false)
+    }
+  }, [])
+
+  const loadAllEpisodesHistory = useCallback(
+    async (opts?: { refresh?: boolean; offset?: number }) => {
+      const offset = Math.max(0, Number(opts?.offset) || 0)
+      const append = offset > 0
+      const fromSupabase = Boolean(opts?.refresh)
+      if (append) setAllEpisodesLoadingMore(true)
+      else {
+        setAllEpisodesError('')
+        if (fromSupabase) setAllEpisodesUpdatingFromSupabase(true)
+      }
+      try {
+        const q = new URLSearchParams({
+          limit: String(ALL_EPISODES_PAGE_SIZE),
+          offset: String(offset),
+        })
+        if (opts?.refresh) q.set('refresh', '1')
+        const res = await deskFetch(`/api/momentum/episodes-history?${q}`)
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok || !body?.ok) {
+          throw new Error(
+            body?.error || `Failed to load episodes (${res.status})`,
+          )
+        }
+        const list = Array.isArray(body.episodes)
+          ? (body.episodes as ActiveEpisodeRow[])
+          : []
+        const actives = Array.isArray(body.activeEpisodes)
+          ? (body.activeEpisodes as ActiveEpisodeRow[])
+          : []
+        if (append) {
+          setAllEpisodesList((prev) => {
+            const seen = new Set(
+              prev.map(
+                (row) =>
+                  `${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`,
+              ),
+            )
+            const extra = list.filter(
+              (row) =>
+                !seen.has(
+                  `${row.episodeId || row.ticker}-${row.episodeNo || row.episodeStartedAt}`,
+                ),
+            )
+            return extra.length ? [...prev, ...extra] : prev
+          })
+        } else {
+          setAllEpisodesList(list)
+        }
+        setActiveEpisodesList(actives)
+        setAllEpisodesHasMore(Boolean(body.hasMore))
+        setAllEpisodesTotal(
+          Number.isFinite(Number(body.total))
+            ? Number(body.total)
+            : offset + list.length,
+        )
+        setAllEpisodesNextOffset(
+          body.nextOffset != null && Number.isFinite(Number(body.nextOffset))
+            ? Number(body.nextOffset)
+            : body.hasMore
+              ? offset + ALL_EPISODES_PAGE_SIZE
+              : null,
+        )
+        setAllEpisodesFetchedAt(
+          String(body.at || new Date().toISOString()),
+        )
+        setAllEpisodesError('')
+        if (!append) {
+          writeEpisodeListCache({
+            episodes: list,
+            activeEpisodes: actives,
+            total: Number.isFinite(Number(body.total))
+              ? Number(body.total)
+              : list.length,
+            hasMore: Boolean(body.hasMore),
+            nextOffset:
+              body.nextOffset != null && Number.isFinite(Number(body.nextOffset))
+                ? Number(body.nextOffset)
+                : body.hasMore
+                  ? offset + ALL_EPISODES_PAGE_SIZE
+                  : null,
+            at: String(body.at || new Date().toISOString()),
+          })
+        }
+      } catch (err) {
+        if (!append) {
+          setAllEpisodesError(
+            err instanceof Error ? err.message : 'Failed to load episodes',
+          )
+        }
+      } finally {
+        if (append) setAllEpisodesLoadingMore(false)
+        else {
+          setAllEpisodesLoading(false)
+          setAllEpisodesUpdatingFromSupabase(false)
+        }
+      }
+    },
+    [],
+  )
 
   const toggleLog = () => {
     setLogCollapsedPersist(!logCollapsed)
@@ -6033,7 +7029,7 @@ export function SndkMomentumPanel({
       setTestModeEnabledUi(tm.enabled)
       setTestModeSummary(String(tm.summary || ''))
     } else {
-      void fetch(`/api/momentum/test-mode?_=${Date.now()}`)
+      void deskFetch(`/api/momentum/test-mode?_=${Date.now()}`)
         .then((r) => r.json().catch(() => ({})))
         .then((body) => {
           if (body?.ok) {
@@ -6052,7 +7048,7 @@ export function SndkMomentumPanel({
     setTestModeSaving(true)
     setTestModeEnabledUi(next) // optimistic
     try {
-      const res = await fetch('/api/momentum/test-mode', {
+      const res = await deskFetch('/api/momentum/test-mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
@@ -6077,7 +7073,7 @@ export function SndkMomentumPanel({
   // Keep bottom Settings menu in sync with server test-mode (even before opening thresholds rail)
   useEffect(() => {
     let cancelled = false
-    void fetch(`/api/momentum/test-mode?_=${Date.now()}`)
+    void deskFetch(`/api/momentum/test-mode?_=${Date.now()}`)
       .then((r) => r.json().catch(() => ({})))
       .then((body) => {
         if (cancelled || !body?.ok) return
@@ -6104,11 +7100,12 @@ export function SndkMomentumPanel({
   }, [])
 
   const loadActiveEpisodesList = useCallback(async (opts?: { refresh?: boolean }) => {
-    setActiveEpisodesLoading(true)
+    const fromSupabase = Boolean(opts?.refresh)
     setActiveEpisodesError('')
+    if (fromSupabase) setActiveEpisodesUpdatingFromSupabase(true)
     try {
       const q = opts?.refresh ? '?refresh=1' : ''
-      const res = await fetch(`/api/momentum/active-episodes${q}`)
+      const res = await deskFetch(`/api/momentum/active-episodes${q}`)
       const body = await res.json().catch(() => ({}))
       if (!res.ok || !body?.ok) {
         throw new Error(
@@ -6140,6 +7137,7 @@ export function SndkMomentumPanel({
       )
     } finally {
       setActiveEpisodesLoading(false)
+      setActiveEpisodesUpdatingFromSupabase(false)
     }
   }, [])
 
@@ -6147,13 +7145,174 @@ export function SndkMomentumPanel({
   const openActiveEpisodesRail = useCallback(() => {
     setRightRailMode('activeEpisodes')
     setLogCollapsedPersist(false)
-    void loadActiveEpisodesList({ refresh: true })
+    void loadActiveEpisodesList()
   }, [setLogCollapsedPersist, loadActiveEpisodesList])
+
+  // Desk: paint cache immediately, then refresh history from Supabase.
+  useEffect(() => {
+    void loadActiveEpisodesList()
+    void loadAllEpisodesHistory({ refresh: true })
+  }, [loadActiveEpisodesList, loadAllEpisodesHistory])
+
+  // Entering / leaving episodes-first mode resets center to the full history list
+  const prevLeftEpisodesRef = useRef(leftShowsActiveEpisodes)
+  useEffect(() => {
+    const was = prevLeftEpisodesRef.current
+    prevLeftEpisodesRef.current = leftShowsActiveEpisodes
+    if (!leftShowsActiveEpisodes) {
+      setDeskEpisodeFocus(null)
+      setDeskUserFocus(null)
+      return
+    }
+    if (!was && leftShowsActiveEpisodes) {
+      setDeskEpisodeFocus(null)
+      setDeskUserFocus(null)
+      setDeskLeftTab('episodes')
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+      setMainPanelTab('episode')
+      // Memory/cache only — Supabase pull is boot + manual Refresh.
+      void loadAllEpisodesHistory()
+    }
+  }, [leftShowsActiveEpisodes, setLogCollapsedPersist, loadAllEpisodesHistory])
+
+  const deskUsersMode = leftShowsActiveEpisodes && deskLeftTab === 'users'
+
+  /** Center stays on All episodes while desk is open — focus only updates the 3rd column. */
+  const showAllEpisodesCenter =
+    leftShowsActiveEpisodes && !deskUsersMode
+
+  /** Ticker → enabled Trigger subscriber count (from device_monitor). */
+  const subscriberCountByTicker = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const list of Object.values(monitoredByClass)) {
+      for (const tab of list || []) {
+        const t = String(tab.ticker || '')
+          .trim()
+          .toUpperCase()
+        if (!t) continue
+        const n =
+          tab.subscriberCount != null && Number.isFinite(Number(tab.subscriberCount))
+            ? Math.max(0, Math.floor(Number(tab.subscriberCount)))
+            : null
+        if (n == null) continue
+        map.set(t, n)
+      }
+    }
+    return map
+  }, [monitoredByClass])
+
+  const filteredAllEpisodesList = useMemo(() => {
+    const q = allEpisodesQuery.trim().toUpperCase()
+    if (!q) return allEpisodesList
+    return allEpisodesList.filter((row) =>
+      String(row.ticker || '')
+        .trim()
+        .toUpperCase()
+        .includes(q),
+    )
+  }, [allEpisodesList, allEpisodesQuery])
+
+  /** Arrow Up/Down → previous/next row in the All episodes center list. */
+  const navigateDeskEpisodeByArrow = useCallback(
+    (delta: 1 | -1) => {
+      if (!showAllEpisodesCenter || !filteredAllEpisodesList.length) return
+      const list = filteredAllEpisodesList
+      const currentIdx = deskEpisodeFocus
+        ? list.findIndex((row) => deskEpisodeRowsMatch(row, deskEpisodeFocus))
+        : -1
+      const nextIdx =
+        currentIdx < 0
+          ? delta > 0
+            ? 0
+            : list.length - 1
+          : Math.max(0, Math.min(list.length - 1, currentIdx + delta))
+      if (nextIdx === currentIdx) return
+      const next = list[nextIdx]
+      if (!next) return
+      selectActiveEpisodeFromLeft(next)
+    },
+    [
+      showAllEpisodesCenter,
+      filteredAllEpisodesList,
+      deskEpisodeFocus,
+      selectActiveEpisodeFromLeft,
+    ],
+  )
+
+  useEffect(() => {
+    if (!showAllEpisodesCenter || !deskEpisodeFocus) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const target = e.target as HTMLElement | null
+      if (target) {
+        const tag = target.tagName
+        if (
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          tag === 'SELECT' ||
+          target.isContentEditable
+        ) {
+          return
+        }
+      }
+      if (document.querySelector('[role="dialog"][data-state="open"]')) return
+      e.preventDefault()
+      navigateDeskEpisodeByArrow(e.key === 'ArrowDown' ? 1 : -1)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [showAllEpisodesCenter, deskEpisodeFocus, navigateDeskEpisodeByArrow])
+
+  // Keep the focused center-list row visible while arrowing through episodes
+  useEffect(() => {
+    if (!showAllEpisodesCenter || !deskEpisodeFocus) return
+    const key = deskEpisodeNavKey(deskEpisodeFocus)
+    if (!key) return
+    const safe =
+      typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(key)
+        : key.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    const el = document.querySelector(
+      `[data-episode-nav-key="${safe}"]`,
+    ) as HTMLElement | null
+    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [showAllEpisodesCenter, deskEpisodeFocus])
+
+  // Load Trigger devices when Users tab is open
+  useEffect(() => {
+    if (!deskUsersMode) return
+    void loadDeskDevices()
+  }, [deskUsersMode, loadDeskDevices])
+
+  // Load push activity for the focused desk user
+  useEffect(() => {
+    if (!deskUsersMode || !deskUserFocus) {
+      setDeskUserActivities([])
+      return
+    }
+    void loadDeskUserActivities(deskUserFocus)
+  }, [deskUsersMode, deskUserFocus, loadDeskUserActivities])
+
+  // Yahoo / user-profile detail rail after focus from the left list
+  useEffect(() => {
+    if (!leftShowsActiveEpisodes) return
+    if (deskEpisodeFocus || deskUserFocus) {
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+    }
+  }, [
+    leftShowsActiveEpisodes,
+    deskEpisodeFocus,
+    deskUserFocus,
+    setLogCollapsedPersist,
+  ])
 
   // When asset class changes while settings are open, swap threshold + episode-rule drafts
   useEffect(() => {
     if (rightRailMode !== 'settings') return
-    const cls = thresholdClassKey(assetClassTab)
+    const cls = thresholdClassKey(assetClassTab || 'equity')
     const snapByClass = (
       status?.config?.thresholdSnapshot as
         | { byClass?: Record<string, Record<string, number | null>> }
@@ -6190,8 +7349,10 @@ export function SndkMomentumPanel({
     setPolicySaveState('idle')
   }, [assetClassTab, rightRailMode, status?.config?.thresholdSnapshot, status?.config?.episodePolicy])
 
-  // Active episode on this ticker → jump straight to Recent Events (keep saved width)
+  // Active episode on this ticker → Recent Events rail (skip when desk is in
+  // episodes-first mode with Yahoo chart in the third column).
   useEffect(() => {
+    if (leftShowsActiveEpisodes || rightRailMode === 'yahoo') return
     const ep = status?.episode
     if (!ep) return
     const st = String(ep.status || 'ACTIVE').toUpperCase()
@@ -6199,6 +7360,8 @@ export function SndkMomentumPanel({
     if (!isIntradayOr24hEventWindow(ep.detectedWindow)) return
     openEventsInLogColumn()
   }, [
+    leftShowsActiveEpisodes,
+    rightRailMode,
     displayTicker,
     status?.episode?.episodeId,
     status?.episode?.episodeStartedAt,
@@ -6218,7 +7381,14 @@ export function SndkMomentumPanel({
         const drag = rightRailDragRef.current
         if (!drag) return
         // Handle is on the left edge of the rail → drag left = wider
-        lastW = Math.min(520, Math.max(240, drag.startW + (drag.startX - ev.clientX)))
+        const maxW = rightRailMaxWidth()
+        lastW = Math.min(
+          maxW,
+          Math.max(
+            RIGHT_RAIL_MIN_WIDTH,
+            drag.startW + (drag.startX - ev.clientX),
+          ),
+        )
         setRightRailWidth(lastW)
       }
       const onUp = () => {
@@ -6237,10 +7407,51 @@ export function SndkMomentumPanel({
     [rightRailWidth],
   )
 
-  const load = useCallback(async () => {
-    const path = momentumApiPath(displayTicker)
+  const loadLive = useCallback(async () => {
+    const path = `${momentumApiPath(displayTicker)}/live`
     try {
-      const res = await fetch(path)
+      const res = await deskFetch(path)
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+      if (!res.ok || body?.ok === false) return
+      setStatus((prev) => {
+        if (!prev) return prev
+        const episode = (body.episode as MomentumStatus['episode']) || null
+        return {
+          ...prev,
+          lastFetchAt:
+            typeof body.lastFetchAt === 'string'
+              ? body.lastFetchAt
+              : prev.lastFetchAt,
+          snapshot: {
+            ...(prev.snapshot || {}),
+            currentPrice:
+              body.livePrice != null
+                ? Number(body.livePrice)
+                : prev.snapshot?.currentPrice,
+            marketSession:
+              (body.marketSession as string) || prev.snapshot?.marketSession,
+            returns: {
+              ...(prev.snapshot?.returns || {}),
+              day:
+                body.dayReturn != null
+                  ? Number(body.dayReturn)
+                  : prev.snapshot?.returns?.day,
+            },
+          },
+          episode: episode || prev.episode,
+        }
+      })
+    } catch {
+      /* keep last status */
+    }
+  }, [displayTicker])
+
+  const load = useCallback(async () => {
+    // Ticker switch: hydrate this ticker's latest episodes/events from Supabase.
+    const path = `${momentumApiPath(displayTicker)}?refresh=1`
+    setTickerUpdatingFromSupabase(true)
+    try {
+      const res = await deskFetch(path)
       const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
       if (!res.ok) {
         setError(await toUiError('Failed to load status', res, body, 'Failed to load', path))
@@ -6248,6 +7459,7 @@ export function SndkMomentumPanel({
       }
       const next = body as unknown as MomentumStatus
       setStatus(next)
+      writeTickerStatusCache(displayTicker, next)
       setError(null)
       // Sync threshold inputs when panel closed (avoid fighting while typing)
       setThresholdDraft((prev) => {
@@ -6292,8 +7504,52 @@ export function SndkMomentumPanel({
       })
     } finally {
       setLoading(false)
+      setTickerUpdatingFromSupabase(false)
     }
   }, [displayTicker, rightRailMode])
+
+  /** Settings → Clear Cache: wipe client + server RAM, then rehydrate from Supabase. */
+  const clearDeskCache = useCallback(async () => {
+    const ok = window.confirm(
+      'Clear desk cache?\n\nThis wipes local cache + server RAM (episodes/events/logs), then reloads fresh history from Supabase.',
+    )
+    if (!ok) return
+    clearDeskLocalCaches()
+    setAllEpisodesList([])
+    setActiveEpisodesList([])
+    setAllEpisodesTotal(0)
+    setAllEpisodesHasMore(false)
+    setAllEpisodesNextOffset(null)
+    setAllEpisodesFetchedAt('')
+    setAllEpisodesError('')
+    setActiveEpisodesError('')
+    setEpisodeByTicker({})
+    setStatus(null)
+    setLoading(true)
+    setAllEpisodesUpdatingFromSupabase(true)
+    setTickerUpdatingFromSupabase(true)
+    try {
+      const res = await deskFetch('/api/momentum/clear-cache', {
+        method: 'POST',
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok || !body?.ok) {
+        throw new Error(body?.error || `Clear cache failed (${res.status})`)
+      }
+      await Promise.all([
+        loadAllEpisodesHistory({ refresh: true }),
+        loadActiveEpisodesList({ refresh: true }),
+        load(),
+      ])
+    } catch (err) {
+      window.alert(
+        err instanceof Error ? err.message : 'Failed to clear cache',
+      )
+      setLoading(false)
+      setAllEpisodesUpdatingFromSupabase(false)
+      setTickerUpdatingFromSupabase(false)
+    }
+  }, [load, loadActiveEpisodesList, loadAllEpisodesHistory])
 
   // Re-apply last saved thresholds after reload so the engine matches the UI.
   useEffect(() => {
@@ -6301,7 +7557,7 @@ export function SndkMomentumPanel({
     if (!Object.keys(local).length) return
     const thresholds = thresholdsFromDraft(local)
     if (!Object.keys(thresholds).length) return
-    void fetch('/api/momentum/thresholds', {
+    void deskFetch('/api/momentum/thresholds', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ thresholds }),
@@ -6317,7 +7573,7 @@ export function SndkMomentumPanel({
       setPplxUsageError('')
     }
     try {
-      const res = await fetch('/api/notifications/usage/perplexity?days=90')
+      const res = await deskFetch('/api/notifications/usage/perplexity?days=90')
       const body = await res.json().catch(() => ({}))
       if (!res.ok) {
         throw new Error(body.error || `Failed (${res.status})`)
@@ -6361,7 +7617,7 @@ export function SndkMomentumPanel({
       .filter(Boolean) as string[]
     const tickers = [...new Set([...fromLocal, ...fromMonitored, displayTicker].filter(Boolean))]
     if (!tickers.length) return
-    void fetch('/api/momentum/watch', {
+    void deskFetch('/api/momentum/watch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -6377,7 +7633,7 @@ export function SndkMomentumPanel({
   useEffect(() => {
     let cancelled = false
     const loadOverview = () => {
-      void fetch(`/api/momentum?_=${Date.now()}`)
+      void deskFetch(`/api/momentum?_=${Date.now()}`)
         .then((res) => res.json().catch(() => ({})))
         .then((body) => {
           if (cancelled || !body?.ok) return
@@ -6446,25 +7702,31 @@ export function SndkMomentumPanel({
     }))
   }, [displayTicker, status?.episode])
 
-  // Clear status when switching tabs so we don't flash the previous ticker
+  // Prefer cached ticker status immediately; avoid blank flash while Supabase hydrates.
   useEffect(() => {
-    setStatus(null)
-    setLoading(true)
+    const cached = readTickerStatusCache(displayTicker)
+    if (cached) {
+      setStatus(cached)
+      setLoading(false)
+    } else {
+      setStatus(null)
+      setLoading(true)
+    }
     setError(null)
     prevLogLen.current = 0
   }, [displayTicker])
 
   useEffect(() => {
     void load()
-    const id = setInterval(() => void load(), 3_000)
+    const id = setInterval(() => void loadLive(), 3_000)
     return () => clearInterval(id)
-  }, [load])
+  }, [load, loadLive])
 
   // Kick a Yahoo tick when landing on a tab so returns/episode populate quickly
   // (background loop covers the full watchlist on its own cadence)
   useEffect(() => {
     let cancelled = false
-    void fetch(momentumApiPath(displayTicker, 'tick'), { method: 'POST' })
+    void deskFetch(momentumApiPath(displayTicker, 'tick'), { method: 'POST' })
       .then((res) => res.json().catch(() => ({})))
       .then((body) => {
         if (cancelled) return
@@ -6606,7 +7868,7 @@ export function SndkMomentumPanel({
     setBusy(true)
     const path = momentumApiPath(displayTicker, 'tick')
     try {
-      const res = await fetch(path, { method: 'POST' })
+      const res = await deskFetch(path, { method: 'POST' })
       const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
       if (!res.ok || body.ok === false) {
         if (body.status) setStatus(body.status as MomentumStatus)
@@ -6661,7 +7923,7 @@ export function SndkMomentumPanel({
     setThresholdSaveState('saving')
     try {
       saveLocalThresholdDraft(draft, assetClass)
-      const res = await fetch(path, {
+      const res = await deskFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -6753,7 +8015,7 @@ export function SndkMomentumPanel({
     setPolicySaving(true)
     setPolicySaveState('saving')
     try {
-      const res = await fetch(path, {
+      const res = await deskFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -7060,7 +8322,7 @@ export function SndkMomentumPanel({
     setAlertDevicesLoading(true)
     setAlertDevicesError('')
     try {
-      const res = await fetch(
+      const res = await deskFetch(
         `/api/notifications/devices?app=trigger&_=${Date.now()}`,
       )
       const body = await res.json().catch(() => ({}))
@@ -7117,7 +8379,7 @@ export function SndkMomentumPanel({
     setStartEpisodeError('')
     const path = momentumApiPath(displayTicker, 'start-episode')
     try {
-      const res = await fetch(path, {
+      const res = await deskFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ windowKey }),
@@ -7220,7 +8482,7 @@ export function SndkMomentumPanel({
         const sessionCode2 =
           status?.snapshot?.marketSession || sessionFromQuote || null
         const windowLabel = returnKeyDisplayLabel(windowKey, sessionCode2)
-        const res = await fetch('/api/notifications/momentum-research', {
+        const res = await deskFetch('/api/notifications/momentum-research', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -7244,6 +8506,7 @@ export function SndkMomentumPanel({
               null,
             market_session: sessionCode2,
             asset_class: activeAssetClass,
+            episode_id: status?.episode?.episodeId || deskEpisodeFocus?.episodeId || null,
             phase: 'prepare',
             // Reuse partner/user edits for this asset class
             prompt_template: savedTemplate || undefined,
@@ -7362,7 +8625,7 @@ export function SndkMomentumPanel({
       const savedTemplate = loadResearchPromptTemplate(
         base.asset_class || activeAssetClass,
       )
-      const prepRes = await fetch('/api/notifications/momentum-research', {
+      const prepRes = await deskFetch('/api/notifications/momentum-research', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -7412,7 +8675,7 @@ export function SndkMomentumPanel({
       )
 
       // 2) Perplexity Sonar
-      const res = await fetch('/api/notifications/momentum-research', {
+      const res = await deskFetch('/api/notifications/momentum-research', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -7486,7 +8749,7 @@ export function SndkMomentumPanel({
       })
       if (body.supabase_save && body.supabase_save.ok === false) {
         setAlertResearchError(
-          `Research OK, but Supabase save failed: ${body.supabase_save.error || 'unknown'}. Run schema_momentum_research_tables.sql if tables are missing.`,
+          `Research OK, but Supabase save failed: ${body.supabase_save.error || 'unknown'}.`,
         )
       }
       // Refresh spend chip after each research call
@@ -7494,7 +8757,7 @@ export function SndkMomentumPanel({
 
       // Record "Perplexity done" on the Recent Events timeline (after backend event)
       try {
-        const tlRes = await fetch(
+        const tlRes = await deskFetch(
           momentumApiPath(displayTicker, 'timeline-event'),
           {
             method: 'POST',
@@ -7553,17 +8816,20 @@ export function SndkMomentumPanel({
   /**
    * Manually end / exit a live momentum episode (no push).
    * Defaults to the focused ticker; pass `ticker` from the Active episodes rail.
+   * Pass `skipConfirm` when bulk-ending from “End all”.
    */
   async function endActiveEpisode(opts?: {
     ticker?: string
     direction?: string | null
     peakMovePercent?: number | null
-  }) {
-    if (endingEpisode) return
+    skipConfirm?: boolean
+    skipRefreshList?: boolean
+  }): Promise<boolean> {
+    if (endingEpisode && !opts?.skipConfirm) return false
     const symbol = String(opts?.ticker || displayTicker || '')
       .trim()
       .toUpperCase()
-    if (!symbol) return
+    if (!symbol) return false
     const dir =
       opts?.direction ||
       (symbol === displayTicker.toUpperCase() ? episode?.direction : null) ||
@@ -7577,17 +8843,19 @@ export function SndkMomentumPanel({
           ? Number(episode.peakMovePercent)
           : null
     const peak = peakRaw != null ? fmtPct(peakRaw) : ''
-    const ok = window.confirm(
-      `End the active ${dir} episode for ${symbol}?${
-        peak ? `\nPeak so far: ${peak}` : ''
-      }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
-    )
-    if (!ok) return
+    if (!opts?.skipConfirm) {
+      const ok = window.confirm(
+        `End the active ${dir} episode for ${symbol}?${
+          peak ? `\nPeak so far: ${peak}` : ''
+        }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
+      )
+      if (!ok) return false
+    }
 
     setEndingEpisode(true)
     setEndingEpisodeTicker(symbol)
     try {
-      const res = await fetch(momentumApiPath(symbol, 'end-episode'), {
+      const res = await deskFetch(momentumApiPath(symbol, 'end-episode'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'MANUAL' }),
@@ -7609,13 +8877,76 @@ export function SndkMomentumPanel({
           (row) => String(row.ticker || '').toUpperCase() !== symbol,
         ),
       )
-      if (rightRailMode === 'activeEpisodes') {
-        void loadActiveEpisodesList({ refresh: true })
+      if (rightRailMode === 'activeEpisodes' && !opts?.skipRefreshList) {
+        void loadActiveEpisodesList()
       }
+      return true
     } catch (err) {
       window.alert(
         err instanceof Error ? err.message : 'Failed to end episode',
       )
+      return false
+    } finally {
+      setEndingEpisode(false)
+      setEndingEpisodeTicker(null)
+    }
+  }
+
+  /** End every live episode shown in the Active episodes rail (one confirm, no pushes). */
+  async function endAllActiveEpisodes() {
+    if (endingEpisode) return
+    const rows = activeEpisodesList.filter((row) => {
+      const st = String(row.status || row.state || 'ACTIVE').toUpperCase()
+      return st === 'ACTIVE' && String(row.ticker || '').trim()
+    })
+    if (!rows.length) return
+    const ok = window.confirm(
+      `End all ${rows.length} active episode${rows.length === 1 ? '' : 's'}?\n\nThis only closes tracking — no push is sent. New episodes can start on the next threshold cross.`,
+    )
+    if (!ok) return
+
+    setEndingEpisode(true)
+    const failed: string[] = []
+    try {
+      for (const row of rows) {
+        const symbol = String(row.ticker || '').trim().toUpperCase()
+        if (!symbol) continue
+        setEndingEpisodeTicker(symbol)
+        try {
+          const res = await deskFetch(momentumApiPath(symbol, 'end-episode'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'MANUAL' }),
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok) {
+            throw new Error(body.error || `End failed (${res.status})`)
+          }
+          if (symbol === displayTicker.toUpperCase()) {
+            if (body?.status) setStatus(body.status as MomentumStatus)
+            else void load()
+          }
+          setEpisodeByTicker((prev) => ({
+            ...prev,
+            [symbol]: null,
+          }))
+          setActiveEpisodesList((prev) =>
+            prev.filter(
+              (r) => String(r.ticker || '').toUpperCase() !== symbol,
+            ),
+          )
+        } catch (err) {
+          failed.push(
+            `${symbol}: ${err instanceof Error ? err.message : 'failed'}`,
+          )
+        }
+      }
+      await loadActiveEpisodesList()
+      if (failed.length) {
+        window.alert(
+          `Ended with ${failed.length} error${failed.length === 1 ? '' : 's'}:\n\n${failed.slice(0, 8).join('\n')}${failed.length > 8 ? '\n…' : ''}`,
+        )
+      }
     } finally {
       setEndingEpisode(false)
       setEndingEpisodeTicker(null)
@@ -7656,7 +8987,7 @@ export function SndkMomentumPanel({
     setEpisodeEventDeletingIdx(idx)
     setEpisodeEditError('')
     try {
-      const res = await fetch(
+      const res = await deskFetch(
         momentumApiPath(displayTicker, 'delete-episode-event'),
         {
           method: 'POST',
@@ -7761,7 +9092,7 @@ export function SndkMomentumPanel({
         reason: ev.reason || null,
         detectedWindow: ev.detectedWindow || null,
       }))
-      const res = await fetch(
+      const res = await deskFetch(
         momentumApiPath(displayTicker, 'edit-episode'),
         {
           method: 'POST',
@@ -7828,8 +9159,8 @@ export function SndkMomentumPanel({
     const ok = window.confirm(
       `Delete episode ${label} (${dir}, ${st}) for ${displayTicker}?\n\n` +
         `This permanently removes it from Supabase:\n` +
-        `• momentum_episodes\n` +
-        `• momentum_episode_events\n\n` +
+        `• episodes (class table)\n` +
+        `• episodes_events\n\n` +
         `episode_id: ${episodeId}\n\n` +
         `This cannot be undone.`,
     )
@@ -7837,7 +9168,7 @@ export function SndkMomentumPanel({
 
     setDeletingEpisodeId(episodeId)
     try {
-      const res = await fetch(
+      const res = await deskFetch(
         momentumApiPath(displayTicker, 'delete-episode'),
         {
           method: 'POST',
@@ -7894,7 +9225,7 @@ export function SndkMomentumPanel({
     setAlertSendMessage('')
     setAlertSendError(false)
     try {
-      const res = await fetch('/api/notifications/alert-news', {
+      const res = await deskFetch('/api/notifications/alert-news', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -7919,7 +9250,7 @@ export function SndkMomentumPanel({
       // Record "Alert sent" on the Recent Events timeline (after Perplexity)
       try {
         const base = researchPayloadBase()
-        const tlRes = await fetch(
+        const tlRes = await deskFetch(
           momentumApiPath(displayTicker, 'timeline-event'),
           {
             method: 'POST',
@@ -7979,138 +9310,300 @@ export function SndkMomentumPanel({
     >
       {/* ── Full-height split: left rail | detail (+ log) ── */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Column 1 — asset icons + label + count + entity list */}
+        {/* Column 1 — active episodes (default) or asset-class entity list */}
         <aside className="flex w-[min(100%,16.5rem)] shrink-0 flex-col border-r border-border bg-background sm:w-64">
           <div className="flex shrink-0 flex-col px-2 pt-2">
             {/* Class label + list tabs + entities (asset switcher is bottom-center) */}
             <div className="flex items-start justify-between gap-2 px-1 pb-1">
               <div className="min-w-0">
                 <p className="truncate text-sm font-semibold leading-tight">
-                  {ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label ||
-                    'Stocks'}
+                  {leftShowsActiveEpisodes
+                    ? deskUsersMode
+                      ? 'Users'
+                      : 'Active episodes'
+                    : ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
+                        ?.label || 'Stocks'}
                 </p>
                 <p
                   className="truncate text-[11px] tabular-nums text-muted-foreground"
                   title={
-                    activeListTab === 'watchlist' && monitoredSourceTable
-                      ? `Source · ${monitoredSourceTable} (enabled subscribers)`
+                    !leftShowsActiveEpisodes && monitoredSourceTable
+                      ? `Source · ${monitoredSourceTable} + momentum episodes`
                       : undefined
                   }
                 >
-                  {activeListTab === 'watchlist' &&
-                  monitoredLoading &&
-                  !displayedEntities.length
-                    ? 'Loading subscribers…'
-                    : mostActivesLoading && !displayedEntities.length
-                      ? 'Loading Yahoo…'
-                      : `${displayedEntities.length} ${
-                          availableListTabs.find((t) => t.id === activeListTab)
-                            ?.label
-                            .toLowerCase() || 'entities'
-                        }${
-                          activeListTab === 'watchlist' && monitoredSourceTable
-                            ? ` · monitored`
-                            : ''
-                        }`}
+                  {leftShowsActiveEpisodes
+                    ? deskUsersMode
+                      ? deskDevicesLoading && !deskDevices.length
+                        ? 'Loading users…'
+                        : `${deskDevices.length} device${deskDevices.length === 1 ? '' : 's'}`
+                      : activeEpisodesUpdatingFromSupabase
+                        ? 'Updating from Supabase…'
+                        : activeEpisodesLoading && !activeEpisodesList.length
+                          ? 'Loading episodes…'
+                          : `${activeEpisodesList.length} live`
+                    : entityListLoading
+                      ? `Loading ${(
+                          ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
+                            ?.label || 'tickers'
+                        ).toLowerCase()}…`
+                      : `${displayedEntities.length} ticker${
+                          displayedEntities.length === 1 ? '' : 's'
+                        }${monitoredSourceTable ? ' · monitored' : ''}`}
                 </p>
               </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="icon-sm"
-                onClick={() => setAddOpen((o) => !o)}
-                title="Add entity"
-                aria-label="Add entity"
-              >
-                <Plus className="size-3.5" strokeWidth={2.25} />
-              </Button>
+              {!leftShowsActiveEpisodes ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  onClick={() => setAddOpen((o) => !o)}
+                  title="Add entity"
+                  aria-label="Add entity"
+                >
+                  <Plus className="size-3.5" strokeWidth={2.25} />
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  onClick={() =>
+                    deskUsersMode
+                      ? void loadDeskDevices()
+                      : void loadActiveEpisodesList({ refresh: true })
+                  }
+                  title={
+                    deskUsersMode
+                      ? 'Refresh users'
+                      : 'Refresh active episodes'
+                  }
+                  aria-label={
+                    deskUsersMode
+                      ? 'Refresh users'
+                      : 'Refresh active episodes'
+                  }
+                  disabled={
+                    deskUsersMode
+                      ? deskDevicesLoading
+                      : activeEpisodesLoading ||
+                        activeEpisodesUpdatingFromSupabase
+                  }
+                >
+                  {(deskUsersMode
+                    ? deskDevicesLoading
+                    : activeEpisodesLoading ||
+                      activeEpisodesUpdatingFromSupabase) ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-3.5" strokeWidth={2.25} />
+                  )}
+                </Button>
+              )}
             </div>
-            <TooltipProvider delayDuration={200}>
+            {leftShowsActiveEpisodes ? (
               <div
-                className="mb-1 flex w-full items-center justify-between gap-0.5 rounded-full border border-border bg-muted p-0.5"
+                className="mb-1 flex w-full items-center gap-0.5 rounded-full border border-border bg-muted p-0.5"
                 role="tablist"
-                aria-label="Market list"
+                aria-label="Desk left tabs"
               >
-                {availableListTabs.map((tab) => {
-                  const active = activeListTab === tab.id
-                  const Icon = tab.Icon
-                  const hover = marketListTabHover(tab)
-                  return (
-                    <Tooltip key={tab.id}>
-                      <TooltipTrigger asChild>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={active}
-                          aria-label={tab.label}
-                          onClick={() => setMarketListTab(tab.id)}
-                          className={cn(
-                            'inline-flex size-7 flex-1 items-center justify-center rounded-full transition-colors',
-                            active
-                              ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
-                              : 'text-muted-foreground hover:text-foreground',
-                          )}
-                        >
-                          <Icon className="size-3.5" strokeWidth={1.75} />
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="bottom"
-                        align="center"
-                        className="flex max-w-[18rem] flex-col items-stretch gap-1.5 px-2.5 py-2"
-                      >
-                        <p className="text-[12px] font-semibold leading-tight text-background">
-                          {hover.title}
-                        </p>
-                        {hover.blurb ? (
-                          <p className="text-[10px] leading-snug text-background/75">
-                            {hover.blurb}
-                          </p>
-                        ) : null}
-                        {hover.rows.length ? (
-                          <ul className="flex flex-col gap-1.5 border-t border-background/15 pt-1.5">
-                            {hover.rows.map((row) => (
-                              <li
-                                key={`${row.kind}-${row.label}`}
-                                className="flex min-w-0 items-start gap-1.5"
-                              >
-                                <span className="mt-0.5 inline-flex size-4 shrink-0 items-center justify-center text-background">
-                                  <MarketListHoverKindIcon kind={row.kind} />
-                                </span>
-                                <span className="min-w-0 flex-1">
-                                  <span className="block text-[11px] font-semibold leading-tight text-background">
-                                    {row.label}
-                                  </span>
-                                  <span className="mt-0.5 block font-mono text-[9px] leading-snug text-background/65">
-                                    {row.detail}
-                                  </span>
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        ) : null}
-                      </TooltipContent>
-                    </Tooltip>
-                  )
-                })}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={!deskUsersMode}
+                  onClick={() => {
+                    setDeskLeftTab('episodes')
+                    setDeskUserFocus(null)
+                  }}
+                  className={cn(
+                    'flex-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
+                    !deskUsersMode
+                      ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  Active episodes
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={deskUsersMode}
+                  onClick={() => {
+                    setDeskLeftTab('users')
+                    setDeskEpisodeFocus(null)
+                    setRightRailMode('yahoo')
+                    setLogCollapsedPersist(false)
+                    void loadDeskDevices()
+                  }}
+                  className={cn(
+                    'flex-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
+                    deskUsersMode
+                      ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  Users
+                </button>
               </div>
-            </TooltipProvider>
+            ) : null}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="space-y-0.5 px-2 pb-2 pt-1">
-              {mostActivesError && !displayedEntities.length ? (
-                <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                  {mostActivesError}
-                </p>
+              {deskUsersMode ? (
+                deskDevicesError ? (
+                  <p className="px-2 py-6 text-center text-xs text-destructive">
+                    {deskDevicesError}
+                  </p>
+                ) : deskDevicesLoading && !deskDevices.length ? (
+                  <div className="flex items-center justify-center gap-2 px-2 py-8 text-xs text-muted-foreground">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Loading users…
+                  </div>
+                ) : !deskDevices.length ? (
+                  <div className="space-y-1 px-2 py-8 text-center">
+                    <Users
+                      className="mx-auto size-5 text-muted-foreground/70"
+                      strokeWidth={1.5}
+                    />
+                    <p className="text-xs font-medium text-foreground">
+                      No users yet
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Trigger devices with monitored tickers appear here.
+                    </p>
+                  </div>
+                ) : (
+                  deskDevices.map((device) => {
+                    const key = deskDeviceKey(device)
+                    const active =
+                      deskUserFocus != null &&
+                      deskDeviceKey(deskUserFocus) === key
+                    return (
+                      <DeskUserListButton
+                        key={key || String(device.expo_push_token)}
+                        device={device}
+                        active={active}
+                        onClick={() => selectDeskUser(device)}
+                      />
+                    )
+                  })
+                )
+              ) : leftShowsActiveEpisodes ? (
+                activeEpisodesError ? (
+                  <p className="px-2 py-6 text-center text-xs text-destructive">
+                    {activeEpisodesError}
+                  </p>
+                ) : activeEpisodesLoading && !activeEpisodesList.length ? (
+                  <div className="flex items-center justify-center gap-2 px-2 py-8 text-xs text-muted-foreground">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Loading active episodes…
+                  </div>
+                ) : !activeEpisodesList.length ? (
+                  <div className="space-y-1 px-2 py-8 text-center">
+                    <Activity
+                      className="mx-auto size-5 text-muted-foreground/70"
+                      strokeWidth={1.5}
+                    />
+                    <p className="text-xs font-medium text-foreground">
+                      No active episodes
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Live momentum episodes across all asset classes appear
+                      here. Pick Stocks / Crypto / … below to browse markets.
+                    </p>
+                  </div>
+                ) : (
+                  activeEpisodesList.map((row) => {
+                    const ticker = String(row.ticker || '')
+                      .trim()
+                      .toUpperCase()
+                    const active =
+                      ticker === String(displayTicker || '').toUpperCase()
+                    const dirUp = row.direction !== 'DOWN'
+                    const move =
+                      row.currentMovePercent ?? row.peakMovePercent ?? null
+                    const no = formatEpisodeNo(row.episodeNo)
+                    return (
+                      <Button
+                        key={String(
+                          row.episodeId ||
+                            `${ticker}-${row.episodeStartedAt || ''}`,
+                        )}
+                        type="button"
+                        variant="ghost"
+                        data-pill="false"
+                        onClick={() => selectActiveEpisodeFromLeft(row)}
+                        className={cn(
+                          'h-auto min-h-10 w-full justify-start gap-2 rounded-lg px-2 py-1.5 text-left',
+                          active && 'bg-muted hover:bg-muted',
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            'size-1.5 shrink-0 rounded-full',
+                            dirUp ? 'bg-emerald-500' : 'bg-rose-500',
+                          )}
+                          aria-hidden
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            <span className="truncate text-[12px] font-semibold tracking-tight">
+                              {ticker}
+                            </span>
+                            {no ? (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">
+                                {no}
+                              </span>
+                            ) : null}
+                          </span>
+                          <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">
+                            {String(row.direction || '—')} ·{' '}
+                            {row.detectedWindow || '—'}
+                            {row.state
+                              ? ` · ${String(row.state).replace(/^MOMENTUM_/, '')}`
+                              : ''}
+                          </span>
+                        </span>
+                        <span
+                          className={cn(
+                            'shrink-0 text-[11px] font-semibold tabular-nums',
+                            dirUp
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-rose-600 dark:text-rose-400',
+                          )}
+                        >
+                          {move == null || !Number.isFinite(Number(move))
+                            ? '—'
+                            : `${Number(move) > 0 ? '+' : ''}${Number(move).toFixed(2)}%`}
+                        </span>
+                      </Button>
+                    )
+                  })
+                )
+              ) : entityListLoading ? (
+                <div className="flex items-center justify-center gap-2 px-2 py-8 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  Loading{' '}
+                  {(
+                    ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label ||
+                    'tickers'
+                  ).toLowerCase()}
+                  …
+                </div>
               ) : displayedEntities.length === 0 ? (
-                <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                  {mostActivesLoading
-                    ? 'Loading Yahoo most active…'
-                    : `No ${(
-                        ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
-                          ?.label || 'items'
-                      ).toLowerCase()} yet. Tap + to add.`}
-                </p>
+                <div className="space-y-1 px-2 py-8 text-center">
+                  <p className="text-xs font-medium text-foreground">
+                    No{' '}
+                    {(
+                      ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
+                        ?.label || 'items'
+                    ).toLowerCase()}{' '}
+                    yet
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Showing device-monitored tickers and momentum episodes only.
+                  </p>
+                </div>
               ) : (
                 displayedEntities.map((tab) => {
                   const dayPct = tabDayPct(tab.ticker)
@@ -8329,9 +9822,380 @@ export function SndkMomentumPanel({
         {/* Right stack: detail · optional log */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-        {/* Column 2 — selected entity detail */}
-        <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+        {/* Column 2 — users activity · all episodes · or focused episode detail */}
+        <div className="mom-hide-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto">
+          {deskUsersMode ? (
+            <DeskUserActivitiesPanel
+              device={deskUserFocus}
+              pushActivities={deskUserActivities}
+              loading={deskUserActivitiesLoading}
+            />
+          ) : showAllEpisodesCenter ? (
+            <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+              <div className="mb-3 flex shrink-0 items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold tracking-tight">
+                    All episodes
+                  </h2>
+                  <p className="text-[12px] text-muted-foreground">
+                    History + live across tickers · click a left active episode
+                    for full detail
+                    {filteredAllEpisodesList.length
+                      ? ` · ${filteredAllEpisodesList.length} shown`
+                      : ''}
+                    {allEpisodesTotal > filteredAllEpisodesList.length
+                      ? ` of ${allEpisodesTotal}`
+                      : allEpisodesQuery.trim() &&
+                          filteredAllEpisodesList.length !==
+                            allEpisodesList.length
+                        ? ` of ${allEpisodesList.length}`
+                        : ''}
+                    {activeEpisodesList.length
+                      ? ` · ${activeEpisodesList.length} live now`
+                      : ''}
+                    {allEpisodesFetchedAt
+                      ? ` · live ${new Date(allEpisodesFetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                      : ''}
+                  </p>
+                  <UpdatingFromSupabaseNote
+                    show={allEpisodesUpdatingFromSupabase}
+                    className="mt-1"
+                  />
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {allEpisodesSearchOpen ? (
+                    <div className="relative">
+                      <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={allEpisodesQuery}
+                        onChange={(e) => setAllEpisodesQuery(e.target.value)}
+                        placeholder="Ticker…"
+                        aria-label="Search All episodes by ticker"
+                        className="h-7 w-[8.5rem] pl-7 pr-7 text-[12px]"
+                        autoFocus
+                      />
+                      {allEpisodesQuery ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          className="absolute right-0.5 top-1/2 size-6 -translate-y-1/2"
+                          aria-label="Clear ticker search"
+                          onClick={() => setAllEpisodesQuery('')}
+                        >
+                          <X className="size-3" />
+                        </Button>
+                      ) : (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          className="absolute right-0.5 top-1/2 size-6 -translate-y-1/2"
+                          aria-label="Close ticker search"
+                          onClick={() => {
+                            setAllEpisodesSearchOpen(false)
+                            setAllEpisodesQuery('')
+                          }}
+                        >
+                          <X className="size-3" />
+                        </Button>
+                      )}
+                    </div>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="outline"
+                      className="size-7"
+                      title="Search by ticker"
+                      aria-label="Search All episodes by ticker"
+                      onClick={() => setAllEpisodesSearchOpen(true)}
+                    >
+                      <Search className="size-3.5" />
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 shrink-0 gap-1.5"
+                    disabled={
+                      allEpisodesLoading || allEpisodesUpdatingFromSupabase
+                    }
+                    title="Force refresh from Supabase"
+                    onClick={() => void loadAllEpisodesHistory({ refresh: true })}
+                  >
+                    {allEpisodesLoading || allEpisodesUpdatingFromSupabase ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="size-3.5" />
+                    )}
+                    Refresh
+                  </Button>
+                </div>
+              </div>
+
+              {allEpisodesError ? (
+                <p className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
+                  {allEpisodesError}
+                </p>
+              ) : null}
+
+              {allEpisodesLoading &&
+              !allEpisodesList.length &&
+              !allEpisodesUpdatingFromSupabase ? (
+                <div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  Loading episodes…
+                </div>
+              ) : allEpisodesUpdatingFromSupabase && !allEpisodesList.length ? (
+                <div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  Updating from Supabase…
+                </div>
+              ) : !allEpisodesList.length ? (
+                <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-center">
+                  <Activity
+                    className="size-6 text-muted-foreground/70"
+                    strokeWidth={1.5}
+                  />
+                  <p className="text-sm font-medium">No episodes yet</p>
+                  <p className="max-w-sm text-[12px] text-muted-foreground">
+                    When momentum episodes open or close, they appear here. Live
+                    actives also show in the left column.
+                  </p>
+                </div>
+              ) : (
+                <>
+              {!filteredAllEpisodesList.length ? (
+                <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-center">
+                  <Search
+                    className="size-6 text-muted-foreground/70"
+                    strokeWidth={1.5}
+                  />
+                  <p className="text-sm font-medium">No matching tickers</p>
+                  <p className="max-w-sm text-[12px] text-muted-foreground">
+                    No episodes match “{allEpisodesQuery.trim()}”. Clear search
+                    to see the full list.
+                  </p>
+                </div>
+              ) : (
+                <TooltipProvider delayDuration={200}>
+                <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-auto rounded-xl border border-border">
+                  <table className="w-full text-left text-[12px]">
+                    <thead className="sticky top-0 z-10 bg-muted/80 backdrop-blur">
+                      <tr className="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground">
+                        <th className="px-3 py-2 font-semibold">Ticker</th>
+                        <th className="px-2 py-2 font-semibold">Episode</th>
+                        <th className="px-2 py-2 font-semibold">Status</th>
+                        <th className="px-2 py-2 font-semibold">Window</th>
+                        <th className="px-2 py-2 text-right font-semibold">
+                          Move
+                        </th>
+                        <th className="px-3 py-2 text-right font-semibold">
+                          Started
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredAllEpisodesList.map((row) => {
+                        const ticker = String(row.ticker || '')
+                          .trim()
+                          .toUpperCase()
+                        const isLive =
+                          String(row.status || '').toUpperCase() === 'ACTIVE'
+                        const up = row.direction !== 'DOWN'
+                        const move =
+                          row.currentMovePercent ??
+                          row.peakMovePercent ??
+                          row.initialMovePercent ??
+                          null
+                        const moveKind: 'current' | 'peak' | 'initial' =
+                          row.currentMovePercent != null &&
+                          Number.isFinite(Number(row.currentMovePercent))
+                            ? 'current'
+                            : row.peakMovePercent != null &&
+                                Number.isFinite(Number(row.peakMovePercent))
+                              ? 'peak'
+                              : 'initial'
+                        const no = formatEpisodeNo(row.episodeNo)
+                        const subCount =
+                          subscriberCountByTicker.get(ticker) ?? null
+                        const quote =
+                          watchQuotes[ticker] ||
+                          watchQuotes[ticker.toUpperCase()] ||
+                          null
+                        const rowSelected = deskEpisodeRowsMatch(
+                          row,
+                          deskEpisodeFocus,
+                        )
+                        const moveLabel =
+                          move == null || !Number.isFinite(Number(move))
+                            ? '—'
+                            : `${Number(move) > 0 ? '+' : ''}${Number(move).toFixed(2)}%`
+                        return (
+                          <tr
+                            key={`${row.episodeId || ticker}-${row.episodeNo || row.episodeStartedAt}`}
+                            data-episode-nav-key={deskEpisodeNavKey(row)}
+                            className={cn(
+                              'cursor-pointer border-b border-border/60 transition-colors last:border-0 hover:bg-muted/50',
+                              rowSelected && 'bg-muted/70',
+                            )}
+                            onClick={() => selectActiveEpisodeFromLeft(row)}
+                          >
+                            <td className="px-3 py-2 font-medium">
+                              <span className="inline-flex min-w-0 items-center gap-2">
+                                <CompanyLogo
+                                  ticker={ticker}
+                                  companyName={
+                                    quote?.longName ||
+                                    quote?.shortName ||
+                                    ticker
+                                  }
+                                  quote={quote}
+                                  size="sm"
+                                />
+                                <span
+                                  className={cn(
+                                    'size-1.5 shrink-0 rounded-full',
+                                    up ? 'bg-emerald-500' : 'bg-rose-500',
+                                  )}
+                                  aria-hidden
+                                />
+                                <span className="truncate text-[13px] font-semibold tracking-tight">
+                                  {ticker}
+                                </span>
+                                {subCount != null ? (
+                                  <Badge
+                                    variant="secondary"
+                                    className="h-5 shrink-0 rounded-full px-1.5 font-mono text-[10px] tabular-nums"
+                                    title={`${subCount} Trigger subscriber${subCount === 1 ? '' : 's'}`}
+                                  >
+                                    {subCount}
+                                  </Badge>
+                                ) : null}
+                              </span>
+                            </td>
+                            <td className="px-2 py-2 tabular-nums text-muted-foreground">
+                              {no || '—'}
+                            </td>
+                            <td className="px-2 py-2">
+                              <Badge
+                                variant={isLive ? 'default' : 'outline'}
+                                className="text-[10px]"
+                              >
+                                {isLive
+                                  ? 'Live'
+                                  : formatEpisodeState(
+                                      row.status || row.state,
+                                    ) || '—'}
+                              </Badge>
+                            </td>
+                            <td className="px-2 py-2 text-muted-foreground">
+                              {row.detectedWindow || '—'}
+                            </td>
+                            <td
+                              className={cn(
+                                'px-2 py-2 text-right font-semibold tabular-nums',
+                                pctColor(move),
+                              )}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {move == null || !Number.isFinite(Number(move)) ? (
+                                '—'
+                              ) : (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <button
+                                      type="button"
+                                      className={cn(
+                                        'cursor-help border-0 bg-transparent p-0 font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
+                                        pctColor(move),
+                                      )}
+                                      aria-label={`${moveLabel} — how calculated`}
+                                    >
+                                      {moveLabel}
+                                    </button>
+                                  </TooltipTrigger>
+                                  <CalcTooltipContent side="left">
+                                    <EpisodeListMoveCalcBody
+                                      row={row}
+                                      shownMove={Number(move)}
+                                      shownKind={moveKind}
+                                    />
+                                  </CalcTooltipContent>
+                                </Tooltip>
+                              )}
+                            </td>
+                            <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                              {fmtDateTime(row.episodeStartedAt) || '—'}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                </TooltipProvider>
+              )}
+              {allEpisodesHasMore ? (
+                <div className="mt-2 flex shrink-0 justify-center">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5"
+                    disabled={allEpisodesLoadingMore}
+                    onClick={() =>
+                      void loadAllEpisodesHistory({
+                        offset:
+                          allEpisodesNextOffset ?? allEpisodesList.length,
+                      })
+                    }
+                  >
+                    {allEpisodesLoadingMore ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : null}
+                    Load more
+                    {allEpisodesTotal
+                      ? ` · ${allEpisodesList.length} of ${allEpisodesTotal}`
+                      : ''}
+                  </Button>
+                </div>
+              ) : allEpisodesList.length > 0 && allEpisodesTotal > 0 ? (
+                <p className="mt-2 shrink-0 text-center text-[11px] text-muted-foreground">
+                  {allEpisodesList.length} of {allEpisodesTotal} episodes
+                </p>
+              ) : null}
+                </>
+              )}
+            </div>
+          ) : (
           <div className="w-full space-y-4 px-3 py-3 sm:px-4 sm:py-4">
+          {leftShowsActiveEpisodes && deskEpisodeFocus ? (
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted/30 px-2.5 py-1.5">
+              <p className="truncate text-[12px] text-muted-foreground">
+                Focused ·{' '}
+                <span className="font-semibold text-foreground">
+                  {String(deskEpisodeFocus.ticker || '').toUpperCase()}
+                </span>
+                {formatEpisodeNo(deskEpisodeFocus.episodeNo)
+                  ? ` ${formatEpisodeNo(deskEpisodeFocus.episodeNo)}`
+                  : ''}
+                {' · '}
+                {deskEpisodeFocus.detectedWindow || 'episode'}
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 shrink-0 px-2 text-[11px]"
+                onClick={clearDeskEpisodeFocus}
+              >
+                Show all episodes
+              </Button>
+            </div>
+          ) : null}
           {/* Row 1: left = logo + name + pricing · right = chart · top-right = subscribers */}
           {(() => {
             const companyName =
@@ -8384,19 +10248,15 @@ export function SndkMomentumPanel({
                           : activeAssetClass}
                       </Badge>
                     ) : null}
-                    <YahooFinanceWithMarketState
-                      marketState={tabQuote?.marketState}
+                    <a
+                      href={yahooFinanceQuoteUrl(displayTicker)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                      title={`Open ${displayTicker} on Yahoo Finance`}
                     >
-                      <a
-                        href={yahooFinanceQuoteUrl(displayTicker)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                        title={`Open ${displayTicker} on Yahoo Finance`}
-                      >
-                        Yahoo Finance
-                      </a>
-                    </YahooFinanceWithMarketState>
+                      Yahoo Finance
+                    </a>
                     <a
                       href={perplexityFinanceQuoteUrl(displayTicker)}
                       target="_blank"
@@ -8532,6 +10392,7 @@ export function SndkMomentumPanel({
                       compact
                       timeZone={exchangeDisplayTz}
                       showTimeZone
+                      disableCache
                     />
                   </div>
                   <span className="pointer-events-none absolute bottom-0.5 right-1 z-10 inline-flex items-center gap-0.5 rounded bg-background/70 px-1 text-[9px] font-medium text-muted-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
@@ -8615,6 +10476,7 @@ export function SndkMomentumPanel({
                 borderless
                 timeZone={exchangeDisplayTz}
                 showTimeZone
+                disableCache
               />
             </div>
           ) : null}
@@ -8706,6 +10568,7 @@ export function SndkMomentumPanel({
                       <Zap className="size-3.5" strokeWidth={2} />
                     </Button>
                   )}
+                  <UpdatingFromSupabaseNote show={tickerUpdatingFromSupabase} />
                   {busy ? (
                     <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
                       <Loader2 className="size-3 animate-spin" />
@@ -9362,6 +11225,7 @@ export function SndkMomentumPanel({
             </p>
           ) : null}
           </div>
+          )}
         </div>
 
         {/* Column 3 — collapsible activity log / subscribers */}
@@ -9391,7 +11255,11 @@ export function SndkMomentumPanel({
               'relative flex shrink-0 flex-col border-l border-border',
               rightRailMode === 'events' ? 'bg-muted/40' : 'bg-background',
             )}
-            style={{ width: rightRailWidth, minWidth: 240, maxWidth: 520 }}
+            style={{
+              width: rightRailWidth,
+              minWidth: RIGHT_RAIL_MIN_WIDTH,
+              maxWidth: rightRailMaxWidth(),
+            }}
           >
             {/* Drag handle — resize right column */}
             <button
@@ -9423,6 +11291,11 @@ export function SndkMomentumPanel({
                     className="size-3.5 shrink-0 text-muted-foreground"
                     strokeWidth={1.75}
                   />
+                ) : rightRailMode === 'yahoo' ? (
+                  <LineChart
+                    className="size-3.5 shrink-0 text-muted-foreground"
+                    strokeWidth={1.75}
+                  />
                 ) : (
                   <Terminal className="size-3.5 shrink-0 text-muted-foreground" />
                 )}
@@ -9437,6 +11310,24 @@ export function SndkMomentumPanel({
                             ? 'Rolling-return thresholds'
                             : rightRailMode === 'activeEpisodes'
                               ? `Active episodes · ${activeEpisodesList.length}`
+                              : rightRailMode === 'yahoo'
+                                ? deskUsersMode
+                                  ? deskUserFocus
+                                    ? `Profile · ${
+                                        deskUserFocus.device_model ||
+                                        deskUserFocus.platform ||
+                                        'Device'
+                                      }`
+                                    : 'User profile'
+                                  : deskEpisodeFocus
+                                    ? `Episode · ${displayTicker}${
+                                        formatEpisodeNo(
+                                          deskEpisodeFocus.episodeNo,
+                                        )
+                                          ? ` ${formatEpisodeNo(deskEpisodeFocus.episodeNo)}`
+                                          : ''
+                                      }`
+                                    : `Yahoo · ${displayTicker}`
                               : `Activity log · ${displayTicker}`}
                     </p>
                     {rightRailMode === 'events' ? (
@@ -9454,28 +11345,59 @@ export function SndkMomentumPanel({
                           ? `${ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label || 'Stocks'} · blank/0 = off`
                           : rightRailMode === 'activeEpisodes'
                             ? 'All live episodes · click to expand'
+                            : rightRailMode === 'yahoo'
+                              ? deskUsersMode
+                                ? 'iOS · build · photo · device fields'
+                                : deskEpisodeFocus
+                                  ? 'Quote · mini chart · A→Z how it built'
+                                  : 'Yahoo Finance chart · quote · session'
                             : 'API · Yahoo · momentum'}
                   </p>
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1">
                 {rightRailMode === 'activeEpisodes' ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={() => void loadActiveEpisodesList({ refresh: true })}
-                    title="Refresh active episodes"
-                    aria-label="Refresh active episodes"
-                    disabled={activeEpisodesLoading}
-                  >
-                    <RefreshCw
-                      className={cn(
-                        'size-3.5',
-                        activeEpisodesLoading && 'animate-spin',
+                  <>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-[11px] text-rose-700 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
+                      onClick={() => void endAllActiveEpisodes()}
+                      title="End all active episodes"
+                      aria-label="End all active episodes"
+                      disabled={
+                        endingEpisode ||
+                        activeEpisodesLoading ||
+                        activeEpisodesList.length === 0
+                      }
+                    >
+                      {endingEpisode ? (
+                        <>
+                          <Loader2 className="size-3 animate-spin" />
+                          Ending…
+                        </>
+                      ) : (
+                        'End all'
                       )}
-                    />
-                  </Button>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => void loadActiveEpisodesList({ refresh: true })}
+                      title="Refresh active episodes"
+                      aria-label="Refresh active episodes"
+                      disabled={activeEpisodesLoading || endingEpisode}
+                    >
+                      <RefreshCw
+                        className={cn(
+                          'size-3.5',
+                          activeEpisodesLoading && 'animate-spin',
+                        )}
+                      />
+                    </Button>
+                  </>
                 ) : null}
                 {rightRailMode === 'subscribers' ||
                 rightRailMode === 'events' ||
@@ -9505,7 +11427,360 @@ export function SndkMomentumPanel({
                 </Button>
               </div>
             </div>
-            {rightRailMode === 'activeEpisodes' ? (
+            {rightRailMode === 'yahoo' ? (
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+                  {deskUsersMode ? (
+                    deskUserFocus ? (
+                      <DeskUserProfilePanel
+                        device={deskUserFocus}
+                        onTickersChanged={async () => {
+                          const focused = deskUserFocus
+                          await loadDeskDevices()
+                          if (focused) await loadDeskUserActivities(focused)
+                        }}
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 px-4 py-12 text-center">
+                        <Users
+                          className="size-6 text-muted-foreground/70"
+                          strokeWidth={1.5}
+                        />
+                        <p className="text-sm font-medium">Select a user</p>
+                        <p className="max-w-[16rem] text-[12px] text-muted-foreground">
+                          Click a device on the left to see iOS / build / photo
+                          and profile fields here.
+                        </p>
+                      </div>
+                    )
+                  ) : (
+                  <div className="space-y-3 px-3 py-3">
+                    {!deskEpisodeFocus ? (
+                      <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-4 py-12 text-center">
+                        <LineChart
+                          className="size-6 text-muted-foreground/70"
+                          strokeWidth={1.5}
+                        />
+                        <p className="text-sm font-medium">Select an episode</p>
+                        <p className="max-w-[16rem] text-[12px] text-muted-foreground">
+                          Click a row in All episodes (center) or a live episode
+                          on the left — the list stays put; detail opens here.
+                        </p>
+                      </div>
+                    ) : null}
+                    {deskEpisodeFocus ? (
+                    <>
+                    {/* Quote + mini chart (click → expand full chart below) */}
+                    <div className="rounded-xl border border-border bg-card p-3">
+                      <div className="flex items-start gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold tracking-tight">
+                              {activeTab?.label &&
+                              activeTab.label !== displayTicker
+                                ? activeTab.label
+                                : displayTicker}
+                            </p>
+                            <p className="truncate text-[11px] text-muted-foreground">
+                              {displayTicker}
+                              {formatEpisodeNo(deskEpisodeFocus.episodeNo)
+                                ? ` · ${formatEpisodeNo(deskEpisodeFocus.episodeNo)}`
+                                : ''}
+                              {deskEpisodeFocus.detectedWindow
+                                ? ` · ${deskEpisodeFocus.detectedWindow}`
+                                : ''}
+                            </p>
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-end gap-x-3 gap-y-1">
+                            <p className="text-xl font-semibold tabular-nums tracking-tight">
+                              {fmtPrice(
+                                livePrice,
+                                activeAssetClass,
+                                quoteCurrency,
+                              )}
+                            </p>
+                            <p
+                              className={cn(
+                                'pb-0.5 text-sm font-semibold tabular-nums',
+                                livePct != null
+                                  ? pctColor(livePct)
+                                  : 'text-muted-foreground',
+                              )}
+                            >
+                              {livePct != null ? fmtPct(livePct) : '—'}
+                            </p>
+                          </div>
+                          {prevClose != null ? (
+                            <p className="mt-1 text-[11px] text-muted-foreground tabular-nums">
+                              Prev close{' '}
+                              {fmtPrice(
+                                prevClose,
+                                activeAssetClass,
+                                quoteCurrency,
+                              )}
+                              {prevClosePct != null
+                                ? ` · ${fmtPct(prevClosePct)}`
+                                : ''}
+                            </p>
+                          ) : null}
+                          {/* Session · Yahoo under share price (clickable → Yahoo) */}
+                          <a
+                            href={yahooFinanceQuoteUrl(displayTicker)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="mt-1.5 inline-flex max-w-full flex-wrap items-center gap-x-1.5 text-[11px] font-medium text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
+                            title={`Open ${displayTicker} on Yahoo Finance`}
+                          >
+                            <YahooMarketStateLabel
+                              marketState={tabQuote?.marketState}
+                              className="text-[11px]"
+                            />
+                            <span aria-hidden>·</span>
+                            <span>Yahoo Finance</span>
+                            <ExternalLink className="size-3 shrink-0 opacity-70" />
+                          </a>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setRailChartExpanded((v) => !v)
+                          }
+                          className="group relative h-[4.5rem] w-[7.5rem] shrink-0 overflow-hidden rounded-none bg-transparent p-0 text-left transition-opacity hover:opacity-90"
+                          title={
+                            railChartExpanded
+                              ? 'Collapse chart'
+                              : 'Expand chart below'
+                          }
+                          aria-expanded={railChartExpanded}
+                        >
+                          <div className="pointer-events-none h-full w-full select-none">
+                            <YahooInteractiveChart
+                              key={`${displayTicker}-rail-mini`}
+                              ticker={displayTicker}
+                              title={`${displayTicker} · Yahoo`}
+                              height={72}
+                              defaultRange="1d"
+                              compact
+                              borderless
+                              timeZone={exchangeDisplayTz}
+                              disableCache
+                            />
+                          </div>
+                          <span className="pointer-events-none absolute bottom-0.5 right-0.5 z-10 inline-flex items-center gap-0.5 rounded bg-background/80 px-1 text-[8px] font-medium text-muted-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
+                            {railChartExpanded ? (
+                              <>
+                                Hide
+                                <ChevronUp className="size-2.5" />
+                              </>
+                            ) : (
+                              <>
+                                Expand
+                                <ChevronDown className="size-2.5" />
+                              </>
+                            )}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {railChartExpanded ? (
+                      <div className="overflow-hidden rounded-xl border border-border bg-card">
+                        <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                          <div className="min-w-0">
+                            <p className="text-[12px] font-medium">
+                              Interactive chart
+                            </p>
+                            <p className="text-[10px] text-muted-foreground">
+                              Hover for price · ranges from Yahoo Finance
+                            </p>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="h-7 shrink-0 gap-1 px-2 text-[11px]"
+                            onClick={() => setRailChartExpanded(false)}
+                          >
+                            <ChevronUp className="size-3.5" />
+                            Collapse
+                          </Button>
+                        </div>
+                        <div className="p-2">
+                          <YahooInteractiveChart
+                            key={`${displayTicker}-rail-full`}
+                            ticker={displayTicker}
+                            title={`${displayTicker} · Yahoo`}
+                            height={280}
+                            defaultRange="1d"
+                            borderless
+                            timeZone={exchangeDisplayTz}
+                            showTimeZone
+                            disableCache
+                          />
+                        </div>
+                        <div className="border-t border-border px-3 py-2">
+                          <a
+                            href={yahooFinanceQuoteUrl(displayTicker)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                            title={`Open ${displayTicker} on Yahoo Finance`}
+                          >
+                            <YahooMarketStateLabel
+                              marketState={tabQuote?.marketState}
+                              className="text-[11px]"
+                            />
+                            <span aria-hidden>·</span>
+                            <span>Yahoo Finance</span>
+                            <ExternalLink className="size-3 shrink-0 opacity-70" />
+                          </a>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* Full A→Z how this episode built — popup content inline */}
+                      <div className="space-y-2 rounded-xl border border-border bg-card p-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                          <Zap
+                            className="size-3.5 text-muted-foreground"
+                            strokeWidth={2}
+                          />
+                          <p className="text-[14px] font-semibold tracking-tight">
+                            How this episode built · A→Z
+                          </p>
+                        </div>
+                        <p className="text-[12px] text-muted-foreground">
+                          Full story plus every alert, Perplexity, and measure
+                          detail inline (same content as the popups).
+                        </p>
+                        {(() => {
+                          const focusTicker = String(
+                            deskEpisodeFocus.ticker || displayTicker || '',
+                          )
+                            .trim()
+                            .toUpperCase()
+                          const statusTicker = String(status?.ticker || '')
+                            .trim()
+                            .toUpperCase()
+                          // Wait until this ticker’s status/events have hydrated —
+                          // otherwise a 1-step stub looks like the full story.
+                          const timelineLoading =
+                            loading ||
+                            !status ||
+                            (focusTicker
+                              ? statusTicker !== focusTicker
+                              : false)
+
+                          if (timelineLoading) {
+                            return (
+                              <div className="flex items-center gap-2 rounded-xl border border-dashed border-border bg-muted/20 px-3 py-8 text-[12px] text-muted-foreground">
+                                <Loader2 className="size-4 shrink-0 animate-spin" />
+                                Loading full episode timeline…
+                              </div>
+                            )
+                          }
+
+                          const focusId = deskEpisodeFocus.episodeId
+                            ? String(deskEpisodeFocus.episodeId)
+                            : ''
+                          const groups = buildEpisodeGroups(
+                            status?.episodes,
+                            status?.events,
+                            episode,
+                          ).map((g) => ensureGroupHasStartedEvent(g))
+                          let group =
+                            (focusId
+                              ? groups.find(
+                                  (g) => String(g.episodeId) === focusId,
+                                )
+                              : null) ||
+                            groups.find(
+                              (g) =>
+                                g.startedAt &&
+                                deskEpisodeFocus.episodeStartedAt &&
+                                g.startedAt ===
+                                  deskEpisodeFocus.episodeStartedAt,
+                            ) ||
+                            null
+                          if (!group) {
+                            // Stub from the clicked row if status has no matching group
+                            group = ensureGroupHasStartedEvent({
+                              id:
+                                focusId ||
+                                `focus-${deskEpisodeFocus.ticker}-${deskEpisodeFocus.episodeStartedAt || ''}`,
+                              direction:
+                                deskEpisodeFocus.direction === 'DOWN'
+                                  ? 'DOWN'
+                                  : 'UP',
+                              startedAt:
+                                deskEpisodeFocus.episodeStartedAt || '',
+                              endedAt: null,
+                              status:
+                                String(deskEpisodeFocus.status || '')
+                                  .toUpperCase() === 'ACTIVE'
+                                  ? 'ACTIVE'
+                                  : 'ENDED',
+                              peakMovePercent: Number(
+                                deskEpisodeFocus.peakMovePercent || 0,
+                              ),
+                              window:
+                                deskEpisodeFocus.detectedWindow || '—',
+                              events: [],
+                              liveState: deskEpisodeFocus.state || null,
+                              episodeId: focusId || null,
+                              episodeNo: deskEpisodeFocus.episodeNo ?? null,
+                              marketSession:
+                                deskEpisodeFocus.marketSession || null,
+                            })
+                          } else if (
+                            group.status === 'ACTIVE' &&
+                            episode?.state &&
+                            (!group.episodeId ||
+                              group.episodeId === episode.episodeId)
+                          ) {
+                            group = {
+                              ...group,
+                              liveState: episode.state,
+                              episodeNo:
+                                group.episodeNo ?? episode.episodeNo ?? null,
+                            }
+                          }
+                          const matchesLive = Boolean(
+                            episode &&
+                              group.episodeId &&
+                              episode.episodeId === group.episodeId,
+                          )
+                          return (
+                            <div className="space-y-3">
+                              <EpisodeExplainCollapse
+                                key={`explain-${group.id}`}
+                                group={group}
+                                accelPoints={
+                                  status?.config?.accelerationPoints
+                                }
+                                inactivityMinutes={
+                                  status?.config?.inactivityMinutes
+                                }
+                              />
+                              <EpisodeAzTimelineInline
+                                key={`az-${group.id}`}
+                                group={group}
+                                assetClass={activeAssetClass}
+                                currency={quoteCurrency}
+                                liveEpisode={episode}
+                                matchesLive={matchesLive}
+                              />
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    </>
+                    ) : null}
+                  </div>
+                  )}
+                </div>
+              </div>
+            ) : rightRailMode === 'activeEpisodes' ? (
               <div className="flex min-h-0 flex-1 flex-col">
                 <ScrollArea className="min-h-0 flex-1">
                   <div className="space-y-2 px-2.5 py-2.5">
@@ -11330,26 +13605,27 @@ export function SndkMomentumPanel({
       {/* end full-height left | right split */}
 
       {/* ── Bottom bar: Perplexity | asset tabs + settings | market + clocks ── */}
-      <div className="grid h-10 shrink-0 grid-cols-3 items-center gap-1.5 border-t border-border bg-background px-2.5 py-1 sm:px-3">
+      <div className="grid h-12 shrink-0 grid-cols-3 items-center gap-2 border-t border-border bg-background px-3 py-1.5 sm:px-4">
         <div className="inline-flex min-w-0 items-center justify-start gap-2">
           <button
             type="button"
             onClick={() => void loadPerplexityUsage({ open: true })}
             title="Perplexity cost — click for breakdown"
-            className="inline-flex min-w-0 items-center justify-start gap-1 text-left transition-opacity hover:opacity-80"
+            className="inline-flex min-w-0 items-center justify-start gap-1.5 text-left transition-opacity hover:opacity-80"
           >
-            <PerplexityLogo className="size-3" />
-            <span className="font-mono text-[11px] font-medium tabular-nums tracking-tight text-foreground">
+            <PerplexityLogo className="size-3.5" />
+            <span className="font-mono text-[12px] font-medium tabular-nums tracking-tight text-foreground sm:text-[13px]">
               $
               {(Number(pplxTotals?.total_cost_usd) || 0).toFixed(2)}
             </span>
           </button>
         </div>
 
-        <div className="flex items-center justify-center">
+        <div className="flex items-center justify-center gap-2">
           <TooltipProvider delayDuration={200}>
+          {/* Asset-class navigator pill */}
           <div
-            className="inline-flex items-center gap-px rounded-full border border-border bg-muted p-px"
+            className="inline-flex items-center gap-0.5 rounded-full border border-border bg-muted p-0.5"
             role="tablist"
             aria-label="Asset class"
           >
@@ -11366,30 +13642,79 @@ export function SndkMomentumPanel({
                       aria-label={tab.label}
                       onClick={() => selectAssetClassTab(tab.id)}
                       className={cn(
-                        'inline-flex h-5 w-5 items-center justify-center rounded-full transition-colors',
+                        'inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors',
                         active
                           ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
                           : 'text-muted-foreground hover:text-foreground',
                       )}
                     >
-                      <Icon className="size-2.5" strokeWidth={1.75} />
+                      <Icon className="size-3.5" strokeWidth={1.75} />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top" className="px-2 py-1">
-                    <p className="text-[11px] font-semibold">{tab.label}</p>
+                    <p className="text-[12px] font-semibold">{tab.label}</p>
                   </TooltipContent>
                 </Tooltip>
               )
             })}
+          </div>
+
+          {/* Active episodes pill — desk view with all live episodes */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label="Active episodes"
+                aria-pressed={leftShowsActiveEpisodes}
+                title="Show all active episodes"
+                onClick={() => {
+                  setAssetClassTab(null)
+                  saveAssetClassFilter(null)
+                  setDeskEpisodeFocus(null)
+                  setMainPanelTab('episode')
+                  setRightRailMode('yahoo')
+                  setLogCollapsedPersist(false)
+                  void loadActiveEpisodesList()
+                  void loadAllEpisodesHistory()
+                }}
+                className={cn(
+                  'relative inline-flex h-7 w-7 items-center justify-center rounded-full border border-border bg-muted transition-colors hover:bg-background hover:text-foreground hover:shadow-sm',
+                  leftShowsActiveEpisodes
+                    ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+                    : 'text-muted-foreground',
+                )}
+              >
+                <Activity className="size-3.5" strokeWidth={1.75} />
+                {activeEpisodesList.length > 0 ? (
+                  <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-foreground px-0.5 text-[9px] font-bold leading-none text-background">
+                    {activeEpisodesList.length > 99
+                      ? '99+'
+                      : activeEpisodesList.length}
+                  </span>
+                ) : null}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="px-2 py-1">
+              <p className="text-[12px] font-semibold">Active episodes</p>
+              <p className="text-[11px] text-background/80">
+                {activeEpisodesList.length
+                  ? `${activeEpisodesList.length} live now`
+                  : 'All live momentum episodes'}
+              </p>
+            </TooltipContent>
+          </Tooltip>
+
+          {/* Settings pill */}
+          <div className="inline-flex items-center rounded-full border border-border bg-muted p-0.5">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
                   title="Settings"
                   aria-label="Settings"
-                  className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-background hover:text-foreground hover:shadow-sm"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-background hover:text-foreground hover:shadow-sm"
                 >
-                  <Settings className="size-2.5" strokeWidth={1.75} />
+                  <Settings className="size-3.5" strokeWidth={1.75} />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent
@@ -11515,6 +13840,15 @@ export function SndkMomentumPanel({
                   <Clock className="size-3.5" strokeWidth={1.75} />
                   Market sessions
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="gap-2 text-rose-700 focus:text-rose-700 dark:text-rose-300 dark:focus:text-rose-300"
+                  onSelect={() => {
+                    void clearDeskCache()
+                  }}
+                >
+                  <RotateCcw className="size-3.5" strokeWidth={1.75} />
+                  Clear Cache
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="gap-2" asChild>
                   <a href="/momentum-studio">
@@ -11572,14 +13906,30 @@ export function SndkMomentumPanel({
           </TooltipProvider>
         </div>
 
-        <div className="flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-0">
+        <button
+          type="button"
+          className={cn(
+            'flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-0 rounded-md px-1.5 py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring',
+            marketStatusOpen && 'bg-muted/50 ring-1 ring-border',
+          )}
+          aria-label="Market sessions — hover for global exchange sessions"
+          aria-expanded={marketStatusOpen}
+          onPointerEnter={openMarketStatusFromHover}
+          onPointerLeave={scheduleMarketStatusHoverClose}
+          onFocus={openMarketStatusFromHover}
+          onBlur={scheduleMarketStatusHoverClose}
+          onClick={() => openMarketStatusFromHover()}
+        >
           <MarketStatusBadge
             nowMs={nowMs}
-            className="text-[10px] gap-1"
-            onClick={() => void loadMarketStatusPopup({ open: true })}
+            className="text-[12px] gap-1.5"
+            yahooMarketState={
+              marketStatusRows.find((r) => r.id === 'us-stocks')?.marketState ??
+              null
+            }
           />
           <div
-            className="flex min-w-0 items-center gap-x-1 whitespace-nowrap text-[10px] tabular-nums leading-none"
+            className="flex min-w-0 items-center gap-x-1.5 whitespace-nowrap text-[12px] tabular-nums leading-none"
             aria-label={`UK ${formatZoneHm(nowMs, 'Europe/London')}, US ${formatZoneHm(nowMs, 'America/New_York')}`}
           >
             <span className="font-medium text-muted-foreground">UK</span>
@@ -11594,7 +13944,165 @@ export function SndkMomentumPanel({
               {formatZoneHm(nowMs, 'America/New_York')}
             </span>
           </div>
-        </div>
+        </button>
+
+        {/*
+          Right-rail market sessions (20vw). Stay open while hovering panel so
+          cards are clickable → Yahoo Finance quote for that probe symbol.
+        */}
+        {marketStatusOpen ? (
+          <div
+            className="pointer-events-none fixed inset-0 z-[200] flex justify-end"
+            role="presentation"
+          >
+            <div
+              data-market-sessions-panel
+              role="dialog"
+              aria-modal="false"
+              aria-label="Market sessions"
+              className="pointer-events-auto flex h-full min-w-[14rem] flex-col overflow-hidden border-l border-border bg-popover/97 text-popover-foreground shadow-2xl backdrop-blur-md"
+              style={{ width: '20vw', maxWidth: '100%' }}
+              onPointerEnter={cancelMarketStatusHoverClose}
+              onPointerLeave={scheduleMarketStatusHoverClose}
+            >
+              <div className="shrink-0 border-b border-border px-4 py-3">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold tracking-tight">
+                      Market sessions
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      Click a card → Yahoo Finance · hover to keep open
+                    </p>
+                  </div>
+                  <p className="text-[10px] tabular-nums text-muted-foreground">
+                    {marketStatusRows.length} markets
+                    {marketStatusLoading ? ' · refreshing…' : ''}
+                  </p>
+                </div>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+                {marketStatusLoading && !marketStatusRows.length ? (
+                  <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Probing global markets via Yahoo…
+                  </p>
+                ) : null}
+                {marketStatusError ? (
+                  <p className="mb-3 text-[13px] text-rose-600">
+                    {marketStatusError}
+                  </p>
+                ) : null}
+                <div className="grid grid-cols-1 gap-2">
+                  {marketStatusRows.map((row) => {
+                    // Exact Yahoo marketState only (PREPRE / POST / CLOSED / …).
+                    const session = row.marketState
+                      ? String(row.marketState).trim().toUpperCase()
+                      : row.currentSession && row.currentSession !== '—'
+                        ? String(row.currentSession).trim().toUpperCase()
+                        : '—'
+                    const latestLabel =
+                      row.lastUpdateLondon ||
+                      (row.quoteAgeSec != null
+                        ? `${Math.round(row.quoteAgeSec)}s ago`
+                        : '—')
+                    const flag = marketSessionFlag(row)
+                    const href = yahooFinanceQuoteUrl(row.symbol)
+                    return (
+                      <a
+                        key={row.id}
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={`Open ${row.symbol} on Yahoo Finance`}
+                        className="flex w-full flex-col gap-1 rounded-xl border border-border/80 bg-card/80 p-3 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <span
+                            className="shrink-0 text-[2.75rem] leading-none"
+                            aria-hidden
+                          >
+                            {flag}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-[13px] font-semibold tracking-tight text-foreground">
+                              {row.label}
+                            </p>
+                            <p className="truncate font-mono text-[10px] text-muted-foreground">
+                              {row.exchange ? `${row.exchange} · ` : ''}
+                              {row.symbol}
+                            </p>
+                            {row.region ? (
+                              <p className="mt-0.5 text-[9px] uppercase tracking-wide text-muted-foreground/80">
+                                {row.region}
+                              </p>
+                            ) : null}
+                          </div>
+                          <ExternalLink
+                            className="mt-0.5 size-3 shrink-0 text-muted-foreground/70"
+                            strokeWidth={1.75}
+                          />
+                        </div>
+                        <p
+                          className={cn(
+                            'font-mono text-sm font-semibold tracking-tight',
+                            marketSessionToneClass(session),
+                          )}
+                        >
+                          {session}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground">
+                          {row.status || row.engineLabel || '—'}
+                          {' · '}
+                          {latestLabel}
+                        </p>
+                        {row.child ? (
+                          <p className="mt-0.5 border-t border-border/60 pt-1 text-[10px] text-muted-foreground">
+                            <span
+                              aria-hidden
+                              className="mr-1.5 inline-block align-middle text-[1.35rem] leading-none"
+                            >
+                              {marketSessionFlag(row.child)}
+                            </span>
+                            <span className="font-medium text-foreground/80">
+                              {row.child.label}
+                            </span>
+                            {' · '}
+                            <span
+                              className={cn(
+                                'font-mono',
+                                marketSessionToneClass(
+                                  row.child.marketState ||
+                                    row.child.currentSession,
+                                ),
+                              )}
+                            >
+                              {row.child.marketState
+                                ? String(row.child.marketState)
+                                    .trim()
+                                    .toUpperCase()
+                                : row.child.currentSession &&
+                                    row.child.currentSession !== '—'
+                                  ? String(row.child.currentSession)
+                                      .trim()
+                                      .toUpperCase()
+                                  : '—'}
+                            </span>
+                          </p>
+                        ) : null}
+                      </a>
+                    )
+                  })}
+                </div>
+                {marketStatusFooter ? (
+                  <p className="mt-4 text-[11px] leading-relaxed text-muted-foreground">
+                    {marketStatusFooter}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Activity log detail dialog */}
@@ -13443,89 +15951,11 @@ export function SndkMomentumPanel({
               </div>
             </>
           ) : timelineDetail?.kind === 'perplexity' ? (
-            <>
-              <DialogHeader className="shrink-0 border-b border-border px-5 py-4 pr-12 text-left">
-                <DialogTitle className="flex items-center gap-2 text-base">
-                  <PerplexityLogo className="size-4" />
-                  Perplexity reason
-                </DialogTitle>
-                <DialogDescription className="text-[12px] text-muted-foreground">
-                  Exact research output used for this step
-                  {timelineDetail.at
-                    ? ` · ${fmtDateTime(timelineDetail.at) || fmtTime(timelineDetail.at)}`
-                    : ''}
-                </DialogDescription>
-              </DialogHeader>
-              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
-                {timelineDetail.research.likely_driver ? (
-                  <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-3.5">
-                    <p className="text-[10px] font-semibold uppercase tracking-wide text-violet-800 dark:text-violet-300">
-                      Likely driver
-                    </p>
-                    <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
-                      {timelineDetail.research.likely_driver}
-                    </p>
-                  </div>
-                ) : null}
-                <div className="rounded-xl border border-border bg-muted/30 p-3.5">
-                  <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    Full reason
-                  </p>
-                  <pre className="mt-1.5 max-h-[min(40vh,18rem)] overflow-auto whitespace-pre-wrap font-sans text-[12px] leading-relaxed text-foreground">
-                    {timelineDetail.research.reason || '—'}
-                  </pre>
-                </div>
-                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                  {timelineDetail.research.provider ? (
-                    <span>{timelineDetail.research.provider}</span>
-                  ) : null}
-                  {timelineDetail.research.model ? (
-                    <span className="font-mono text-[10px]">
-                      {timelineDetail.research.model}
-                    </span>
-                  ) : null}
-                  {timelineDetail.research.cost_usd_display ? (
-                    <span>{timelineDetail.research.cost_usd_display}</span>
-                  ) : null}
-                </div>
-                {timelineDetail.research.search_results?.length ||
-                timelineDetail.research.citations?.length ? (
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      Sources
-                    </p>
-                    <ul className="mt-1 max-h-28 space-y-1 overflow-y-auto text-[11px]">
-                      {(timelineDetail.research.search_results?.length
-                        ? timelineDetail.research.search_results
-                        : (timelineDetail.research.citations || []).map(
-                            (url) => ({
-                              url,
-                              title: url,
-                            }),
-                          )
-                      )
-                        .slice(0, 8)
-                        .map((src, i) => (
-                          <li key={i} className="truncate">
-                            {src.url ? (
-                              <a
-                                href={src.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
-                              >
-                                {src.title || src.url}
-                              </a>
-                            ) : (
-                              <span>{src.title || 'source'}</span>
-                            )}
-                          </li>
-                        ))}
-                    </ul>
-                  </div>
-                ) : null}
-              </div>
-            </>
+            <PerplexityDialogPanel
+              ev={timelineDetail.ev}
+              research={timelineDetail.research}
+              at={timelineDetail.at}
+            />
           ) : null}
           <DialogFooter className="shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border px-5 py-3">
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
@@ -13561,262 +15991,6 @@ export function SndkMomentumPanel({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={marketStatusOpen} onOpenChange={setMarketStatusOpen}>
-        <DialogContent
-          showCloseButton
-          className="max-h-[min(90dvh,36rem)] w-[min(100vw-1.5rem,36rem)] gap-0 overflow-hidden p-0 sm:max-w-xl"
-        >
-          <DialogHeader className="shrink-0 border-b border-border px-5 py-4 pr-12 text-left">
-            <DialogTitle className="text-base">Market sessions</DialogTitle>
-            <DialogDescription className="text-[12px] text-muted-foreground">
-              Calendar is expected hours. Delayed Yahoo data is not a market
-              close. This popup does not start or stop the backend engine.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
-            {marketStatusLoading ? (
-              <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin" />
-                Probing headline markets…
-              </p>
-            ) : null}
-            {marketStatusError ? (
-              <p className="text-[13px] text-rose-600">{marketStatusError}</p>
-            ) : null}
-            <TooltipProvider delayDuration={180}>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-[12px]">
-                  <thead>
-                    <tr className="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground">
-                      <th className="py-1.5 pr-2 font-semibold">
-                        <MarketSessionHoverTip
-                          title="Column · Market"
-                          lines={[
-                            'Headline Yahoo probe for this asset class.',
-                            'One lightweight quote only — does not wake or stop the backend engine.',
-                          ]}
-                        >
-                          Market
-                        </MarketSessionHoverTip>
-                      </th>
-                      <th className="py-1.5 pr-2 font-semibold">
-                        <MarketSessionHoverTip
-                          title="Column · Session"
-                          lines={[
-                            'Expected calendar session right now (Overnight, Pre-market, Regular, Post-market, Open, Maintenance, Closed, 24/7).',
-                            'Based on America/New_York policy hours — not inferred from delayed Yahoo prints.',
-                          ]}
-                        >
-                          Session
-                        </MarketSessionHoverTip>
-                      </th>
-                      <th className="py-1.5 pr-2 font-semibold">
-                        <MarketSessionHoverTip
-                          title="Column · Status"
-                          lines={[
-                            'Live = open + fresh data. Delayed = should be open but Yahoo is stale/missing. Closed = full session close. Maintenance = CME daily break.',
-                            'Delayed is never treated as a market close.',
-                          ]}
-                        >
-                          Status
-                        </MarketSessionHoverTip>
-                      </th>
-                      <th className="py-1.5 font-semibold">
-                        <MarketSessionHoverTip
-                          title="Column · Latest data"
-                          lines={[
-                            'Time of the last usable Yahoo print, shown in Europe/London for display.',
-                            '“—” means no quote timestamp. “Resumes …” is the next expected open when the market is closed.',
-                          ]}
-                        >
-                          Latest data
-                        </MarketSessionHoverTip>
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {marketStatusRows.map((row) => {
-                      const marketInfo =
-                        MARKET_PROBE_INFO[row.id] || {
-                          title: row.label,
-                          lines: [
-                            `Probe symbol ${row.symbol}.`,
-                            row.reason ||
-                              'Headline market probe for the session popup.',
-                          ],
-                        }
-                      const sessionInfo = sessionHoverInfo(
-                        row.currentSession || row.uiStatus,
-                        row,
-                      )
-                      const statusInfo = statusHoverInfo(row)
-                      const latestInfo = latestDataHoverInfo(row)
-                      const latestLabel =
-                        row.lastUpdateLondon ||
-                        (row.quoteAgeSec != null
-                          ? `${Math.round(row.quoteAgeSec)}s ago`
-                          : '—')
-                      const childSession = row.child
-                        ? row.child.currentSession || row.child.uiStatus
-                        : null
-                      const childSessionInfo =
-                        row.child && childSession
-                          ? sessionHoverInfo(childSession, row.child)
-                          : null
-                      return (
-                        <tr key={row.id} className="border-b border-border/60">
-                          <td className="py-2 pr-2 align-top">
-                            <MarketSessionHoverTip
-                              title={marketInfo.title}
-                              lines={marketInfo.lines}
-                            >
-                              <div className="font-medium text-foreground">
-                                {row.label}
-                              </div>
-                              <div className="font-mono text-[10px] text-muted-foreground">
-                                {row.symbol}
-                              </div>
-                            </MarketSessionHoverTip>
-                            {row.child ? (
-                              <div className="mt-0.5">
-                                <MarketSessionHoverTip
-                                  title={`${row.child.label} (${row.child.symbol})`}
-                                  lines={[
-                                    'Cash index child probe under Indices (RTH only).',
-                                    `UI status: ${row.child.uiStatus}.`,
-                                    row.child.reason ||
-                                      'Futures and cash can differ outside cash hours.',
-                                  ]}
-                                >
-                                  <span className="text-[10px] text-muted-foreground">
-                                    {row.child.label}: {row.child.uiStatus}
-                                  </span>
-                                </MarketSessionHoverTip>
-                              </div>
-                            ) : null}
-                          </td>
-                          <td className="py-2 pr-2 align-top">
-                            <MarketSessionHoverTip
-                              title={sessionInfo.title}
-                              lines={sessionInfo.lines}
-                            >
-                              <span>{row.currentSession || row.uiStatus}</span>
-                            </MarketSessionHoverTip>
-                            {childSessionInfo ? (
-                              <div className="mt-0.5">
-                                <MarketSessionHoverTip
-                                  title={childSessionInfo.title}
-                                  lines={childSessionInfo.lines}
-                                >
-                                  <span className="text-[10px] text-muted-foreground">
-                                    Cash: {childSession}
-                                  </span>
-                                </MarketSessionHoverTip>
-                              </div>
-                            ) : null}
-                          </td>
-                          <td className="py-2 pr-2 align-top">
-                            <MarketSessionHoverTip
-                              title={statusInfo.title}
-                              lines={statusInfo.lines}
-                            >
-                              <span>{row.status || row.engineLabel}</span>
-                            </MarketSessionHoverTip>
-                          </td>
-                          <td className="py-2 align-top text-muted-foreground">
-                            <MarketSessionHoverTip
-                              title={latestInfo.title}
-                              lines={latestInfo.lines}
-                            >
-                              <span>{latestLabel}</span>
-                            </MarketSessionHoverTip>
-                            {row.resumeAtLondon ? (
-                              <div className="mt-0.5">
-                                <MarketSessionHoverTip
-                                  title="Next expected open"
-                                  lines={[
-                                    `Shown in Europe/London: ${row.resumeAtLondon}.`,
-                                    'Canonical open time is computed in America/New_York from this market’s session policy.',
-                                    row.nextExpectedOpenUtc
-                                      ? `UTC: ${row.nextExpectedOpenUtc}.`
-                                      : '',
-                                  ].filter(Boolean)}
-                                >
-                                  <span className="text-[10px]">
-                                    Resumes {row.resumeAtLondon}
-                                  </span>
-                                </MarketSessionHoverTip>
-                              </div>
-                            ) : null}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </TooltipProvider>
-            {marketStatusFooter ? (
-              <MarketSessionHoverTip
-                title="What this means"
-                lines={[
-                  marketStatusFooter,
-                  'This summary is informational only — it never starts or stops ticker engines.',
-                ]}
-              >
-                <p className="text-[11px] leading-relaxed text-muted-foreground">
-                  {marketStatusFooter}
-                </p>
-              </MarketSessionHoverTip>
-            ) : null}
-            {marketStatusDebug ? (
-              <pre className="max-h-32 overflow-auto rounded-lg border border-border bg-muted/30 p-2 font-mono text-[10px]">
-                {marketStatusDebug}
-              </pre>
-            ) : null}
-          </div>
-          <DialogFooter className="shrink-0 flex-wrap gap-2 border-t border-border px-5 py-3">
-            <Button
-              type="button"
-              variant="ghost"
-              className="mr-auto"
-              onClick={() => {
-                const first = marketStatusRows[0]
-                if (!first) return
-                setMarketStatusDebug(
-                  JSON.stringify(
-                    {
-                      symbol: first.symbol,
-                      calendarState: first.calendarState,
-                      freshnessState: first.freshnessState,
-                      quoteTimestampUtc: first.quoteTimestampUtc,
-                      nowUtc: new Date().toISOString(),
-                      quoteAgeSec: first.quoteAgeSec,
-                      engineGate: first.engineLabel,
-                      nextExpectedOpenUtc: first.nextExpectedOpenUtc,
-                    },
-                    null,
-                    2,
-                  ),
-                )
-              }}
-            >
-              Debug
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={marketStatusLoading}
-              onClick={() => void loadMarketStatusPopup({ open: true })}
-            >
-              Refresh
-            </Button>
-            <Button type="button" onClick={() => setMarketStatusOpen(false)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }

@@ -2,16 +2,20 @@
 -- Apply in Supabase Dashboard → SQL → New query → Run.
 --
 -- Tables:
---   momentum_research_monitored_stocks  (equity / stocks)
+--   momentum_research_stocks  (equity / stocks)
 --   momentum_research_commodities
 --   momentum_research_forex
 --   momentum_research_crypto
 --   momentum_research_indexes
+--
+-- If you still have the old name, run:
+--   alter table public.momentum_research_monitored_stocks
+--     rename to momentum_research_stocks;
 
 create extension if not exists pgcrypto;
 
--- ─── Monitored Stocks ───────────────────────────────────────────
-create table if not exists public.momentum_research_monitored_stocks (
+-- ─── Stocks ─────────────────────────────────────────────────────
+create table if not exists public.momentum_research_stocks (
   id uuid primary key default gen_random_uuid(),
   ticker text not null,
   company_name text,
@@ -50,10 +54,10 @@ create table if not exists public.momentum_research_monitored_stocks (
   created_at timestamptz not null default now()
 );
 
-create index if not exists momentum_research_monitored_stocks_ticker_created_idx
-  on public.momentum_research_monitored_stocks (ticker, created_at desc);
-create index if not exists momentum_research_monitored_stocks_created_idx
-  on public.momentum_research_monitored_stocks (created_at desc);
+create index if not exists momentum_research_stocks_ticker_created_idx
+  on public.momentum_research_stocks (ticker, created_at desc);
+create index if not exists momentum_research_stocks_created_idx
+  on public.momentum_research_stocks (created_at desc);
 
 -- ─── Commodities ────────────────────────────────────────────────
 create table if not exists public.momentum_research_commodities (
@@ -236,7 +240,7 @@ create index if not exists momentum_research_indexes_created_idx
   on public.momentum_research_indexes (created_at desc);
 
 -- RLS: readable by anon/authenticated; inserts allowed for anon + service_role (server)
-alter table public.momentum_research_monitored_stocks enable row level security;
+alter table public.momentum_research_stocks enable row level security;
 alter table public.momentum_research_commodities enable row level security;
 alter table public.momentum_research_forex enable row level security;
 alter table public.momentum_research_crypto enable row level security;
@@ -246,7 +250,7 @@ do $$
 declare
   t text;
   tables text[] := array[
-    'momentum_research_monitored_stocks',
+    'momentum_research_stocks',
     'momentum_research_commodities',
     'momentum_research_forex',
     'momentum_research_crypto',

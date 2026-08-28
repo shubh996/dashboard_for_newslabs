@@ -8,6 +8,11 @@ import edgarRouter from './edgar/index.js'
 import yahooRouter from './yahoo/index.js'
 import { mountNotificationsRoutes } from './notifications.js'
 import { createMomentumRouter, startMomentumLoop } from './momentum/index.js'
+import {
+  deskOnlyBlockedPayload,
+  isDeskOnlyAllowedPath,
+  isDeskOnlyMode,
+} from './deskOnly.js'
 import { getYahooSession, fetchYahooQuoteSummary, yahooRaw } from './yahooClient.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -77,6 +82,15 @@ app.use((req, res, next) => {
 // thousands of trades) can comfortably exceed a few MB of JSON once saved to
 // Supabase -- 4mb was rejecting real save payloads with a 413.
 app.use(express.json({ limit: '25mb' }))
+
+// Momentum desk-only: block news / 9AM / Studio / Trigger-scrape / EDGAR / heavy Yahoo.
+app.use((request, response, next) => {
+  if (!isDeskOnlyMode()) return next()
+  const path = request.path || request.url || ''
+  if (!String(path).startsWith('/api/')) return next()
+  if (isDeskOnlyAllowedPath(request.method, path)) return next()
+  response.status(503).json(deskOnlyBlockedPayload(path))
+})
 
 /** Liveness for Hetzner / load balancers / uptime monitors */
 app.get('/api/health', (_req, res) => {
@@ -1352,5 +1366,10 @@ app.use('/api/momentum', createMomentumRouter())
 
 app.listen(port, host, () => {
   console.log(`News dashboard API listening on http://${host}:${port}`)
+  if (isDeskOnlyMode()) {
+    console.log(
+      '[DESK-ONLY] MOMENTUM_DESK_ONLY=1 — news/9AM/Studio/Trigger-scrape/EDGAR/heavy Yahoo APIs return 503; Momentum desk stays on',
+    )
+  }
   startMomentumLoop()
 })

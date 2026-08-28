@@ -22,6 +22,7 @@ import {
   fillMomentumResearchPrompt,
   callPerplexityResearch,
   extractLikelyDriver,
+  extractSecondaryDriver,
   structuredReasonHasLikelyDriver,
   sanitizeGeminiSessionHeadline,
   geminiMaxOutputTokens,
@@ -369,7 +370,9 @@ export async function researchStartMove(input) {
 
   // Robust extract (handles **Likely driver:** and mid-line after [TICKER] header)
   const likelyDriver = formatDashesToCommas(extractLikelyDriver(summary))
+  const secondaryDriver = formatDashesToCommas(extractSecondaryDriver(summary))
   const summaryFormatted = formatDashesToCommas(summary)
+  const episodeId = String(input.episodeId || input.episode_id || '').trim() || null
 
   // Title: start = emoji + % + trading-hours lookback; reverse = reverse headline
   // Body:  ONLY likely driver
@@ -403,6 +406,7 @@ export async function researchStartMove(input) {
         ticker,
         company_name: companyName || null,
         asset_class: cls,
+        episode_id: episodeId,
         window_key: windowKey,
         window_label: windowLabel,
         exact_label: exactLabel || null,
@@ -414,16 +418,12 @@ export async function researchStartMove(input) {
         reference_price: referencePrice,
         reference_time: referenceTime,
         likely_driver: likelyDriver || null,
-        reason: summaryFormatted || summary,
+        secondary_driver: secondaryDriver || null,
         push_title: pushTitle,
         push_body: pushBody,
-        model: result.model,
-        model_version: result.modelVersion,
+        model_version: result.modelVersion || result.model,
         request_id: result.requestId,
-        provider: 'perplexity',
         citations: result.citations || [],
-        search_results: result.search_results || [],
-        tools: result.tools || [],
         tokens: {
           prompt: result.usageRaw?.prompt_tokens ?? null,
           completion: result.usageRaw?.completion_tokens ?? null,
@@ -431,8 +431,6 @@ export async function researchStartMove(input) {
         },
         cost: result.cost,
         cost_usd_display: result.cost_usd_display,
-        prompt: fullPrompt,
-        input_facts: inputFacts,
       })
       void recordPerplexityUsageLedger(supabase, {
         ticker,
@@ -467,6 +465,8 @@ export async function researchStartMove(input) {
     user_movement: userMovement,
     reason: summaryFormatted || summary,
     likely_driver: likelyDriver || null,
+    secondary_driver: secondaryDriver || null,
+    episode_id: episodeId,
     push_title: pushTitle,
     push_body: pushBody,
     model: result.model,
@@ -650,6 +650,7 @@ export async function handleAutoStartResearchAlerts(opts) {
     try {
       research = await researchStartMove({
         ticker,
+        episodeId,
         companyName,
         windowKey,
         windowLabel: windowKey,
@@ -701,7 +702,6 @@ export async function handleAutoStartResearchAlerts(opts) {
           provider: research.provider || (dummyMode ? 'dummy' : 'perplexity'),
           model: research.model_version || research.model,
           citations: research.citations || [],
-          search_results: research.search_results || [],
           cost_usd_display: research.cost_usd_display,
           startedAt: researchStartedAt,
           completedAt: researchAt,
@@ -1060,6 +1060,7 @@ export async function handleAutoStartResearchAlerts(opts) {
             ? 'RESEARCH'
             : 'RESEARCH_FALLBACK',
       shouldNotify: true,
+      researchId: research.supabase_save?.id || research.id || null,
       // Full user-facing copy for mobile
       notification: { title, body },
       notificationTitle: title,
@@ -1104,7 +1105,7 @@ export async function handleAutoStartResearchAlerts(opts) {
             push_body: body,
             // Persist sources for Supabase / mobile (same as RESEARCH_DONE)
             citations: research.citations || [],
-            search_results: research.search_results || [],
+            researchId: research.supabase_save?.id || research.id || null,
           }
         : {
             status: 'error',
@@ -1147,6 +1148,7 @@ export async function handleAutoStartResearchAlerts(opts) {
                 ? exactMinutesFrozen
                 : null,
               exactLabel: exactLabelFrozen || null,
+              researchId: research.supabase_save?.id || research.id || null,
             },
           }
         : liveForPersist,
@@ -1191,6 +1193,7 @@ export async function handleAutoStartResearchAlerts(opts) {
               ? exactMinutesFrozen
               : null,
             exactLabel: exactLabelFrozen || null,
+            researchId: research.supabase_save?.id || research.id || null,
           },
           lastNotifiedTime: notifiedAt,
           lastNotifiedPrice: price ?? live.lastNotifiedPrice,

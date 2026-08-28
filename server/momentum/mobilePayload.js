@@ -109,7 +109,7 @@ export function buildMeasureExplain(ep, livePrice, movePercent) {
 }
 
 /**
- * Full episode snapshot for mobile (stored in momentum_episodes.payload).
+ * Full episode snapshot for mobile (stored in episodes_*.payload).
  */
 export function buildMobileEpisodePayload(ep) {
   if (!ep || typeof ep !== 'object') return {}
@@ -191,7 +191,7 @@ export function buildMobileEpisodePayload(ep) {
 }
 
 /**
- * Full timeline event for mobile (stored in momentum_episode_events.payload).
+ * Full timeline event for mobile (stored in episodes_events.payload).
  * @param {Record<string, unknown>} ev
  * @param {Record<string, unknown>|null} [episode]
  */
@@ -228,26 +228,31 @@ export function buildMobileEventPayload(ev, episode = null) {
         }
       : null
 
-  const pushResult =
-    ev.pushResult && typeof ev.pushResult === 'object' ? { ...ev.pushResult } : null
+  const rawPush =
+    ev.pushResult && typeof ev.pushResult === 'object' ? ev.pushResult : null
+  const pushResult = rawPush
+    ? {
+        sent_ok: num(rawPush.sent_ok ?? rawPush.sentOk),
+        recipient_count: num(rawPush.recipient_count ?? rawPush.recipientCount),
+        at: iso(rawPush.at),
+        ok: rawPush.ok != null ? Boolean(rawPush.ok) : null,
+      }
+    : null
 
   const research =
     ev.research && typeof ev.research === 'object'
       ? {
           status: str(ev.research.status),
-          mode: str(ev.research.mode),
-          reason: str(ev.research.reason),
           likely_driver: str(ev.research.likely_driver),
-          provider: str(ev.research.provider),
-          model: str(ev.research.model),
-          startedAt: iso(ev.research.startedAt),
-          completedAt: iso(ev.research.completedAt),
+          reason: str(
+            typeof ev.research.reason === 'string'
+              ? ev.research.reason.slice(0, 400)
+              : ev.research.reason,
+          ),
+          researchId: str(ev.research.id || ev.research.researchId),
           citations: Array.isArray(ev.research.citations)
-            ? ev.research.citations
-            : [],
-          search_results: Array.isArray(ev.research.search_results)
-            ? ev.research.search_results
-            : [],
+            ? ev.research.citations.slice(0, 8)
+            : undefined,
         }
       : null
 
@@ -306,9 +311,9 @@ export function buildMobileEventPayload(ev, episode = null) {
     notificationBody: notification?.body || null,
     pushResult,
     eligibleDeviceCount: num(ev.eligibleDeviceCount),
-    eligibleDevices: Array.isArray(ev.eligibleDevices) ? ev.eligibleDevices : [],
+    researchId: str(ev.researchId || research?.researchId),
 
-    // Research
+    // Research (pointer + short driver only — full blob lives in research)
     research,
     likely_driver: str(ev.likely_driver || research?.likely_driver),
 
@@ -325,13 +330,48 @@ export function buildMobileEventPayload(ev, episode = null) {
 }
 
 /**
+ * Never persist Yahoo OHLCV / chart series (or other live-fetch blobs) into
+ * Supabase episode/event payload. Momentum only needs scalars + mobile DTO.
+ */
+const YAHOO_CHART_BLOB_KEYS = new Set([
+  'candles',
+  'dailyCandles',
+  'rawCandles',
+  'candlesRaw',
+  'chart',
+  'chartRaw',
+  'yahooChart',
+  'yahooQuote',
+  'quoteRaw',
+  'sessionQuote',
+  'intraday',
+  'ohlcv',
+  'bars',
+  'series',
+  'quotes',
+  'history',
+  'priceHistory',
+  'normalizedCandles',
+])
+
+function stripYahooChartBlobs(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {}
+  const out = { ...obj }
+  for (const key of YAHOO_CHART_BLOB_KEYS) {
+    if (key in out) delete out[key]
+  }
+  return out
+}
+
+/**
  * Merge engine episode with mobile DTO for payload column.
+ * Explicitly strips any Yahoo 1m/chart history if it ever got attached.
  */
 export function episodePayloadForSupabase(ep) {
   const mobile = buildMobileEpisodePayload(ep)
   // Spread engine fields first, then mobile overwrites with canonical keys
   return {
-    ...(ep && typeof ep === 'object' ? ep : {}),
+    ...stripYahooChartBlobs(ep && typeof ep === 'object' ? ep : {}),
     ...mobile,
     mobile,
   }
@@ -339,11 +379,12 @@ export function episodePayloadForSupabase(ep) {
 
 /**
  * Merge engine event with mobile DTO for payload column.
+ * Explicitly strips any Yahoo 1m/chart history if it ever got attached.
  */
 export function eventPayloadForSupabase(ev, episode = null) {
   const mobile = buildMobileEventPayload(ev, episode)
   return {
-    ...(ev && typeof ev === 'object' ? ev : {}),
+    ...stripYahooChartBlobs(ev && typeof ev === 'object' ? ev : {}),
     ...mobile,
     mobile,
   }

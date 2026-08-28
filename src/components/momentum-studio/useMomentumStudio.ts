@@ -5,6 +5,7 @@ import {
   resolveYahooLogoUrl,
   type YahooLiveQuote,
 } from '@/services/yahooApi'
+import { isDeskOnlyMode } from '@/lib/deskOnly'
 import { detectAssetClass } from './format'
 import type {
   ActiveEpisodeRow,
@@ -15,13 +16,14 @@ import type {
 } from './types'
 
 export function useMomentumStudio() {
+  const deskOnly = isDeskOnlyMode()
   const [view, setView] = useState<StudioView>('overview')
   const [assetClass, setAssetClass] = useState<AssetClassId>('equity')
   const [tickers, setTickers] = useState<StudioTicker[]>([])
   const [byClass, setByClass] = useState<Partial<Record<AssetClassId, number>>>(
     {},
   )
-  const [listLoading, setListLoading] = useState(true)
+  const [listLoading, setListLoading] = useState(!deskOnly)
   const [activeTicker, setActiveTicker] = useState('')
   const [status, setStatus] = useState<StudioStatus | null>(null)
   const [statusLoading, setStatusLoading] = useState(false)
@@ -36,6 +38,7 @@ export function useMomentumStudio() {
    * true = filter to the selected entity’s episodes after a click.
    */
   const [railEntityFocus, setRailEntityFocus] = useState(false)
+  const [focusedEpisodeId, setFocusedEpisodeId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [testModeEnabled, setTestModeEnabled] = useState(false)
   const [testModeSaving, setTestModeSaving] = useState(false)
@@ -135,7 +138,7 @@ export function useMomentumStudio() {
   const loadEpisodeHistory = useCallback(async (opts?: { refresh?: boolean }) => {
     setEpisodeHistoryLoading(true)
     try {
-      const q = new URLSearchParams({ _: String(Date.now()), limit: '120' })
+      const q = new URLSearchParams({ _: String(Date.now()), limit: '40' })
       if (opts?.refresh) q.set('refresh', '1')
       const res = await fetch(`/api/momentum/episodes-history?${q}`)
       const body = await res.json().catch(() => ({}))
@@ -155,6 +158,10 @@ export function useMomentumStudio() {
   }, [])
 
   useEffect(() => {
+    if (deskOnly) {
+      setListLoading(false)
+      return
+    }
     void loadWatchlist()
     void fetch(`/api/momentum/test-mode?_=${Date.now()}`)
       .then((r) => r.json())
@@ -162,22 +169,24 @@ export function useMomentumStudio() {
         if (typeof b?.enabled === 'boolean') setTestModeEnabled(b.enabled)
       })
       .catch(() => {})
-  }, [loadWatchlist])
+  }, [loadWatchlist, deskOnly])
 
   useEffect(() => {
-    if (!activeTicker) return
+    if (deskOnly || !activeTicker) return
     void loadStatus(activeTicker)
     const id = window.setInterval(() => void loadStatus(activeTicker), 20_000)
     return () => window.clearInterval(id)
-  }, [activeTicker, loadStatus])
+  }, [activeTicker, loadStatus, deskOnly])
 
   useEffect(() => {
+    if (deskOnly) return
     void loadActiveEpisodes()
     const id = window.setInterval(() => void loadActiveEpisodes(), 30_000)
     return () => window.clearInterval(id)
-  }, [loadActiveEpisodes])
+  }, [loadActiveEpisodes, deskOnly])
 
   useEffect(() => {
+    if (deskOnly) return
     if (view !== 'episodes' && view !== 'overview') return
     void loadEpisodeHistory({ refresh: view === 'episodes' })
     const id = window.setInterval(
@@ -185,10 +194,10 @@ export function useMomentumStudio() {
       view === 'episodes' ? 20_000 : 45_000,
     )
     return () => window.clearInterval(id)
-  }, [view, loadEpisodeHistory])
+  }, [view, loadEpisodeHistory, deskOnly])
 
   useEffect(() => {
-    if (!classTickers.length) return
+    if (deskOnly || !classTickers.length) return
     const ac = new AbortController()
     void fetchYahooQuotes(
       classTickers.map((t) => t.ticker),
@@ -207,7 +216,7 @@ export function useMomentumStudio() {
       })
       .catch(() => {})
     return () => ac.abort()
-  }, [classTickers])
+  }, [classTickers, deskOnly])
 
   async function confirmTestMode(payload: {
     enabled: boolean
@@ -260,7 +269,11 @@ export function useMomentumStudio() {
 
   /** Manually end a live episode from the Active episodes rail (no push). */
   const endActiveEpisode = useCallback(
-    async (ticker: string, row?: ActiveEpisodeRow | null) => {
+    async (
+      ticker: string,
+      row?: ActiveEpisodeRow | null,
+      opts?: { skipConfirm?: boolean; skipRefresh?: boolean },
+    ) => {
       const symbol = String(ticker || '').trim().toUpperCase()
       if (!symbol || endingEpisodeTicker) return false
       const dir = row?.direction || 'episode'
@@ -272,12 +285,14 @@ export function useMomentumStudio() {
         peak != null
           ? `${peak > 0 ? '+' : ''}${peak.toFixed(2)}%`
           : ''
-      const ok = window.confirm(
-        `End the active ${dir} episode for ${symbol}?${
-          peakLabel ? `\nPeak so far: ${peakLabel}` : ''
-        }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
-      )
-      if (!ok) return false
+      if (!opts?.skipConfirm) {
+        const ok = window.confirm(
+          `End the active ${dir} episode for ${symbol}?${
+            peakLabel ? `\nPeak so far: ${peakLabel}` : ''
+          }\n\nThis only closes tracking — no push is sent. A new episode can start on the next threshold cross.`,
+        )
+        if (!ok) return false
+      }
 
       setEndingEpisodeTicker(symbol)
       try {
@@ -303,9 +318,11 @@ export function useMomentumStudio() {
         ) {
           setStatus(body.status)
         }
-        await loadActiveEpisodes()
-        if (railEntityFocus) {
-          await loadEpisodeHistory({ refresh: true })
+        if (!opts?.skipRefresh) {
+          await loadActiveEpisodes()
+          if (railEntityFocus) {
+            await loadEpisodeHistory({ refresh: true })
+          }
         }
         return true
       } catch (err) {
@@ -326,6 +343,48 @@ export function useMomentumStudio() {
     ],
   )
 
+  /** End every live ACTIVE episode in the rail (one confirm, no pushes). */
+  const endAllActiveEpisodes = useCallback(async () => {
+    if (endingEpisodeTicker) return false
+    const rows = activeEpisodes.filter((row) => {
+      const st = String(row.status || 'ACTIVE').toUpperCase()
+      return st === 'ACTIVE' && String(row.ticker || '').trim()
+    })
+    if (!rows.length) return false
+    const ok = window.confirm(
+      `End all ${rows.length} active episode${rows.length === 1 ? '' : 's'}?\n\nThis only closes tracking — no push is sent. New episodes can start on the next threshold cross.`,
+    )
+    if (!ok) return false
+
+    const failed: string[] = []
+    for (const row of rows) {
+      const symbol = String(row.ticker || '').trim().toUpperCase()
+      if (!symbol) continue
+      const done = await endActiveEpisode(row.ticker, row, {
+        skipConfirm: true,
+        skipRefresh: true,
+      })
+      if (!done) failed.push(symbol)
+    }
+    await loadActiveEpisodes()
+    if (railEntityFocus) {
+      await loadEpisodeHistory({ refresh: true })
+    }
+    if (failed.length) {
+      window.alert(
+        `Ended with ${failed.length} error${failed.length === 1 ? '' : 's'} for: ${failed.slice(0, 8).join(', ')}${failed.length > 8 ? '…' : ''}`,
+      )
+    }
+    return failed.length === 0
+  }, [
+    activeEpisodes,
+    endActiveEpisode,
+    endingEpisodeTicker,
+    loadActiveEpisodes,
+    loadEpisodeHistory,
+    railEntityFocus,
+  ])
+
   /**
    * Select a history/active row: stay on episodes view.
    * Right column switches to that entity’s episodes (active + history).
@@ -337,15 +396,19 @@ export function useMomentumStudio() {
       const item = tickers.find((t) => t.ticker.toUpperCase() === ticker)
       if (item) setAssetClass(item.assetClass)
       setActiveTicker(ticker)
+      setFocusedEpisodeId(row.episodeId ? String(row.episodeId) : null)
       setRailEntityFocus(true)
       setView('episodes')
+      void loadStatus(ticker)
+      void loadEpisodeHistory({ refresh: true })
     },
-    [tickers],
+    [tickers, loadStatus, loadEpisodeHistory],
   )
 
   /** Reset 3rd column to all live ACTIVE episodes. */
   const clearRailEntityFocus = useCallback(() => {
     setRailEntityFocus(false)
+    setFocusedEpisodeId(null)
   }, [])
 
   /** Live ACTIVE episode for the focused ticker (3rd column), if any. */
@@ -383,6 +446,7 @@ export function useMomentumStudio() {
   }, [activeEpisodes])
 
   return {
+    deskOnly,
     view,
     setView,
     assetClass,
@@ -404,6 +468,7 @@ export function useMomentumStudio() {
     episodeHistoryLoading,
     activeEpisodeForTicker,
     railEntityFocus,
+    focusedEpisodeId,
     setRailEntityFocus,
     clearRailEntityFocus,
     settingsOpen,
@@ -420,6 +485,7 @@ export function useMomentumStudio() {
     confirmTestMode,
     runTick,
     endActiveEpisode,
+    endAllActiveEpisodes,
     selectActiveEpisode,
     livePrice,
     dayPct,
