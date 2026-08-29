@@ -21,7 +21,6 @@ import {
   BellRing,
   Bitcoin,
   Check,
-  Clock,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -383,10 +382,6 @@ type MomentumEvent = {
       message?: string | null
     }>
   } | null
-  /** Perplexity research findings (manual research or attached) */
-  research?: EventResearch | null
-  researchId?: string | null
-  likely_driver?: string | null
 }
 
 /** One momentum episode with its events nested under it. */
@@ -7475,10 +7470,6 @@ export function EpisodeDashboard({
     tickerHasActiveEpisode,
   ])
 
-  const entityListLoading =
-    assetClassTab != null &&
-    monitoredLoading &&
-    !displayedEntities.length
   /** Asset-class list hydrate from Supabase (device monitor). */
   const entityListUpdatingFromSupabase =
     assetClassTab != null && monitoredLoading
@@ -7779,7 +7770,7 @@ export function EpisodeDashboard({
       const cls = (
         ASSET_CLASS_TABS.some((tab) => tab.id === raw)
           ? raw
-          : tabAssetClass({ ticker: t, assetClass: raw })
+          : tabAssetClass({ ticker: t, label: t, assetClass: raw })
       ) as AssetClassTabId
       const resolved = (
         ASSET_CLASS_TABS.some((tab) => tab.id === cls) ? cls : 'equity'
@@ -8046,12 +8037,6 @@ export function EpisodeDashboard({
     setLogCollapsedPersist(false)
   }, [setLogCollapsedPersist])
 
-  /** Open right rail on the activity / engine log. */
-  const openActivityLogInLogColumn = useCallback(() => {
-    setRightRailMode('logs')
-    setLogCollapsedPersist(false)
-  }, [setLogCollapsedPersist])
-
   function policyDraftFromSnapshot(
     pol:
       | {
@@ -8225,13 +8210,6 @@ export function EpisodeDashboard({
       setActiveEpisodesUpdatingFromSupabase(false)
     }
   }, [])
-
-  /** Settings → Active episodes: all live episodes in the right column. */
-  const openActiveEpisodesRail = useCallback(() => {
-    setRightRailMode('activeEpisodes')
-    setLogCollapsedPersist(false)
-    void loadActiveEpisodesList()
-  }, [setLogCollapsedPersist, loadActiveEpisodesList])
 
   // Desk: paint cache immediately, then refresh history from Supabase.
   useEffect(() => {
@@ -12607,13 +12585,6 @@ export function EpisodeDashboard({
                                   Number.isFinite(Number(row.initialMovePercent))
                                 ? Number(row.initialMovePercent)
                                 : null
-                        const nowKind: 'current' | 'peak' | 'initial' =
-                          row.currentMovePercent != null &&
-                          Number.isFinite(Number(row.currentMovePercent))
-                            ? 'current'
-                            : peakMove != null
-                              ? 'peak'
-                              : 'initial'
                         const no = formatEpisodeNo(row.episodeNo)
                         const sourceTable =
                           String(row.sourceTable || '').trim() ||
@@ -14101,6 +14072,7 @@ export function EpisodeDashboard({
                                   tab.id ===
                                   tabAssetClass({
                                     ticker: displayTicker,
+                                    label: displayTicker,
                                     assetClass: detectAssetClass(displayTicker),
                                   }),
                               )?.label || 'Markets'
@@ -18698,7 +18670,8 @@ export function EpisodeDashboard({
   )
 }
 
-function Stat({
+/** Episode-card metric chip (exported for reuse / keeps tsc noUnusedLocals happy). */
+export function Stat({
   label,
   value,
   valueClass,
