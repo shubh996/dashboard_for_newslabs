@@ -1,23 +1,14 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { BrowserRouter, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { BottomToastProvider } from '@/components/ui/bottom-toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { SitePasscodeGate } from '@/components/SitePasscodeGate'
 import { ServiceErrorGate } from '@/components/ServiceErrorGate'
 import { apiUrl, hasExternalApiBase } from '@/lib/apiBase'
 import './index.css'
-import App from './App.tsx'
-import TickerDashboard from '@/pages/TickerDashboard.tsx'
-import YahooTickerDashboard from '@/pages/YahooTickerDashboard.tsx'
-import ManagerPortfolioPage from '@/pages/ManagerPortfolioPage.tsx'
-import PoliticianPortfolioPage from '@/pages/PoliticianPortfolioPage.tsx'
-import TickerDatabasePage from '@/pages/TickerDatabasePage.tsx'
-import PrivacyPage from '@/pages/PrivacyPage.tsx'
-import TermsPage from '@/pages/TermsPage.tsx'
-import SupportPage from '@/pages/SupportPage.tsx'
+import EpisodePage from '@/pages/EpisodePage.tsx'
 import NotificationsPage from '@/pages/NotificationsPage.tsx'
-import MomentumStudioPage from '@/pages/MomentumStudioPage.tsx'
 
 /**
  * When VITE_API_BASE_URL is set (Cloudflare Pages → remote Node API), rewrite
@@ -85,17 +76,10 @@ createRoot(document.getElementById('root')!).render(
           <SitePasscodeGate>
             <ServiceErrorGate>
               <Routes>
-                <Route path="/privacy" element={<PrivacyPage />} />
-                <Route path="/terms" element={<TermsPage />} />
-                <Route path="/support" element={<SupportPage />} />
+                <Route path="/" element={<EpisodePage />} />
+                <Route path="/trigger" element={<NotificationsPage />} />
                 <Route path="/notifications" element={<NotificationsPage />} />
-                <Route path="/momentum-studio" element={<MomentumStudioPage />} />
-                <Route path="/dashboard/database" element={<TickerDatabasePage />} />
-                <Route path="/dashboard/yahoo/:symbol" element={<YahooTickerDashboard />} />
-                <Route path="/dashboard/ticker/manager/:cik" element={<ManagerPortfolioPage />} />
-                <Route path="/dashboard/ticker/politician/:filerId" element={<PoliticianPortfolioPage />} />
-                <Route path="/dashboard/ticker/:symbol" element={<TickerDashboard />} />
-                <Route path="*" element={<App />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>
             </ServiceErrorGate>
           </SitePasscodeGate>

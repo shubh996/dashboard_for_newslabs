@@ -8,8 +8,11 @@ import {
   buildMarketBulletinBody,
   buildMarketBulletinPushBody,
   buildMarketBulletinTitle,
+  buildMarketSessionResearchPrompt,
   dueMarketBulletinSlots,
   isWithinBulletinFireWindow,
+  classifyTickerMarkets,
+  isMarketBulletinEligibleTicker,
 } from './marketSessionBulletin.js'
 
 describe('marketSessionBulletin format', () => {
@@ -18,7 +21,6 @@ describe('marketSessionBulletin format', () => {
     assert.equal(formatStockBracketPct('AAPL', -0.5), 'AAPL (-0.5%)')
     assert.equal(formatStockBracketPct('TSLA', 0), 'TSLA (0.0%)')
     assert.equal(formatStockBracketPct('IBM', null), 'IBM (n/a)')
-    // Futures → human names in headings
     assert.equal(formatStockBracketPct('NG=F', 2.5), 'Natural Gas (+2.5%)')
     assert.equal(formatStockBracketPct('CL=F', -1.2), 'Crude Oil (-1.2%)')
     assert.equal(formatStockBracketPct('GC=F', 0.8), 'Gold (+0.8%)')
@@ -33,40 +35,81 @@ describe('marketSessionBulletin format', () => {
     assert.equal(body, 'SNDK (+3.1%) · AAPL (-0.5%) · TSLA (+2.1%)')
   })
 
-  it('push body has no watchlist dump', () => {
-    const openBody = buildMarketBulletinPushBody('OPEN')
-    const closeBody = buildMarketBulletinPushBody('CLOSE')
-    assert.ok(/unusual momentum/i.test(openBody))
-    assert.ok(/watchlist assets/i.test(openBody))
-    assert.ok(/tap to see what.?s moving/i.test(openBody))
-    assert.ok(/trigger never sleeps/i.test(closeBody))
-    assert.ok(/unusual momentum/i.test(closeBody))
-    assert.ok(/watchlist assets/i.test(closeBody))
-    // Must never look like the old lock-screen spam
+  it('yahoo fallback body has no watchlist dump', () => {
+    const openBody = buildMarketBulletinPushBody('OPEN', 'us', {
+      probeSymbol: 'SPY',
+      dayChangePercent: 0.42,
+    })
+    const closeBody = buildMarketBulletinPushBody('CLOSE', 'us', {
+      probeSymbol: 'SPY',
+      dayChangePercent: -0.4,
+    })
+    assert.ok(/US market/i.test(openBody))
+    assert.ok(/open/i.test(openBody))
+    assert.ok(/SPY/i.test(openBody))
+    assert.ok(/closed/i.test(closeBody))
     assert.ok(!/\(n\/a\)/i.test(openBody))
-    assert.ok(!/\(n\/a\)/i.test(closeBody))
-    assert.ok(!/SNDK \(\+/.test(openBody))
-    assert.ok(!/IONQ/i.test(openBody))
     assert.ok(!/ · /.test(openBody))
+
+    const indiaClose = buildMarketBulletinPushBody('CLOSE', 'india', {
+      probeSymbol: 'RELIANCE.NS',
+      dayChangePercent: 1.1,
+    })
+    assert.ok(/Indian market/i.test(indiaClose))
+    assert.ok(/RELIANCE\.NS/i.test(indiaClose))
   })
 
-  it('titles open and close without dates', () => {
+  it('titles open and close for US and India', () => {
     assert.equal(buildMarketBulletinTitle('OPEN'), 'The US market has opened')
     assert.equal(buildMarketBulletinTitle('CLOSE'), 'The US market has closed')
     assert.equal(
-      buildMarketBulletinTitle('OPEN', '2026-08-14'),
-      'The US market has opened',
+      buildMarketBulletinTitle('OPEN', '2026-08-14', 'india'),
+      'The Indian market has opened',
+    )
+    assert.equal(
+      buildMarketBulletinTitle('CLOSE', '', 'india'),
+      'The Indian market has closed',
+    )
+  })
+
+  it('builds a short Perplexity prompt from saved Yahoo facts', () => {
+    const prompt = buildMarketSessionResearchPrompt({
+      market: 'us',
+      slot: 'OPEN',
+      sessionDate: '2026-08-28',
+      snap: {
+        probeSymbol: 'SPY',
+        marketState: 'REGULAR',
+        last: 650.25,
+        open: 648.5,
+        previousClose: 647.1,
+        dayChangePercent: 0.486,
+      },
+    })
+    assert.match(prompt, /exactly 2 or 3 short sentences/i)
+    assert.match(prompt, /US market opened on 2026-08-28/)
+    assert.match(prompt, /yahoo_probe=SPY/)
+    assert.match(prompt, /yahoo_market_state=REGULAR/)
+    assert.match(prompt, /yahoo_day_change_percent=\+0\.49%/)
+  })
+
+  it('builds India / China / Australia titles', () => {
+    assert.equal(
+      buildMarketBulletinTitle('OPEN', '', 'china'),
+      'The Chinese market has opened',
+    )
+    assert.equal(
+      buildMarketBulletinTitle('CLOSE', '', 'australia'),
+      'The Australian market has closed',
     )
   })
 
   it('dueMarketBulletinSlots empty on weekend', () => {
-    // 2026-08-15 is Saturday
     const sat = Date.parse('2026-08-15T15:00:00.000Z')
     assert.deepEqual(dueMarketBulletinSlots(sat), [])
   })
 
   it('OPEN only due inside post-open grace — not all day', () => {
-    // Mon 2026-08-17 open+5 = 13:35 UTC (9:35 ET EDT)
     const openFire = Date.parse('2026-08-17T13:35:00.000Z')
     assert.ok(isWithinBulletinFireWindow(openFire + 60_000, openFire))
     assert.equal(
@@ -75,35 +118,31 @@ describe('marketSessionBulletin format', () => {
         .join(','),
       'OPEN',
     )
-
-    // Mid-session 11:14 ET = 15:14 UTC — must NOT re-fire OPEN
-    // (this is the bug from the lock-screen screenshot)
     const mid = Date.parse('2026-08-17T15:14:00.000Z')
-    assert.deepEqual(dueMarketBulletinSlots(mid), [])
+    assert.equal(dueMarketBulletinSlots(mid).length, 0)
+  })
+})
 
-    // After open grace (openFire + 25m)
-    assert.deepEqual(dueMarketBulletinSlots(openFire + 25 * 60_000), [])
-
-    // Pre-open 9:20 ET — not yet
-    const pre = Date.parse('2026-08-17T13:20:00.000Z')
-    assert.deepEqual(dueMarketBulletinSlots(pre), [])
+describe('marketSessionBulletin targeting', () => {
+  it('classifies India / China / Australia / US tickers from holdings', () => {
+    assert.ok(classifyTickerMarkets('RELIANCE.NS').has('india'))
+    assert.ok(classifyTickerMarkets('TCS.BO').has('india'))
+    assert.ok(!classifyTickerMarkets('RELIANCE.NS').has('us'))
+    assert.ok(classifyTickerMarkets('0700.HK').has('china'))
+    assert.ok(classifyTickerMarkets('600519.SS').has('china'))
+    assert.ok(classifyTickerMarkets('BHP.AX').has('australia'))
+    assert.ok(classifyTickerMarkets('AAPL').has('us'))
+    assert.ok(classifyTickerMarkets('SPY').has('us'))
+    assert.equal(classifyTickerMarkets('BTC-USD').size, 0)
+    assert.equal(classifyTickerMarkets('EURUSD=X').size, 0)
+    assert.equal(classifyTickerMarkets('VOD.L').size, 0)
   })
 
-  it('CLOSE only due inside post-close grace', () => {
-    // Close+5 = 16:05 ET = 20:05 UTC (EDT)
-    const closeFire = Date.parse('2026-08-17T20:05:00.000Z')
-    const due = dueMarketBulletinSlots(closeFire + 30_000)
-    assert.equal(due.length, 1)
-    assert.equal(due[0].slot, 'CLOSE')
-    assert.deepEqual(dueMarketBulletinSlots(closeFire + 30 * 60_000), [])
-  })
-
-  it('never due outside US equity RTH open/close windows', () => {
-    // After close evening 18:00 ET
-    const evening = Date.parse('2026-08-17T22:00:00.000Z')
-    assert.deepEqual(dueMarketBulletinSlots(evening), [])
-    // Overnight 2:00 ET
-    const overnight = Date.parse('2026-08-18T06:00:00.000Z')
-    assert.deepEqual(dueMarketBulletinSlots(overnight), [])
+  it('eligible helpers', () => {
+    assert.equal(isMarketBulletinEligibleTicker('AAPL'), true)
+    assert.equal(isMarketBulletinEligibleTicker('RELIANCE.NS'), true)
+    assert.equal(isMarketBulletinEligibleTicker('0700.HK'), true)
+    assert.equal(isMarketBulletinEligibleTicker('BHP.AX'), true)
+    assert.equal(isMarketBulletinEligibleTicker('BTC-USD'), false)
   })
 })

@@ -16,7 +16,7 @@ import {
   sendTriggerEpisodePush,
   loadExpoRecipientsForTicker,
 } from '../notifications.js'
-import { resolvePushRecipients } from './testMode.js'
+import { resolvePushRecipients } from './recipientPolicy.js'
 import * as store from './store.js'
 import { isPushWorthy, buildNotificationCopy } from './notifyCopy.js'
 import { calendarAllowsHeavyWork } from './engineGate.js'
@@ -57,7 +57,7 @@ export async function loadWatchlistEligibleDevices(ticker) {
 
   try {
     const recipients = await loadExpoRecipientsForTicker(supabase, symbol, 'trigger')
-    // Test mode → tester only; prod → subscribers + always-notify tester
+    // Relevant subscribers + the always-notify Trigger iPhone.
     return resolvePushRecipients(recipients, 'trigger').map((r) => ({
       device_id: r.device_id,
       expo_push_token: r.expo_push_token,
@@ -70,7 +70,7 @@ export async function loadWatchlistEligibleDevices(ticker) {
       '[momentum delivery] watchlist load failed:',
       err instanceof Error ? err.message : err,
     )
-    // Still return always-notify tester so episode alerts can reach the owner
+    // Still return the always-notify Trigger iPhone so alerts reach the owner.
     return resolvePushRecipients([], 'trigger').map((r) => ({
       device_id: r.device_id,
       expo_push_token: r.expo_push_token,
@@ -224,7 +224,7 @@ export async function enrichEventForDelivery(event, episode = null, opts = {}) {
     errors: pushResult.errors || [],
     device_ids: pushResult.device_ids || [],
     recipients: pushResult.recipients || [],
-    forced_allowlist: Boolean(pushResult.forced_allowlist),
+    always_notify_included: Boolean(pushResult.always_notify_included),
     tickets: pushResult.tickets || [],
     at: notifiedAt,
   }

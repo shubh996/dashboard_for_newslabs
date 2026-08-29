@@ -1,15 +1,15 @@
--- episodes_events: asset_class, drop fat payload + unused span/ratio columns.
+-- events_episodes: asset_class, drop fat payload + unused span/ratio columns.
 
-alter table public.episodes_events
+alter table public.events_episodes
   add column if not exists asset_class text;
 
-update public.episodes_events
+update public.events_episodes
 set giveback_pct = giveback_ratio * 100
 where giveback_pct is null
   and giveback_ratio is not null
   and abs(giveback_ratio) <= 1.5;
 
-update public.episodes_events
+update public.events_episodes
 set asset_class = case
   when lower(coalesce(payload->>'assetClass', payload->>'asset_class', ''))
     in ('crypto', 'cryptocurrency')
@@ -30,7 +30,7 @@ set asset_class = case
 end
 where coalesce(asset_class, '') = '';
 
-alter table public.episodes_events
+alter table public.events_episodes
   drop column if exists payload,
   drop column if exists exact_label,
   drop column if exists window_minutes,

@@ -1364,6 +1364,145 @@ mountNotificationsRoutes(app, { getSupabase })
 // Multi-ticker momentum engine (intraday rolling moves) — debug API + poll loop
 app.use('/api/momentum', createMomentumRouter())
 
+/**
+ * Deep-link into Supabase SQL Editor for one episode row plus its full event
+ * timeline. The generated result keeps the episode columns at the top level
+ * and adds `event_count` + a chronological `events` JSON array.
+ */
+app.get('/api/desk/supabase-episode-link', async (request, response) => {
+  try {
+    const episodeId = String(request.query.episode_id || '').trim()
+    const ticker = String(request.query.ticker || '').trim().toUpperCase()
+    const assetClass = String(request.query.asset_class || '').trim()
+    if (!episodeId) {
+      response.status(400).json({ error: 'episode_id required' })
+      return
+    }
+
+    const { episodeTableFor } = await import('./momentum/persist.js')
+    const preferredTable = episodeTableFor(
+      ticker || episodeId.split('-')[0],
+      assetClass,
+    )
+
+    const projectRef = (() => {
+      try {
+        return new URL(process.env.SUPABASE_URL || '').hostname.split('.')[0] || ''
+      } catch {
+        return ''
+      }
+    })()
+    if (!projectRef) {
+      response.status(500).json({ error: 'SUPABASE_URL missing/invalid' })
+      return
+    }
+
+    const safeEpisodeId = episodeId.replace(/'/g, "''")
+    const episodeTables = [
+      'episodes_stocks',
+      'episodes_etfs',
+      'episodes_indexes',
+      'episodes_forex',
+      'episodes_crypto',
+      'episodes_commodities',
+      'episodes',
+    ]
+    const unionEpisode = episodeTables
+      .map(
+        (table) =>
+          `  select '${table}'::text as source_table, to_jsonb(t) as row\n  from public.${table} as t\n  where t.episode_id = '${safeEpisodeId}'`,
+      )
+      .join('\n  union all\n')
+
+    // Full related bundle: episode (any class table) + events + Perplexity research
+    const sql = `-- Everything related to episode_id = ${safeEpisodeId}
+-- Tables: episodes_* · events_episodes · research (Perplexity)
+with episode_hits as (
+${unionEpisode}
+),
+episode_pick as (
+  select *
+  from episode_hits
+  order by
+    case source_table
+      when '${preferredTable.replace(/'/g, "''")}' then 0
+      when 'episodes_stocks' then 1
+      when 'episodes_etfs' then 2
+      when 'episodes_indexes' then 3
+      when 'episodes_forex' then 4
+      when 'episodes_crypto' then 5
+      when 'episodes_commodities' then 6
+      else 9
+    end
+  limit 1
+),
+event_rows as (
+  select e.*
+  from public.events_episodes as e
+  where e.episode_id = '${safeEpisodeId}'
+  order by e.detected_at asc nulls last
+),
+research_rows as (
+  select distinct on (r.id) r.*
+  from public.research as r
+  where r.episode_id = '${safeEpisodeId}'
+     or r.id in (
+       select ev.research_id
+       from public.events_episodes as ev
+       where ev.episode_id = '${safeEpisodeId}'
+         and ev.research_id is not null
+     )
+  order by r.id, r.created_at desc nulls last
+)
+select
+  (select source_table from episode_pick) as episode_source_table,
+  (select row from episode_pick) as episode,
+  (
+    select coalesce(
+      jsonb_agg(to_jsonb(ev) order by ev.detected_at asc nulls last),
+      '[]'::jsonb
+    )
+    from event_rows as ev
+  ) as events,
+  (
+    select coalesce(jsonb_agg(to_jsonb(r) order by r.created_at asc nulls last), '[]'::jsonb)
+    from research_rows as r
+  ) as research,
+  (select count(*)::int from event_rows) as event_count,
+  (select count(*)::int from research_rows) as research_count;`
+
+    const sqlUrl = `https://supabase.com/dashboard/project/${encodeURIComponent(projectRef)}/sql/new?skip=true&content=${encodeURIComponent(sql)}`
+
+    response.json({
+      ok: true,
+      projectRef,
+      table: preferredTable,
+      episode_id: episodeId,
+      ticker: ticker || null,
+      filter: `episode_id:eq:${episodeId}`,
+      url: sqlUrl,
+      sqlUrl,
+      sql,
+      mode: 'sql-editor',
+      includes: [
+        'episodes_stocks',
+        'episodes_etfs',
+        'episodes_indexes',
+        'episodes_forex',
+        'episodes_crypto',
+        'episodes_commodities',
+        'episodes',
+        'events_episodes',
+        'research',
+      ],
+    })
+  } catch (error) {
+    response.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to build Supabase link',
+    })
+  }
+})
+
 app.listen(port, host, () => {
   console.log(`News dashboard API listening on http://${host}:${port}`)
   if (isDeskOnlyMode()) {

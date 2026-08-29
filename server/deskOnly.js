@@ -25,21 +25,22 @@ export function isDeskOnlyAllowedPath(method, pathname) {
   // Original Momentum desk — full surface
   if (p === '/api/momentum' || p.startsWith('/api/momentum/')) return true
 
-  // Yahoo — only live quote/chart/search the desk needs (not full module dumps)
+  // Desk helpers (Supabase deep-link to episode row)
+  if (p === '/api/desk/supabase-episode-link') return m === 'GET'
+
+  // Yahoo — Episode desk + Trigger extremes
   if (p === '/api/yahoo/quotes') return m === 'GET'
   if (p === '/api/yahoo/search') return m === 'GET'
+  if (p === '/api/yahoo/extreme-movers') return m === 'GET'
+  if (p === '/api/yahoo/market-lists' || p === '/api/yahoo/most-actives') return m === 'GET'
   if (/^\/api\/yahoo\/[^/]+\/quote$/.test(p)) return m === 'GET'
   if (/^\/api\/yahoo\/[^/]+\/chart$/.test(p)) return m === 'GET'
   if (/^\/api\/yahoo\/[^/]+\/profile$/.test(p)) return m === 'GET'
+  // Share-card / desk logos (Peak · So Far image preview)
+  if (/^\/api\/yahoo\/[^/]+\/logo$/.test(p)) return m === 'GET'
 
-  // Notifications — only pieces the Momentum desk uses
-  if (p.startsWith('/api/notifications/devices')) return true
-  if (p.startsWith('/api/notifications/usage/perplexity')) return m === 'GET'
-  if (p.startsWith('/api/notifications/momentum-research')) return true
-  if (p === '/api/notifications/alert-news') return m === 'POST'
-  if (p === '/api/notifications/test-mode' || p.startsWith('/api/notifications/test-mode')) {
-    return true
-  }
+  // Notifications — Episode desk + Trigger extremes/share/scrape desk
+  if (p.startsWith('/api/notifications/')) return true
 
   return false
 }

@@ -26,7 +26,14 @@ export function timeZoneSuffix(date: Date, requestedTimeZone?: string): string {
         ?.value.trim() || ''
     )
   } catch {
-    return ''
+    if (requestedTimeZone) return requestedTimeZone
+    const offsetMinutes = -date.getTimezoneOffset()
+    if (offsetMinutes === 0) return 'UTC'
+    const sign = offsetMinutes >= 0 ? '+' : '-'
+    const absolute = Math.abs(offsetMinutes)
+    const hours = Math.floor(absolute / 60)
+    const minutes = absolute % 60
+    return `UTC${sign}${hours}${minutes ? `:${String(minutes).padStart(2, '0')}` : ''}`
   }
 }
 
@@ -37,4 +44,33 @@ export function localTimeZoneSuffix(date: Date): string {
 export function withLocalTimeZone(value: string, date: Date): string {
   const suffix = localTimeZoneSuffix(date)
   return suffix ? `${value} ${suffix}` : value
+}
+
+type LocalDateTimeInput = Date | string | number
+
+function validLocalDate(value: LocalDateTimeInput): Date | null {
+  const date = value instanceof Date ? value : new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+/** Format a browser-local date/time and always append its short timezone. */
+export function formatLocalDateTimeWithZone(
+  value: LocalDateTimeInput,
+  options: Intl.DateTimeFormatOptions = {},
+  locale = 'en-US',
+): string {
+  const date = validLocalDate(value)
+  if (!date) return '—'
+  return withLocalTimeZone(date.toLocaleString(locale, options), date)
+}
+
+/** Format a browser-local clock and always append its short timezone. */
+export function formatLocalTimeWithZone(
+  value: LocalDateTimeInput,
+  options: Intl.DateTimeFormatOptions = {},
+  locale = 'en-US',
+): string {
+  const date = validLocalDate(value)
+  if (!date) return '—'
+  return withLocalTimeZone(date.toLocaleTimeString(locale, options), date)
 }

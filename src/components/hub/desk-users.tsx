@@ -14,11 +14,42 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
-import { fmtDateTime } from '@/components/momentum-studio/format'
-import type { StudioDevice } from '@/components/momentum-studio/users-view'
+import { fmtDateTime } from '@/components/hub/format'
 import { CompanyLogo } from '@/components/hub/company-logo'
 
-export type DeskDevice = StudioDevice
+export type DeskDevice = {
+  device_id?: string | null
+  expo_push_token?: string | null
+  app_key?: string | null
+  enabled?: boolean
+  subscription_status?: string | null
+  tickers?: string[]
+  enabled_tickers?: string[]
+  enabled_count?: number
+  disabled_count?: number
+  pro_crypto?: boolean
+  user_id?: string | null
+  platform?: string | null
+  device_model?: string | null
+  manufacturer?: string | null
+  os_version?: string | null
+  app_version?: string | null
+  build_number?: string | null
+  timezone?: string | null
+  locale?: string | null
+  notifications_enabled?: boolean | null
+  permission_status?: string | null
+  last_seen_at?: string | null
+  token_updated_at?: string | null
+  created_at?: string | null
+  profile_updated_at?: string | null
+  subscriber_updated_at?: string | null
+  featured_device?: boolean
+  featured_id?: string | null
+  featured_label?: string | null
+  featured_role?: 'always_notify' | 'featured' | string | null
+  always_notify?: boolean
+}
 
 export type DeskUserActivity = {
   id: string
@@ -101,6 +132,42 @@ function formatFieldValue(
 
 export function deskDeviceKey(d: DeskDevice): string {
   return String(d.device_id || d.expo_push_token || '').trim()
+}
+
+const TRIGGER_ALWAYS_DEVICE_ID =
+  'ios-0c793db2-c3a0-4ee7-b742-4270d81e20f7'
+const TRIGGER_ALWAYS_TOKEN =
+  'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'
+const EXPO_APP_DEVICE_ID = 'ios-1ddd5b0c-5ff8-401f-b0a6-ae9beaac8ea1'
+const EXPO_APP_TOKEN = 'ExponentPushToken[Q4Q4xqGpb9fyE9kpMPdUYZ]'
+
+function deskFeaturedRole(
+  device: DeskDevice,
+): 'always_notify' | 'featured' | null {
+  if (device.always_notify || device.featured_role === 'always_notify') {
+    return 'always_notify'
+  }
+  const id = String(device.device_id || '').trim()
+  const token = String(device.expo_push_token || '').trim()
+  if (id === TRIGGER_ALWAYS_DEVICE_ID || token === TRIGGER_ALWAYS_TOKEN) {
+    return 'always_notify'
+  }
+  if (
+    device.featured_device ||
+    device.featured_role === 'featured' ||
+    id === EXPO_APP_DEVICE_ID ||
+    token === EXPO_APP_TOKEN
+  ) {
+    return 'featured'
+  }
+  return null
+}
+
+function deskFeaturedLabel(device: DeskDevice): string | null {
+  const role = deskFeaturedRole(device)
+  if (role === 'always_notify') return 'Trigger app · iPhone 16'
+  if (role === 'featured') return 'Expo app'
+  return null
 }
 
 export function deskPlatformLabel(
@@ -213,7 +280,7 @@ export function buildDeskLifecycleActivities(
 }
 
 /** Platform mark for Users list (Apple / Android) with Smartphone fallback. */
-function PlatformDeviceLogo({
+export function PlatformDeviceLogo({
   platform,
   deviceId,
   className,
@@ -265,6 +332,8 @@ export function DeskUserListButton({
 }) {
   const platform = deskPlatformLabel(device.platform, device.device_id)
   const status = String(device.subscription_status || 'off')
+  const featuredRole = deskFeaturedRole(device)
+  const featuredLabel = deskFeaturedLabel(device)
   const tickerCount = Math.max(
     0,
     Number(
@@ -274,6 +343,13 @@ export function DeskUserListButton({
         0,
     ) || 0,
   )
+  const tickerLabels = [
+    ...(device.enabled_tickers?.length
+      ? device.enabled_tickers
+      : device.tickers || []),
+  ]
+    .map((ticker) => String(ticker || '').trim().toUpperCase())
+    .filter((ticker, index, list) => Boolean(ticker) && list.indexOf(ticker) === index)
   return (
     <Button
       type="button"
@@ -281,8 +357,14 @@ export function DeskUserListButton({
       data-pill="false"
       onClick={onClick}
       className={cn(
-        'h-auto min-h-10 w-full justify-start gap-2 rounded-lg px-2 py-1.5 text-left',
-        active && 'bg-muted hover:bg-muted',
+        'h-auto min-h-11 w-full justify-start gap-2 rounded-lg border px-2 py-1.5 text-left',
+        !featuredRole && 'border-transparent',
+        featuredRole === 'always_notify' &&
+          'border-amber-500/40 bg-amber-500/10 shadow-sm hover:bg-amber-500/15',
+        featuredRole === 'featured' &&
+          'border-sky-500/35 bg-sky-500/10 shadow-sm hover:bg-sky-500/15',
+        active && !featuredRole && 'bg-muted hover:bg-muted',
+        active && featuredRole && 'ring-2 ring-ring/35',
       )}
     >
       <PlatformDeviceLogo
@@ -292,20 +374,66 @@ export function DeskUserListButton({
       <span className="min-w-0 flex-1">
         <span className="flex min-w-0 items-center gap-1.5">
           <span className="truncate text-[13px] font-semibold tracking-tight">
-            {device.device_model ||
+            {featuredLabel ||
+              device.device_model ||
               platform ||
               String(device.device_id || 'Device').slice(0, 18)}
           </span>
-          {platform ? (
+          {featuredRole ? (
+            <Badge
+              variant="outline"
+              className={cn(
+                'h-5 shrink-0 gap-1 px-1.5 text-[9px] font-semibold uppercase tracking-wide',
+                featuredRole === 'always_notify'
+                  ? 'border-amber-500/40 bg-amber-500/15 text-amber-800 dark:text-amber-200'
+                  : 'border-sky-500/40 bg-sky-500/15 text-sky-800 dark:text-sky-200',
+              )}
+            >
+              {featuredRole === 'always_notify' ? (
+                <BellRing className="size-2.5" strokeWidth={2.25} />
+              ) : null}
+              {featuredRole === 'always_notify' ? 'Always notify' : 'Expo app'}
+            </Badge>
+          ) : platform ? (
             <span className="shrink-0 text-[11px] text-muted-foreground">
               {platform}
             </span>
           ) : null}
         </span>
-        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
-          {status}
-          {` · ${tickerCount} ticker${tickerCount === 1 ? '' : 's'}`}
-          {device.build_number ? ` · build ${device.build_number}` : ''}
+        <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] leading-snug text-muted-foreground">
+          <span className="shrink-0">
+            {featuredRole === 'always_notify' ? 'Every notification' : status}
+            {` · ${tickerCount} ticker${tickerCount === 1 ? '' : 's'}`}
+          </span>
+          {tickerLabels.length ? (
+            <span className="inline-flex min-w-0 flex-wrap items-center gap-1">
+              {tickerLabels.slice(0, 6).map((ticker) => (
+                <span
+                  key={ticker}
+                  className="inline-flex items-center gap-0.5 rounded-full border border-border/70 bg-background/70 py-0.5 pl-0.5 pr-1.5"
+                  title={ticker}
+                >
+                  <CompanyLogo
+                    ticker={ticker}
+                    companyName={ticker}
+                    size="sm"
+                    className="size-4 rounded-full"
+                  />
+                  <span className="font-mono text-[10px] font-medium text-foreground">
+                    {ticker}
+                  </span>
+                </span>
+              ))}
+              {tickerLabels.length > 6 ? (
+                <span className="text-[10px] text-muted-foreground">
+                  +{tickerLabels.length - 6}
+                </span>
+              ) : null}
+            </span>
+          ) : null}
+          {device.build_number ? (
+            <span className="shrink-0">· build {device.build_number}</span>
+          ) : null}
         </span>
       </span>
     </Button>
@@ -347,8 +475,7 @@ export function DeskUserActivitiesPanel({
         />
         <p className="text-sm font-medium">Select a user</p>
         <p className="max-w-sm text-[12px] text-muted-foreground">
-          Click a device on the left to see their push and watchlist activity
-          here.
+          Click a device in All users to see their push and watchlist activity.
         </p>
       </div>
     )
@@ -479,14 +606,19 @@ export function DeskUserActivitiesPanel({
 export function DeskUserProfilePanel({
   device,
   onTickersChanged,
+  onOpenTicker,
 }: {
   device: DeskDevice
   onTickersChanged?: () => void | Promise<void>
+  /** Non-edit mode: open this ticker in its asset-class desk section. */
+  onOpenTicker?: (ticker: string) => void
 }) {
   const tickers = device.enabled_tickers?.length
     ? device.enabled_tickers
     : device.tickers || []
   const platform = deskPlatformLabel(device.platform, device.device_id)
+  const featuredRole = deskFeaturedRole(device)
+  const featuredLabel = deskFeaturedLabel(device)
 
   const [editing, setEditing] = useState(false)
   const [selectedTickers, setSelectedTickers] = useState<string[]>([])
@@ -571,54 +703,6 @@ export function DeskUserProfilePanel({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="space-y-3 px-3 py-3">
-        <div className="flex items-center gap-3 rounded-xl border border-border bg-card p-3">
-          <PlatformDeviceLogo
-            platform={device.platform}
-            deviceId={device.device_id}
-            className="size-14 rounded-2xl"
-          />
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-[15px] font-semibold">
-              {device.device_model || platform || 'Device'}
-            </p>
-            <p className="truncate text-[12px] text-muted-foreground">
-              {[platform, device.build_number ? `build ${device.build_number}` : null]
-                .filter(Boolean)
-                .join(' · ') || 'Profile'}
-            </p>
-            <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
-              {String(device.device_id || '').slice(0, 28) ||
-                maskToken(device.expo_push_token) ||
-                '—'}
-            </p>
-          </div>
-        </div>
-
-        <div className="overflow-hidden rounded-xl border border-border bg-card">
-          {fields.length ? (
-            fields.map((field, index) => (
-              <div key={field.key}>
-                {index > 0 ? <Separator /> : null}
-                <div className="space-y-1 px-3 py-2.5">
-                  <p className="font-mono text-[11px] font-medium text-muted-foreground">
-                    {field.label}
-                  </p>
-                  <p className="break-all text-[13px] font-medium tabular-nums">
-                    {field.display}
-                  </p>
-                  <p className="text-[11px] text-muted-foreground">
-                    {field.hint}
-                  </p>
-                </div>
-              </div>
-            ))
-          ) : (
-            <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">
-              No profile fields available for this device yet.
-            </p>
-          )}
-        </div>
-
         {tickers.length ? (
           <div className="space-y-2 rounded-xl border border-border bg-card p-3">
             <div className="flex items-center justify-between gap-2">
@@ -659,29 +743,67 @@ export function DeskUserProfilePanel({
             <div className="flex flex-wrap gap-1.5">
               {tickers.map((ticker) => {
                 const selected = selectedTickers.includes(ticker)
+                const symbol = String(ticker || '')
+                  .trim()
+                  .toUpperCase()
                 if (!editing) {
+                  if (onOpenTicker) {
+                    return (
+                      <button
+                        key={symbol}
+                        type="button"
+                        title={`Open ${symbol} in desk`}
+                        onClick={() => onOpenTicker(symbol)}
+                        className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-background py-0 pl-0.5 pr-2 font-mono text-xs text-foreground transition-colors hover:bg-muted hover:ring-1 hover:ring-border"
+                      >
+                        <CompanyLogo
+                          ticker={symbol}
+                          companyName={symbol}
+                          size="sm"
+                          className="size-5 rounded-full"
+                        />
+                        {symbol}
+                      </button>
+                    )
+                  }
                   return (
-                    <Badge key={ticker} variant="outline" className="font-mono">
-                      {ticker}
+                    <Badge
+                      key={symbol}
+                      variant="outline"
+                      className="h-7 gap-1.5 py-0 pl-0.5 pr-2 font-mono"
+                    >
+                      <CompanyLogo
+                        ticker={symbol}
+                        companyName={symbol}
+                        size="sm"
+                        className="size-5 rounded-full"
+                      />
+                      {symbol}
                     </Badge>
                   )
                 }
                 return (
                   <button
-                    key={ticker}
+                    key={symbol}
                     type="button"
                     disabled={busy}
                     onClick={() => toggleTicker(ticker)}
                     className={cn(
-                      'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs transition-colors',
+                      'inline-flex h-7 items-center gap-1.5 rounded-full border py-0 pl-0.5 pr-2 font-mono text-xs transition-colors',
                       selected
                         ? 'border-destructive/40 bg-destructive/10 text-destructive'
                         : 'border-border bg-background text-foreground hover:bg-muted',
                     )}
                     aria-pressed={selected}
                   >
+                    <CompanyLogo
+                      ticker={symbol}
+                      companyName={symbol}
+                      size="sm"
+                      className="size-5 rounded-full"
+                    />
                     {selected ? <Check className="size-3" /> : null}
-                    {ticker}
+                    {symbol}
                   </button>
                 )
               })}
@@ -715,6 +837,81 @@ export function DeskUserProfilePanel({
             ) : null}
           </div>
         ) : null}
+
+        <div
+          className={cn(
+            'flex items-center gap-3 rounded-xl border bg-card p-3',
+            featuredRole === 'always_notify'
+              ? 'border-amber-500/40 bg-amber-500/10'
+              : featuredRole === 'featured'
+                ? 'border-sky-500/35 bg-sky-500/10'
+                : 'border-border',
+          )}
+        >
+          <PlatformDeviceLogo
+            platform={device.platform}
+            deviceId={device.device_id}
+            className="size-14 rounded-2xl"
+          />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[15px] font-semibold">
+              {featuredLabel || device.device_model || platform || 'Device'}
+            </p>
+            {featuredRole ? (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'mt-1 h-5 gap-1 px-1.5 text-[9px] font-semibold uppercase tracking-wide',
+                  featuredRole === 'always_notify'
+                    ? 'border-amber-500/40 bg-amber-500/15 text-amber-800 dark:text-amber-200'
+                    : 'border-sky-500/40 bg-sky-500/15 text-sky-800 dark:text-sky-200',
+                )}
+              >
+                {featuredRole === 'always_notify' ? (
+                  <BellRing className="size-2.5" strokeWidth={2.25} />
+                ) : null}
+                {featuredRole === 'always_notify'
+                  ? 'Always receives notifications'
+                  : 'Featured Expo app'}
+              </Badge>
+            ) : null}
+            <p className="truncate text-[12px] text-muted-foreground">
+              {[platform, device.build_number ? `build ${device.build_number}` : null]
+                .filter(Boolean)
+                .join(' · ') || 'Profile'}
+            </p>
+            <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+              {String(device.device_id || '').slice(0, 28) ||
+                maskToken(device.expo_push_token) ||
+                '—'}
+            </p>
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-xl border border-border bg-card">
+          {fields.length ? (
+            fields.map((field, index) => (
+              <div key={field.key}>
+                {index > 0 ? <Separator /> : null}
+                <div className="space-y-1 px-3 py-2.5">
+                  <p className="font-mono text-[11px] font-medium text-muted-foreground">
+                    {field.label}
+                  </p>
+                  <p className="break-all text-[13px] font-medium tabular-nums">
+                    {field.display}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {field.hint}
+                  </p>
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">
+              No profile fields available for this device yet.
+            </p>
+          )}
+        </div>
       </div>
     </div>
   )

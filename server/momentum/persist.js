@@ -8,7 +8,83 @@ import { formatExactLookbackLabel } from './returns.js'
 import {
   episodePayloadForSupabase,
   eventPayloadForSupabase,
+  measureForPersist,
+  canonicalEventState,
 } from './mobilePayload.js'
+
+/** episodeId → last persisted MOMENTUM_STATE label (same-state poll guard) */
+const lastPersistedStateByEpisode = new Map()
+
+function rememberPersistedState(episodeId, state) {
+  const id = String(episodeId || '').trim()
+  const st = String(state || '')
+    .trim()
+    .toUpperCase()
+  if (!id || !st) return
+  lastPersistedStateByEpisode.set(id, st)
+  if (lastPersistedStateByEpisode.size > 2000) {
+    const first = lastPersistedStateByEpisode.keys().next().value
+    lastPersistedStateByEpisode.delete(first)
+  }
+}
+
+/**
+ * Skip redundant MOMENTUM_STATE rows when label did not change.
+ * Other event types always persist.
+ */
+export function shouldPersistTimelineEvent(ev) {
+  if (!ev) return false
+  const type = String(ev.eventType || ev.event_type || '')
+    .trim()
+    .toUpperCase()
+  if (!type) return false
+  if (type !== 'MOMENTUM_STATE') return true
+  const episodeId = String(ev.episodeId || ev.episode_id || '').trim()
+  const state = canonicalEventState(ev, ev.episode || null)
+  if (!episodeId || !state) return true
+  const prev = lastPersistedStateByEpisode.get(episodeId)
+  if (prev && prev === state) return false
+  // Optimistic remember so same-process duplicate HOLDING polls cannot enqueue twice.
+  rememberPersistedState(episodeId, state)
+  return true
+}
+
+function eventWantsIdempotencyKey(ev, type) {
+  if (ev?.idempotencyKey || ev?.idempotency_key) return true
+  const t = String(type || '').toUpperCase()
+  return (
+    t === 'MOMENTUM_ALERT_SENT' ||
+    t.endsWith('_ALERT_SENT') ||
+    t === 'MOMENTUM_ACCELERATING' ||
+    t === 'MOMENTUM_RE_ACCELERATING' ||
+    t === 'MOMENTUM_STARTED' ||
+    Boolean(ev?.shouldNotify)
+  )
+}
+
+function slimReasonForPersist(ev, type, state) {
+  const t = String(type || '').toUpperCase()
+  const reason = ev?.reason != null ? String(ev.reason) : null
+  if (!reason) return null
+  if (t === 'MOMENTUM_RESEARCH_DONE' || t === 'MOMENTUM_RESEARCH_RUNNING') {
+    return reason
+  }
+  if (t === 'MOMENTUM_ALERT_SENT' || t.endsWith('_ALERT_SENT')) {
+    // Title/body columns carry user copy; avoid "RESEARCH" / prose duplicates.
+    if (reason === 'RESEARCH' || reason === 'RESEARCH_FALLBACK') return null
+    if (reason === 'REVERSAL_RESEARCH' || reason === 'REVERSAL_RESEARCH_FALLBACK') {
+      return reason
+    }
+    if (reason.length > 80) return null
+    return reason
+  }
+  if (t === 'MOMENTUM_STATE') {
+    // Prefer state column; keep short label only if different.
+    if (state && reason.toUpperCase() === String(state).toUpperCase()) return null
+    return reason.length <= 40 ? reason : null
+  }
+  return reason.length > 500 ? reason.slice(0, 500) : reason
+}
 
 let client = null
 let clientTried = false
@@ -86,12 +162,13 @@ function isMissingRelationError(err) {
 }
 
 async function fromEpisodeTable(supabase, ticker, hint, run) {
-  const table = episodeTableFor(ticker, hint)
-  let res = await run(supabase.from(table), table)
+  let sourceTable = episodeTableFor(ticker, hint)
+  let res = await run(supabase.from(sourceTable), sourceTable)
   if (res?.error && isMissingRelationError(res.error)) {
-    res = await run(supabase.from('episodes'), 'episodes')
+    sourceTable = 'episodes'
+    res = await run(supabase.from(sourceTable), sourceTable)
   }
-  return res
+  return res && typeof res === 'object' ? { ...res, sourceTable } : res
 }
 
 export function episodeRowFromMemory(ep) {
@@ -183,6 +260,8 @@ export function memoryEpisodeFromRow(row) {
   const researchId =
     lastAlert?.research_id || row.latest_research_id || null
   return {
+    sourceTable: row.__source_table || row.source_table || null,
+    sourceRowId: row.id || row.episode_id || null,
     episodeId: row.episode_id || null,
     episodeNo: row.episode_no ?? null,
     ticker: row.ticker,
@@ -281,16 +360,50 @@ export function memoryEventFromRow(row) {
   if (!row) return null
   const title = row.notification_title || null
   const body = row.notification_body || null
+  const shortReason =
+    row.short_reason != null && String(row.short_reason).trim()
+      ? String(row.short_reason).trim()
+      : null
+  const reason =
+    row.reason != null && String(row.reason).trim()
+      ? String(row.reason).trim()
+      : null
+  const type = String(row.event_type || '')
+  // Old RESEARCH_DONE rows stored research prose in `state` — do not surface as state.
+  let state = row.state ?? null
+  if (
+    type === 'MOMENTUM_RESEARCH_DONE' ||
+    type === 'MOMENTUM_RESEARCH_RUNNING' ||
+    type === 'MOMENTUM_ALERT_SENT' ||
+    String(type).endsWith('_ALERT_SENT')
+  ) {
+    const st = String(state || '').trim()
+    const canonical = new Set([
+      'STARTED',
+      'ACCELERATING',
+      'HOLDING',
+      'WEAKENING',
+      'STRONGLY_WEAKENING',
+      'RE_ACCELERATING',
+      'REVERSAL',
+      'ENDED',
+      'EXPIRED',
+    ])
+    if (!st || !canonical.has(st.toUpperCase())) state = null
+  }
   return {
     ticker: row.ticker,
     eventType: row.event_type,
-    state: row.state ?? null,
+    state,
     direction: row.direction,
     detectedWindow: row.detected_window,
     detectedAt: row.detected_at,
     movePercent: num(row.move_percent),
     price: num(row.price),
-    reason: row.reason ?? null,
+    reason,
+    shortReason,
+    // Dashboard extractEventResearch reads likely_driver for the chip.
+    likely_driver: shortReason,
     givebackPct: num(row.giveback_pct ?? row.giveback_percent),
     episodeId: row.episode_id || null,
     episodeNo: row.episode_no ?? null,
@@ -305,6 +418,18 @@ export function memoryEventFromRow(row) {
       title || body
         ? { title: title || undefined, body: body || undefined }
         : null,
+    // Reconstruct a minimal research object so Perplexity done clicks work
+    // even when public.research is empty or research_id is null.
+    research:
+      type.includes('RESEARCH') && (reason || shortReason)
+        ? {
+            status: type.includes('RUNNING') ? 'running' : 'done',
+            reason,
+            likely_driver: shortReason,
+            researchId: row.research_id || null,
+            completedAt: row.detected_at || null,
+          }
+        : undefined,
     supabaseSaved: true,
     supabasePersist: {
       ok: true,
@@ -392,7 +517,10 @@ const EVENT_LIGHT_COLUMNS = [
   'move_percent',
   'price',
   'reason',
+  'short_reason',
   'exact_minutes',
+  'reference_time',
+  'reference_price',
   'notification_title',
   'notification_body',
   'notified_at',
@@ -415,7 +543,10 @@ const EVENT_LIGHT_COLUMNS_NO_RESEARCH_ID = [
   'move_percent',
   'price',
   'reason',
+  'short_reason',
   'exact_minutes',
+  'reference_time',
+  'reference_price',
   'notification_title',
   'notification_body',
   'notified_at',
@@ -536,66 +667,92 @@ export async function insertEvents(ticker, events) {
   const rows = []
   for (const ev of events) {
     if (!ev) continue
+    if (!shouldPersistTimelineEvent(ev)) continue
     const detectedAt = iso(ev.detectedAt)
     if (!detectedAt) continue
-    const fullPayload = eventPayloadForSupabase(ev, ev.episode || null)
+    const epSnap = ev.episode || null
+    const fullPayload = eventPayloadForSupabase(ev, epSnap)
+    const type = String(ev.eventType || fullPayload.eventType || 'MOMENTUM_STATE')
+    const state = canonicalEventState(ev, epSnap)
     const notif = fullPayload.notification || ev.notification || null
-    const givebackPct = (() => {
-      const pct = num(ev.givebackPct ?? fullPayload.givebackPct)
-      if (pct != null) return pct
-      const r = num(ev.givebackRatio ?? fullPayload.givebackRatio)
-      if (r != null) return r * 100
-      return num(fullPayload?.measure?.givebackPercent)
+    const isResearch =
+      type === 'MOMENTUM_RESEARCH_DONE' || type === 'MOMENTUM_RESEARCH_RUNNING'
+    const isAlert =
+      type === 'MOMENTUM_ALERT_SENT' || type.endsWith('_ALERT_SENT')
+    const givebackPct = isResearch
+      ? null
+      : (() => {
+          const pct = num(ev.givebackPct ?? fullPayload.givebackPct)
+          if (pct != null) return pct
+          const r = num(ev.givebackRatio ?? fullPayload.givebackRatio)
+          if (r != null) return r * 100
+          return null
+        })()
+    const shortReason = (() => {
+      if (ev.shortReason) return String(ev.shortReason)
+      if (typeof fullPayload.likely_driver === 'string' && fullPayload.likely_driver) {
+        return fullPayload.likely_driver
+      }
+      if (isResearch && typeof ev.reason === 'string') {
+        // Prefer likely driver; avoid dumping full reason into short_reason.
+        return null
+      }
+      return null
     })()
-    rows.push({
+    const row = {
       episode_no: Number.isFinite(Number(ev.episodeNo)) ? Number(ev.episodeNo) : null,
       episode_id: String(ev.episodeId || ''),
       ticker: symbol,
       asset_class: episodeAssetClassKey(
         symbol,
-        ev.assetClass || ev.episode?.assetClass,
+        ev.assetClass || epSnap?.assetClass,
       ),
-      event_type: String(ev.eventType || 'MOMENTUM_STATE'),
-      state: ev.state || fullPayload.state || null,
+      event_type: type,
+      state,
       direction: ev.direction || null,
-      detected_window: ev.detectedWindow || null,
+      detected_window: isResearch ? null : ev.detectedWindow || null,
       detected_at: detectedAt,
       move_percent: num(ev.movePercent),
       price: num(ev.price),
-      reason: ev.reason || null,
-      idempotency_key:
-        ev.idempotencyKey || fullPayload.idempotencyKey || null,
+      reason: slimReasonForPersist(ev, type, state),
       exact_minutes:
         ev.exactMinutes != null && Number.isFinite(Number(ev.exactMinutes))
           ? Math.round(Number(ev.exactMinutes))
           : null,
-      reference_time: iso(ev.referenceTime),
-      reference_price: num(ev.referencePrice),
+      reference_time: isResearch ? null : iso(ev.referenceTime),
+      reference_price: isResearch ? null : num(ev.referencePrice),
       notification_title: notif?.title || fullPayload.notificationTitle || null,
       notification_body: notif?.body || fullPayload.notificationBody || null,
       notified_at: iso(ev.notifiedAt || fullPayload.notifiedAt),
       should_notify:
-        ev.shouldNotify != null ? Boolean(ev.shouldNotify) : null,
+        ev.shouldNotify != null ? Boolean(ev.shouldNotify) : isAlert ? true : null,
       giveback_pct: givebackPct,
-      measure: fullPayload.measure || null,
+      measure: measureForPersist(fullPayload.measure, ev),
       research_id:
         ev.researchId ||
         fullPayload.researchId ||
         ev.research?.researchId ||
         ev.research?.id ||
         null,
-      short_reason:
-        ev.shortReason ||
-        (typeof fullPayload.likely_driver === 'string'
-          ? fullPayload.likely_driver
-          : ev.reason) ||
-        null,
+      short_reason: shortReason,
       updated_at: new Date().toISOString(),
-    })
+    }
+    if (eventWantsIdempotencyKey(ev, type)) {
+      row.idempotency_key =
+        ev.idempotencyKey || fullPayload.idempotencyKey || null
+    }
+    // RESEARCH_DONE: drop notification columns unless explicitly set
+    if (isResearch && !isAlert) {
+      if (!row.notification_title) row.notification_title = null
+      if (!row.notification_body) row.notification_body = null
+      row.should_notify = false
+      row.measure = null
+    }
+    rows.push(row)
   }
   if (!rows.length) return []
   let { data, error } = await supabase
-    .from('episodes_events')
+    .from('events_episodes')
     .upsert(rows, { onConflict: 'ticker,event_type,detected_at,episode_id' })
     .select(
       'id, ticker, event_type, detected_at, episode_id, asset_class, giveback_pct, created_at, updated_at',
@@ -604,7 +761,7 @@ export async function insertEvents(ticker, events) {
     // Retry without optional mobile columns
     const slimRows = rows.map((r) => stripSpanColumns(r))
     const retry = await supabase
-      .from('episodes_events')
+      .from('events_episodes')
       .upsert(slimRows, { onConflict: 'ticker,event_type,detected_at,episode_id' })
       .select('id, ticker, event_type, detected_at, episode_id, created_at, updated_at')
     data = retry.data
@@ -618,6 +775,11 @@ export async function insertEvents(ticker, events) {
   if (error) {
     console.warn('[momentum persist] event insert failed:', error.message)
     return []
+  }
+  for (const row of rows) {
+    if (String(row.event_type) === 'MOMENTUM_STATE' && row.state) {
+      rememberPersistedState(row.episode_id, row.state)
+    }
   }
   return data || []
 }
@@ -635,7 +797,7 @@ export async function deleteResearchRunningEvents(ticker, episodeId) {
   if (!symbol) return
   try {
     let q = supabase
-      .from('episodes_events')
+      .from('events_episodes')
       .delete()
       .eq('ticker', symbol)
       .eq('event_type', 'MOMENTUM_RESEARCH_RUNNING')
@@ -826,7 +988,9 @@ export async function loadTickerHistory(ticker, opts = {}) {
         .eq('ticker', symbol)
         .order('started_at', { ascending: false })
         .limit(episodeLimit)
-      if (!legacy.error && (legacy.data || []).length) epQ = legacy
+      if (!legacy.error && (legacy.data || []).length) {
+        epQ = { ...legacy, sourceTable: 'episodes' }
+      }
     }
     const epErr = epQ.error
     const epRows = epQ.data
@@ -834,16 +998,23 @@ export async function loadTickerHistory(ticker, opts = {}) {
       console.warn('[momentum persist] load episodes failed:', epErr.message)
       return { ...empty, available: false, error: epErr.message }
     }
-    const episodes = (epRows || []).map(memoryEpisodeFromRow).filter(Boolean)
+    const episodes = (epRows || [])
+      .map((row) =>
+        memoryEpisodeFromRow({
+          ...row,
+          __source_table: epQ.sourceTable || episodeTableFor(symbol, null),
+        }),
+      )
+      .filter(Boolean)
     let evQ = await supabase
-      .from('episodes_events')
+      .from('events_episodes')
       .select(EVENT_LIGHT_COLUMNS)
       .eq('ticker', symbol)
       .order('detected_at', { ascending: false })
       .limit(400)
     if (evQ.error && isMissingColumnError(evQ.error)) {
       evQ = await supabase
-        .from('episodes_events')
+        .from('events_episodes')
         .select(EVENT_LIGHT_COLUMNS_NO_RESEARCH_ID)
         .eq('ticker', symbol)
         .order('detected_at', { ascending: false })
@@ -851,7 +1022,7 @@ export async function loadTickerHistory(ticker, opts = {}) {
     }
     if (evQ.error && isMissingColumnError(evQ.error)) {
       evQ = await supabase
-        .from('episodes_events')
+        .from('events_episodes')
         .select(
           'id,episode_id,episode_no,ticker,event_type,state,direction,detected_window,detected_at,move_percent,price,reason',
         )
@@ -866,6 +1037,16 @@ export async function loadTickerHistory(ticker, opts = {}) {
       return { episodes, events: [], maxEpisodeNo: maxNo(episodes), available: true }
     }
     const events = (evRows || []).map(memoryEventFromRow).filter(Boolean)
+    // Seed same-state guard from newest MOMENTUM_STATE per episode (rows are desc).
+    for (const ev of events) {
+      if (String(ev?.eventType || '') !== 'MOMENTUM_STATE') continue
+      const eid = String(ev.episodeId || '')
+      const st = canonicalEventState(ev, null)
+      if (!eid || !st) continue
+      if (!lastPersistedStateByEpisode.has(eid)) {
+        rememberPersistedState(eid, st)
+      }
+    }
     // Max episode_no for THIS ticker only (per-ticker #001, #002, …)
     let maxRes = await fromEpisodeTable(supabase, symbol, null, (q) =>
       q
@@ -1231,7 +1412,7 @@ export async function applyEpisodeEdit(ticker, episodeId, patch = {}, eventPatch
         update.detected_window = epatch.detectedWindow
       }
 
-      let q = supabase.from('episodes_events').update(update)
+      let q = supabase.from('events_episodes').update(update)
       if (rowId) {
         q = q.eq('id', rowId)
       } else {
@@ -1478,7 +1659,7 @@ export async function deleteEpisodeEvent(ticker, opts = {}) {
   const supabase = getSupabaseOrNull()
   let deleted = removedMem
   if (supabase) {
-    let q = supabase.from('episodes_events').delete({ count: 'exact' })
+    let q = supabase.from('events_episodes').delete({ count: 'exact' })
     if (rowId) {
       q = q.eq('id', rowId)
     } else {
@@ -1561,7 +1742,7 @@ export async function deleteEpisodeFromSupabase(ticker, episodeId) {
   try {
     // Events first (no FK required, but cleaner)
     const { error: evErr, count: evCount } = await supabase
-      .from('episodes_events')
+      .from('events_episodes')
       .delete({ count: 'exact' })
       .eq('ticker', key)
       .eq('episode_id', eid)
@@ -1686,7 +1867,7 @@ export async function hydrateTicker(ticker, opts = {}) {
 }
 
 const RESEARCH_UNIFIED_SELECT =
-  'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,alert,model_version,citations,cost_usd,cost_usd_display,created_at'
+  'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,move_classification,confidence,alert,model_version,citations,cost_usd,cost_usd_display,created_at'
 
 /** Heavy research row — only for detail views. */
 export async function loadResearchById(researchId) {
@@ -1709,7 +1890,7 @@ export async function loadResearchByEpisodeId(episodeId) {
   const { data, error } = await supabase
     .from('research')
     .select(
-      'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,alert,model_version,citations,cost_usd,cost_usd_display,created_at',
+      'id,episode_id,ticker,asset_class,likely_driver,secondary_driver,move_classification,confidence,alert,model_version,citations,cost_usd,cost_usd_display,created_at',
     )
     .eq('episode_id', eid)
     .order('created_at', { ascending: false })

@@ -6,7 +6,11 @@
  */
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluateMomentumFromCandles } from './engine.js'
+import {
+  activeEpisodePredatesRegularSession,
+  evaluateMomentumFromCandles,
+  requiresYahooRegularSession,
+} from './engine.js'
 import {
   computeRollingReturns,
   movePercent,
@@ -51,6 +55,51 @@ function series(prices, intervalMs = 60_000, endMs = Date.now()) {
     close,
   }))
 }
+
+describe('strict Yahoo regular gate policy', () => {
+  it('exempts crypto from session stops but gates every other asset', () => {
+    assert.equal(requiresYahooRegularSession('BTC-USD'), false)
+    assert.equal(requiresYahooRegularSession('ETH-USD'), false)
+    assert.equal(requiresYahooRegularSession('TSLA'), true)
+    assert.equal(requiresYahooRegularSession('^GSPC'), true)
+    assert.equal(requiresYahooRegularSession('GC=F'), true)
+    assert.equal(requiresYahooRegularSession('EURUSD=X'), true)
+  })
+
+  it('closes hydrated ACTIVE episodes that predate the current regular open', () => {
+    const open = Date.parse('2026-08-24T13:30:00.000Z')
+    assert.equal(
+      activeEpisodePredatesRegularSession(
+        {
+          status: 'ACTIVE',
+          episodeStartedAt: '2026-08-24T12:45:00.000Z',
+        },
+        open,
+      ),
+      true,
+    )
+    assert.equal(
+      activeEpisodePredatesRegularSession(
+        {
+          status: 'ACTIVE',
+          episodeStartedAt: '2026-08-24T13:35:00.000Z',
+        },
+        open,
+      ),
+      false,
+    )
+    assert.equal(
+      activeEpisodePredatesRegularSession(
+        {
+          status: 'ENDED',
+          episodeStartedAt: '2026-08-24T12:45:00.000Z',
+        },
+        open,
+      ),
+      false,
+    )
+  })
+})
 
 /** Prime edge state so the next hot returns count as a fresh thr cross. */
 function primeStart(ticker = 'SNDK') {

@@ -6,7 +6,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { toYahooSymbol } from '../yahooClient.js'
-import { isTestModeEnabled } from './testMode.js'
 
 const THRESHOLD_STORE_PATH = path.resolve(
   process.cwd(),
@@ -75,22 +74,6 @@ export const MOMENTUM_ENGINE_ENABLED = process.env.MOMENTUM_ENGINE_ENABLED !== '
  */
 export const MOMENTUM_AUTO_START_RESEARCH =
   process.env.MOMENTUM_AUTO_START_RESEARCH !== '0'
-
-/**
- * Skip real Perplexity API; use dummy likely-driver for testing.
- * Priority:
- *  1. Dashboard Test Mode ON → always dummy (no Perplexity spend)
- *  2. MOMENTUM_DUMMY_RESEARCH=1 → force dummy
- *  3. MOMENTUM_DUMMY_RESEARCH=0 → force real API
- *  4. default → real Perplexity (do NOT auto-dummy from PUSH_ALLOWLIST)
- */
-export function isMomentumDummyResearchMode() {
-  if (isTestModeEnabled()) return true
-  const flag = String(process.env.MOMENTUM_DUMMY_RESEARCH || '').trim()
-  if (flag === '1' || flag.toLowerCase() === 'true') return true
-  if (flag === '0' || flag.toLowerCase() === 'false') return false
-  return false
-}
 
 function envThr(name, fallback) {
   if (process.env[name] === undefined || process.env[name] === '') return fallback

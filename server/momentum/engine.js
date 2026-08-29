@@ -20,6 +20,8 @@ import {
 } from './config.js'
 import {
   buildSessionQuote,
+  candlesInCurrentYahooRegularSession,
+  classifyMomentumAsset,
   inferMarketSession,
   isYahooRegularMarketState,
   normalizeYahooChart,
@@ -76,6 +78,23 @@ import * as store from './store.js'
 const yahooFinance = new YahooFinance({
   suppressNotices: ['yahooSurvey', 'ripHistorical'],
 })
+
+/** Crypto is continuous; every other asset requires Yahoo REGULAR/OPEN. */
+export function requiresYahooRegularSession(symbol) {
+  return classifyMomentumAsset(symbol) !== 'crypto'
+}
+
+/** Never carry a non-crypto ACTIVE episode into a later regular session. */
+export function activeEpisodePredatesRegularSession(episode, sessionStartMs) {
+  if (!episode || String(episode.status || '').toUpperCase() !== 'ACTIVE') {
+    return false
+  }
+  if (!Number.isFinite(Number(sessionStartMs))) return false
+  const startedMs = Date.parse(
+    String(episode.episodeStartedAt || episode.triggerTime || ''),
+  )
+  return !Number.isFinite(startedMs) || startedMs < Number(sessionStartMs)
+}
 
 let timer = null
 /** @type {Set<string>} */
@@ -731,14 +750,11 @@ export async function runMomentumTick(opts = {}) {
     )
 
     // Cross-exchange run gate: Yahoo marketState only (US / India / UK / …).
-    // REGULAR (or OPEN) → evaluate. Anything else → end episodes + skip.
-    // Keeps polling so the next REGULAR print can wake the symbol naturally.
+    // Non-crypto requires explicit REGULAR/OPEN. PRE/POST/CLOSED/missing all
+    // terminate the active episode and skip. Crypto is intentionally 24/7.
     const yahooMarketState = sessionQuote?.marketState ?? quote?.marketState ?? null
-    if (
-      yahooMarketState != null &&
-      String(yahooMarketState).trim() !== '' &&
-      !isYahooRegularMarketState(yahooMarketState)
-    ) {
+    const cryptoContinuous = !requiresYahooRegularSession(symbol)
+    if (!cryptoContinuous && !isYahooRegularMarketState(yahooMarketState)) {
       const nowIso = new Date().toISOString()
       const closed = closeActiveEpisodeFullMarketClose(symbol, {
         nowIso,
@@ -752,7 +768,7 @@ export async function runMomentumTick(opts = {}) {
       store.pushLog(
         symbol,
         'info',
-        `Yahoo marketState=${String(yahooMarketState).toUpperCase()} · not REGULAR · episodes ended · skip evaluate`,
+        `Yahoo marketState=${String(yahooMarketState || 'MISSING').toUpperCase()} · explicit REGULAR required · episodes ended · skip evaluate`,
         'momentum',
         { marketState: yahooMarketState },
       )
@@ -842,23 +858,94 @@ export async function runMomentumTick(opts = {}) {
     if (priorSleep?.kind === 'PAUSE_DATA') clearSleep(symbol)
     schedulePendingClose(symbol)
 
-    const asOfMs = candles.length ? candles[candles.length - 1].t : Date.now()
+    let evaluationCandles = candles
+    let evaluationPreviousClose = previousClose
+    let evaluationDailyCandles = dailyCandles
+    let regularSessionBounds = null
+
+    if (!cryptoContinuous) {
+      const regularSlice = candlesInCurrentYahooRegularSession(
+        candles,
+        meta,
+        Date.now(),
+      )
+      if (!regularSlice.resolved || !regularSlice.candles.length) {
+        store.pushLog(
+          symbol,
+          'warn',
+          'Yahoo REGULAR state is live but current regular-session boundary/candles are unavailable · skip evaluate',
+          'momentum',
+          { marketState: yahooMarketState, bounds: regularSlice.bounds },
+        )
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'regular-session-boundary-unavailable',
+          ticker: symbol,
+          marketState: yahooMarketState,
+          episode: store.getActiveEpisode(symbol),
+        }
+      }
+      evaluationCandles = regularSlice.candles
+      regularSessionBounds = regularSlice.bounds
+      // No prior-close/day or multi-day comparison may feed the momentum game.
+      evaluationPreviousClose = null
+      evaluationDailyCandles = null
+
+      const activeEpisode = store.getActiveEpisode(symbol)
+      if (
+        activeEpisodePredatesRegularSession(
+          activeEpisode,
+          regularSlice.bounds.startMs,
+        )
+      ) {
+        const nowIso = new Date().toISOString()
+        const closed = closeActiveEpisodeFullMarketClose(symbol, {
+          episode: activeEpisode,
+          nowIso,
+          currentPrice,
+          marketSession: 'REGULAR',
+        })
+        if (closed?.closedEpisode) {
+          void persistTick(
+            symbol,
+            null,
+            closed.events || [],
+            closed.closedEpisode,
+          ).catch(() => {})
+          store.pushLog(
+            symbol,
+            'info',
+            `Previous-session ACTIVE episode closed at regular-session reset · session opened ${new Date(regularSlice.bounds.startMs).toISOString()}`,
+            'momentum',
+          )
+        }
+      }
+    }
+
+    const asOfMs = evaluationCandles.length
+      ? evaluationCandles[evaluationCandles.length - 1].t
+      : Date.now()
     store.pushLog(
       symbol,
       'info',
-      `Computing rolling returns · session=${session} · asOf=${new Date(asOfMs).toISOString()}`,
+      `Computing rolling returns · session=${session} · asOf=${new Date(asOfMs).toISOString()}${
+        regularSessionBounds
+          ? ` · regular-only from ${new Date(regularSessionBounds.startMs).toISOString()}`
+          : ' · continuous crypto'
+      }`,
       'momentum',
     )
     const result = evaluateMomentumFromCandles({
       ticker: symbol,
-      candles,
+      candles: evaluationCandles,
       currentPrice,
-      previousClose,
+      previousClose: evaluationPreviousClose,
       asOfMs,
       marketSession: session,
       sessionQuote,
       episode: store.getActiveEpisode(symbol),
-      dailyCandles,
+      dailyCandles: evaluationDailyCandles,
       // Rolling-return cards: exact clock hours (not eligible-trading walk).
       // Inactivity expiry still uses eligible trading time inside episode.js.
       useEligibleTradingTime: false,
@@ -1156,8 +1243,9 @@ export function setMomentumFocus(ticker) {
 }
 
 /**
- * Pull Trigger-enabled tickers from device_monitor into the loop
+ * Pull Trigger-enabled tickers from device monitor tables into the loop
  * so the engine keeps watching even when the dashboard is closed.
+ * Uses the same table fallbacks as notifications (assets_monitor_based_on_device…).
  * Replaces (does not merge) so unsubscribed symbols leave the universe.
  */
 export async function syncWatchlistFromMonitoredTickers() {
@@ -1172,15 +1260,18 @@ export async function syncWatchlistFromMonitoredTickers() {
     const supabase = createClient(url, key, {
       auth: { persistSession: false, autoRefreshToken: false },
     })
-    const { data, error } = await supabase
-      .from('device_monitor')
-      .select('ticker, subscribers')
-      .limit(500)
-    if (error || !data?.length) return store.listWatchedTickers()
+    const {
+      fetchDeviceMonitorRows,
+      listWatchlistSubscribers,
+    } = await import('../notifications.js')
+    const { data } = await fetchDeviceMonitorRows(
+      supabase,
+      'ticker, subscribers',
+    )
+    if (!data?.length) return store.listWatchedTickers()
 
-    const { listWatchlistSubscribers } = await import('../notifications.js')
     const tickers = []
-    for (const row of data) {
+    for (const row of data.slice(0, 500)) {
       const t = store.normalizeMomentumTicker(row.ticker)
       if (!t) continue
       const recips = listWatchlistSubscribers([row], 'trigger')
@@ -1212,9 +1303,17 @@ export function startMomentumLoop() {
   store.setWatchedTickers(MOMENTUM_BOOTSTRAP_TICKERS)
   store.setFocusTicker(MOMENTUM_BOOTSTRAP_TICKERS[0] || MOMENTUM_TICKER)
 
-  // Prefer Supabase thresholds + episode policy over local disk
+  // Prefer Supabase thresholds + episode policy; Perplexity prompts always from Supabase → memory
   void hydrateThresholdsFromSupabase()
   void hydrateEpisodePolicyFromSupabase()
+  void import('./perplexityPrompts.js')
+    .then((m) => m.ensurePerplexityPromptsFromSupabase({ force: true }))
+    .catch((err) => {
+      console.warn(
+        '[momentum] perplexity prompts Supabase pull skipped:',
+        err instanceof Error ? err.message : err,
+      )
+    })
   // Seed full Trigger app watchlist ASAP so we are not focus-only after restart
   void syncWatchlistFromMonitoredTickers().then((list) => {
     console.log(

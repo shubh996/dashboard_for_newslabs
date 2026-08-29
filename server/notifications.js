@@ -29,12 +29,12 @@ import {
   sanitizeStockHeadlineInSummary,
 } from './momentum/notifyCopy.js'
 import {
-  isTestModeEnabled,
-  getTestModeAllowlistRecipients,
-  ensureAlwaysNotifyRecipients,
+  ensureAlwaysNotifyRecipient,
   resolvePushRecipients,
-  ALWAYS_NOTIFY_DEVICES,
-} from './momentum/testMode.js'
+  ALWAYS_NOTIFY_DEVICE,
+  FEATURED_DEVICES,
+  findFeaturedDevice,
+} from './momentum/recipientPolicy.js'
 
 const FIRECRAWL_BASE = 'https://api.firecrawl.dev/v1'
 const MONTHS = {
@@ -2448,9 +2448,52 @@ function buildNotablePayload({
   }
 }
 
-/** Users list → device_monitor · Extreme/Pinned → pinned_monitored_tickers */
-const MONITOR_TABLE_DEVICE = 'device_monitor'
+/**
+ * Users / audience monitor rows.
+ * Live Supabase (News-app) uses `assets_monitor_based_on_device` — `device_monitor`
+ * is missing from the schema cache. Keep legacy names as fallbacks.
+ */
+export const MONITOR_TABLE_DEVICE_CANDIDATES = [
+  'assets_monitor_based_on_device',
+  'device_monitor',
+  'device_monitored_tickers',
+]
+const MONITOR_TABLE_DEVICE = MONITOR_TABLE_DEVICE_CANDIDATES[0]
 const MONITOR_TABLE_PINNED = 'pinned_monitored_tickers'
+
+/**
+ * Read ticker/subscriber rows from the first monitor table that exists.
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @param {string} [select]
+ * @param {{ eq?: Record<string, string>, ilike?: Record<string, string> }} [filters]
+ */
+export async function fetchDeviceMonitorRows(
+  supabase,
+  select = 'ticker, company_name, subscribers, created_at, updated_at, notable_price_movements, asset_class',
+  filters = {},
+) {
+  let lastError = null
+  for (const table of MONITOR_TABLE_DEVICE_CANDIDATES) {
+    const run = async (cols) => {
+      let q = supabase.from(table).select(cols)
+      for (const [k, v] of Object.entries(filters.eq || {})) q = q.eq(k, v)
+      for (const [k, v] of Object.entries(filters.ilike || {})) q = q.ilike(k, v)
+      return q
+    }
+    let { data, error } = await run(select)
+    if (error && /notable_price_movements|company_name|asset_class/i.test(error.message || '')) {
+      ;({ data, error } = await run('ticker, subscribers, created_at, updated_at'))
+    }
+    if (!error) return { table, data: data || [] }
+    lastError = error
+    // Missing relation → try next candidate
+    if (!/schema cache|does not exist|Could not find the table/i.test(error.message || '')) {
+      // Real query error on an existing table — still try fallbacks, but keep message
+      console.warn(`[notifications] ${table} read failed:`, error.message)
+    }
+  }
+  throw lastError || new Error('No device monitor table found in Supabase')
+}
 
 function normalizeMonitorScope(value) {
   const scope = String(value || '')
@@ -2872,8 +2915,8 @@ function subscriberNotificationApp(subscriber) {
     subscriber?.project_id ??
     subscriber?.bundle_id ??
     subscriber?.package_name
-  // Existing subscriber records predate app tagging and belong to 9AM.
-  if (explicit == null || explicit === '') return 'nineam'
+  // Untagged subscriber rows belong to Trigger (this project no longer ships 9AM).
+  if (explicit == null || explicit === '') return 'trigger'
   const raw = String(explicit).trim().toLowerCase()
   // Common mobile package / slug variants for Trigger.
   if (
@@ -2930,135 +2973,6 @@ function isSubscriberEnabled(subscriber) {
   return sawTruthy || candidates.every((v) => v === undefined || v === null || v === '')
 }
 
-/**
- * Delivery gates:
- *  1. Dashboard Test Mode ON  → selected allowlist from Test Mode picker
- *  2. Else legacy PUSH_ALLOWLIST_* env → only those devices
- *  3. Else all eligible subscribers (+ always-notify injected elsewhere)
- *
- * Env (comma-separated), legacy:
- *   PUSH_ALLOWLIST_DEVICE_IDS=ios-…
- *   PUSH_ALLOWLIST_TOKENS=ExponentPushToken[…]
- */
-function getPushAllowlist() {
-  // Dashboard Test Mode: selected devices from the Studio picker
-  if (isTestModeEnabled()) {
-    const forced = getTestModeAllowlistRecipients('trigger')
-    const deviceIds = forced.map((r) => r.device_id).filter(Boolean)
-    const tokens = forced.map((r) => r.expo_push_token).filter(Boolean)
-    // Include aliases so legacy device_ids still pass filters
-    for (const d of ALWAYS_NOTIFY_DEVICES) {
-      if (tokens.includes(d.expo_push_token) || deviceIds.includes(d.device_id)) {
-        for (const a of d.aliases || []) deviceIds.push(a)
-      }
-    }
-    return {
-      active: true,
-      source: 'test_mode',
-      deviceIds,
-      tokens,
-      deviceIdSet: new Set(deviceIds),
-      tokenSet: new Set(tokens),
-    }
-  }
-  // Legacy env allowlist only when explicitly opted in (does NOT run with Test Mode OFF by default)
-  const useEnv =
-    process.env.MOMENTUM_USE_ENV_ALLOWLIST === '1' ||
-    process.env.MOMENTUM_USE_ENV_ALLOWLIST === 'true'
-  if (!useEnv) {
-    return {
-      active: false,
-      source: 'none',
-      deviceIds: [],
-      tokens: [],
-      deviceIdSet: new Set(),
-      tokenSet: new Set(),
-    }
-  }
-  const deviceIds = String(process.env.PUSH_ALLOWLIST_DEVICE_IDS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const tokens = String(process.env.PUSH_ALLOWLIST_TOKENS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  return {
-    active: deviceIds.length > 0 || tokens.length > 0,
-    source: 'env',
-    deviceIds,
-    tokens,
-    deviceIdSet: new Set(deviceIds),
-    tokenSet: new Set(tokens),
-  }
-}
-
-/**
- * Build forced recipients when test mode / env allowlist is active.
- * @param {string} [appKey='trigger']
- * @returns {Array<{ device_id: string|null, expo_push_token: string, enabled: boolean, app_key: string, forced: boolean }>|null}
- *   null when allowlist is inactive
- */
-function forceAllowlistRecipients(appKey = 'trigger') {
-  if (isTestModeEnabled()) {
-    return getTestModeAllowlistRecipients(appKey)
-  }
-  const allow = getPushAllowlist()
-  if (!allow.active) return null
-  const selectedApp = normalizeNotificationApp(appKey)
-  const ids = allow.deviceIds
-  const tokens = allow.tokens
-  const n = Math.max(ids.length, tokens.length, 1)
-  const out = []
-  const seen = new Set()
-  for (let i = 0; i < n; i += 1) {
-    const token = String(tokens[i] || tokens[0] || '').trim()
-    const device_id = String(ids[i] || ids[0] || '').trim() || null
-    if (!token || !isExpoPushToken(token)) continue
-    if (seen.has(token)) continue
-    seen.add(token)
-    out.push({
-      device_id,
-      expo_push_token: token,
-      enabled: true,
-      app_key: selectedApp,
-      forced: true,
-    })
-  }
-  return out
-}
-
-/**
- * Filter recipients / Expo messages to the allowlist (if configured).
- * Matches device_id OR expo_push_token / message.to.
- * @template T
- * @param {T[]} list
- * @param {(item: T) => { device_id?: string|null, expo_push_token?: string|null, to?: string|null }} pick
- * @returns {T[]}
- */
-function applyPushAllowlist(list, pick) {
-  const allow = getPushAllowlist()
-  if (!allow.active) return list || []
-  const filtered = (list || []).filter((item) => {
-    const { device_id, expo_push_token, to } = pick(item) || {}
-    const id = device_id != null ? String(device_id).trim() : ''
-    const token = String(expo_push_token || to || '').trim()
-    if (id && allow.deviceIdSet.has(id)) return true
-    if (token && allow.tokenSet.has(token)) return true
-    return false
-  })
-  if ((list || []).length > 0 && filtered.length === 0) {
-    console.warn(
-      `[push allowlist] blocked all recipients (${allow.source || 'env'}) — none matched tester / PUSH_ALLOWLIST_*`,
-    )
-  } else if ((list || []).length !== filtered.length) {
-    console.log(
-      `[push allowlist] ${filtered.length}/${(list || []).length} recipient(s) after ${allow.source || 'env'} gate`,
-    )
-  }
-  return filtered
-}
-
 /** Mask Expo token for UI logs (keep start + end). */
 function maskExpoToken(token) {
   const t = String(token || '').trim()
@@ -3070,9 +2984,9 @@ function maskExpoToken(token) {
 /**
  * Unique push-ready devices on ticker row(s) for an app — pure audience math.
  * Same rules as delivery eligibility, but:
- *   - no PUSH_ALLOWLIST force-inject
- *   - no allowlist filter
- * Use this for dashboard subscriber counts so dev allowlists don't show "1" on every ticker.
+ *   - no always-notify force-inject
+ * Use this for dashboard subscriber counts so the owner device does not show
+ * as a subscriber on every ticker.
  *
  * @param {Array<Record<string, unknown>>|Record<string, unknown>|null|undefined} rows
  * @param {string} [appKey='trigger']
@@ -3113,24 +3027,13 @@ export function listWatchlistSubscribers(rows, appKey = 'trigger') {
  * Only tokens with ≥1 enabled subscription for the selected app are returned
  * (used for actual push sends).
  *
- * When PUSH_ALLOWLIST_* is set: returns forced allowlist recipients only
- * (ignores empty watchlist — still delivers to the tester device).
- *
  * Exported so other modules can reuse the exact push-delivery path.
  */
 export function collectPushRecipients(rows, appKey = 'nineam') {
   const selectedApp = normalizeNotificationApp(appKey)
-  const forced = forceAllowlistRecipients(selectedApp)
-  if (forced && forced.length) {
-    console.log(
-      `[push] ${isTestModeEnabled() ? 'test mode' : 'allowlist'} → force-deliver to ${forced.length} device(s) (watchlist ignored)`,
-    )
-    return forced
-  }
-
-  // Real subscribers + both always-notify testers (even if not on this ticker)
+  // Relevant subscribers + the Trigger iPhone 16 (even if not subscribed).
   const subs = listWatchlistSubscribers(rows, selectedApp)
-  return ensureAlwaysNotifyRecipients(subs, selectedApp)
+  return ensureAlwaysNotifyRecipient(subs, selectedApp)
 }
 
 /**
@@ -3323,6 +3226,70 @@ export function extractSecondaryDriver(text) {
       .trim()
   }
   const lineMatch = normalized.match(/secondary\s*driver\s*:\s*(.+)/i)
+  if (lineMatch?.[1]) {
+    return lineMatch[1]
+      .split(/\n/)[0]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  return ''
+}
+
+/**
+ * Pull "Move classification: …" from a structured Perplexity / Gemini reason.
+ * @param {string|null|undefined} text
+ * @returns {string}
+ */
+export function extractMoveClassification(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const normalized = raw.replace(
+    /\*{0,2}\s*move\s*classification\s*\*{0,2}\s*:/gi,
+    'Move classification:',
+  )
+  const sectionMatch = normalized.match(
+    /move\s*classification\s*:\s*([\s\S]*?)(?=(?:\n\s*)?(?:\*{0,2}\s*)?(?:confidence|volume|tap\s+to\s+see|likely\s*driver|secondary\s*driver)(?:\s*\*{0,2})?\s*:|$)/i,
+  )
+  if (sectionMatch?.[1]) {
+    return sectionMatch[1]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  const lineMatch = normalized.match(/move\s*classification\s*:\s*(.+)/i)
+  if (lineMatch?.[1]) {
+    return lineMatch[1]
+      .split(/\n/)[0]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  return ''
+}
+
+/**
+ * Pull "Confidence: High|Medium|Low — …" from a structured reason.
+ * @param {string|null|undefined} text
+ * @returns {string}
+ */
+export function extractConfidence(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const normalized = raw.replace(
+    /\*{0,2}\s*confidence\s*\*{0,2}\s*:/gi,
+    'Confidence:',
+  )
+  const sectionMatch = normalized.match(
+    /confidence\s*:\s*([\s\S]*?)(?=(?:\n\s*)?(?:\*{0,2}\s*)?(?:volume|tap\s+to\s+see|likely\s*driver|secondary\s*driver|move\s*classification)(?:\s*\*{0,2})?\s*:|$)/i,
+  )
+  if (sectionMatch?.[1]) {
+    return sectionMatch[1]
+      .replace(/\*+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  const lineMatch = normalized.match(/confidence\s*:\s*(.+)/i)
   if (lineMatch?.[1]) {
     return lineMatch[1]
       .split(/\n/)[0]
@@ -3704,30 +3671,23 @@ async function sendExpoPushMessages(messages) {
   const errors = []
   const expoAccessToken = String(process.env.EXPO_ACCESS_TOKEN || '').trim()
 
-  // Hard gate: even if a caller builds messages without collectPushRecipients,
-  // never send outside the allowlist when configured.
-  const outbound = applyPushAllowlist(messages || [], (m) => ({
-    device_id: m?._device_id,
-    expo_push_token: m?.to,
-    to: m?.to,
-  }))
-  if ((messages || []).length > 0 && outbound.length === 0) {
-    return {
-      tickets: [],
-      errors: [
-        {
-          batch_start: 0,
-          failed_count: 0,
-          device_ids: [],
-          status: 0,
-          error:
-            'Push allowlist active — no messages matched PUSH_ALLOWLIST_DEVICE_IDS / PUSH_ALLOWLIST_TOKENS',
-        },
-      ],
-      ok: 0,
-      failed: 0,
-      allowlist_blocked: true,
-    }
+  // Final transport-level guarantee: every non-empty notification batch also
+  // reaches the Trigger iPhone, even if a future caller forgets to resolve its
+  // audience through the shared recipient policy first.
+  const outbound = Array.isArray(messages) ? [...messages] : []
+  if (
+    outbound.length > 0 &&
+    !outbound.some(
+      (message) =>
+        String(message?.to || '').trim() ===
+        ALWAYS_NOTIFY_DEVICE.expo_push_token,
+    )
+  ) {
+    outbound.push({
+      ...outbound[0],
+      to: ALWAYS_NOTIFY_DEVICE.expo_push_token,
+      _device_id: ALWAYS_NOTIFY_DEVICE.device_id,
+    })
   }
 
   for (let i = 0; i < outbound.length; i += EXPO_PUSH_BATCH) {
@@ -3810,18 +3770,26 @@ export async function loadExpoRecipientsForTicker(supabase, ticker, appKey = 'tr
   const symbol = normalizeTicker(ticker)
   if (!symbol || !supabase) return []
 
-  let { data: rows, error } = await supabase
-    .from('device_monitor')
-    .select('ticker, company_name, subscribers')
-    .eq('ticker', symbol)
-
-  if (error) throw error
+  let rows = []
+  try {
+    ;({ data: rows } = await fetchDeviceMonitorRows(
+      supabase,
+      'ticker, company_name, subscribers',
+      { eq: { ticker: symbol } },
+    ))
+  } catch {
+    rows = []
+  }
   if (!rows?.length) {
-    ;({ data: rows, error } = await supabase
-      .from('device_monitor')
-      .select('ticker, company_name, subscribers')
-      .ilike('ticker', symbol))
-    if (error) throw error
+    try {
+      ;({ data: rows } = await fetchDeviceMonitorRows(
+        supabase,
+        'ticker, company_name, subscribers',
+        { ilike: { ticker: symbol } },
+      ))
+    } catch {
+      rows = []
+    }
   }
 
   // Exact ticker match after normalize (ilike can over-match)
@@ -3964,34 +3932,26 @@ export async function sendTriggerEpisodePush(opts = {}) {
     }
   }
 
-  // Test mode / env allowlist: only forced tester device(s).
-  // Prod: watchlist subscribers + always-notify tester (even if not subscribed).
-  const forced = forceAllowlistRecipients(appKey)
+  // Relevant ticker subscribers + the Trigger iPhone 16 on every send.
   let recipients = []
-  let forcedAllowlist = false
-  if (forced && forced.length) {
-    recipients = forced
-    forcedAllowlist = true
-  } else {
-    try {
-      const subs = await loadExpoRecipientsForTicker(supabase, sym, appKey)
-      recipients = resolvePushRecipients(subs, appKey)
-    } catch (err) {
-      // Still deliver to always-notify tester even if watchlist lookup fails
-      recipients = resolvePushRecipients([], appKey)
-      if (!recipients.length) {
-        return {
-          ok: false,
-          skipped: true,
-          reason: err instanceof Error ? err.message : String(err),
-          recipient_count: 0,
-          sent_ok: 0,
-          sent_failed: 0,
-          tickets: [],
-          errors: [{ error: err instanceof Error ? err.message : String(err) }],
-          device_ids: [],
-          recipients: [],
-        }
+  try {
+    const subs = await loadExpoRecipientsForTicker(supabase, sym, appKey)
+    recipients = resolvePushRecipients(subs, appKey)
+  } catch (err) {
+    // Still deliver to the always-notify Trigger device if lookup fails.
+    recipients = resolvePushRecipients([], appKey)
+    if (!recipients.length) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: err instanceof Error ? err.message : String(err),
+        recipient_count: 0,
+        sent_ok: 0,
+        sent_failed: 0,
+        tickets: [],
+        errors: [{ error: err instanceof Error ? err.message : String(err) }],
+        device_ids: [],
+        recipients: [],
       }
     }
   }
@@ -4040,7 +4000,8 @@ export async function sendTriggerEpisodePush(opts = {}) {
     device_id: r.device_id || null,
     expo_push_token: r.expo_push_token,
     expo_push_token_masked: maskExpoToken(r.expo_push_token),
-    forced: Boolean(r.forced || forcedAllowlist),
+    always_notify:
+      r.expo_push_token === ALWAYS_NOTIFY_DEVICE.expo_push_token,
   }))
 
   if (dryRun) {
@@ -4054,7 +4015,9 @@ export async function sendTriggerEpisodePush(opts = {}) {
       errors: [],
       device_ids: recipients.map((r) => r.device_id).filter(Boolean),
       recipients: recipientSummaries,
-      forced_allowlist: forcedAllowlist,
+      always_notify_included: recipients.some(
+        (r) => r.expo_push_token === ALWAYS_NOTIFY_DEVICE.expo_push_token,
+      ),
       sample: messages[0]
         ? { title: messages[0].title, body: messages[0].body, data: messages[0].data }
         : null,
@@ -4076,7 +4039,7 @@ export async function sendTriggerEpisodePush(opts = {}) {
       null
     return {
       ...r,
-      status: ticket?.status || (pushResult.allowlist_blocked ? 'blocked' : 'unknown'),
+      status: ticket?.status || 'unknown',
       ticket_id: ticket?.id || null,
       error: ticket?.status && ticket.status !== 'ok' ? ticket.message || null : null,
     }
@@ -4092,7 +4055,9 @@ export async function sendTriggerEpisodePush(opts = {}) {
     errors: pushResult.errors,
     device_ids: recipients.map((r) => r.device_id).filter(Boolean),
     recipients: recipientsWithStatus,
-    forced_allowlist: forcedAllowlist,
+    always_notify_included: recipients.some(
+      (r) => r.expo_push_token === ALWAYS_NOTIFY_DEVICE.expo_push_token,
+    ),
     deep_link: pushData.deep_link,
     notification_type: pushData.notification_type,
   }
@@ -4550,6 +4515,12 @@ export async function saveMomentumResearchRow(supabase, payload = {}) {
     payload.secondary_driver ||
     extractSecondaryDriver(payload.reason) ||
     null
+  const moveClassification =
+    payload.move_classification ||
+    extractMoveClassification(payload.reason) ||
+    null
+  const confidence =
+    payload.confidence || extractConfidence(payload.reason) || null
   const alertTitle =
     payload.alert?.title || payload.push_title || null
   const alertBody =
@@ -4563,6 +4534,8 @@ export async function saveMomentumResearchRow(supabase, payload = {}) {
       asset_class: assetClass,
       likely_driver: likelyDriver,
       secondary_driver: secondaryDriver,
+      move_classification: moveClassification,
+      confidence,
       alert: {
         title: alertTitle || '',
         body: alertBody || '',
@@ -4608,23 +4581,10 @@ export function createNotificationsRouter({ getSupabase }) {
       try {
         const appKey = normalizeNotificationApp(request.query?.app)
         const supabase = getSupabase()
-        let data = null
-        let error = null
-
-        ;({ data, error } = await supabase
-          .from('device_monitor')
-          .select('ticker, company_name, created_at, updated_at, notable_price_movements, subscribers')
-          .order('ticker', { ascending: true }))
-
-        // Column may not exist until schema_device_monitor.sql is applied.
-        if (error && /notable_price_movements/i.test(error.message || '')) {
-          ;({ data, error } = await supabase
-            .from('device_monitor')
-            .select('ticker, company_name, created_at, updated_at, subscribers')
-            .order('ticker', { ascending: true }))
-        }
-
-        if (error) throw error
+        const { data } = await fetchDeviceMonitorRows(
+          supabase,
+          'ticker, company_name, created_at, updated_at, notable_price_movements, subscribers, asset_class',
+        )
 
         // Deduplicate device rows by ticker; merge date maps so one tab = one ticker.
         const byTicker = new Map()
@@ -5806,13 +5766,21 @@ export function createNotificationsRouter({ getSupabase }) {
       try {
         const appKey = normalizeNotificationApp(request.query?.app)
         const supabase = getSupabase()
-        const { data, error } = await supabase
-          .from('device_monitor')
-          .select('ticker, company_name, subscribers')
+        let monitorRows = []
+        try {
+          ;({ data: monitorRows } = await fetchDeviceMonitorRows(
+            supabase,
+            'ticker, company_name, subscribers, asset_class',
+          ))
+        } catch (monitorError) {
+          console.warn(
+            '[notifications] device monitor tables unavailable; using device_profiles only:',
+            monitorError?.message || monitorError,
+          )
+          monitorRows = []
+        }
 
-        if (error) throw error
-
-        const devices = buildAudienceDevices(data || [], appKey)
+        const devices = buildAudienceDevices(monitorRows || [], appKey)
 
         // Enrich with device profile rows when present (Trigger vs 9AM tables).
         // Also include profile-only devices with zero monitored tickers so they
@@ -5884,6 +5852,37 @@ export function createNotificationsRouter({ getSupabase }) {
           })
         }
 
+        // Keep both dashboard-featured devices visible even when their profile
+        // or watchlist row is temporarily missing. Only the Trigger iPhone is
+        // an always-notify recipient; Expo app remains subscription-gated.
+        for (const featured of FEATURED_DEVICES) {
+          const present = devices.some((device) =>
+            Boolean(
+              findFeaturedDevice(
+                device.device_id,
+                device.expo_push_token,
+              )?.id === featured.id,
+            ),
+          )
+          if (present) continue
+          devices.push({
+            device_id: featured.device_id,
+            expo_push_token: featured.expo_push_token,
+            app_key: appKey,
+            enabled: featured.role === 'always_notify',
+            subscription_status:
+              featured.role === 'always_notify' ? 'on' : 'off',
+            tickers: [],
+            enabled_tickers: [],
+            disabled_tickers: [],
+            crypto_tickers: [],
+            pro_crypto: false,
+            enabled_count: 0,
+            disabled_count: 0,
+            subscriber_updated_at: null,
+          })
+        }
+
         const enriched = devices.map((device) => {
           const profile =
             (device.device_id && profileByDeviceId.get(String(device.device_id))) ||
@@ -5891,8 +5890,18 @@ export function createNotificationsRouter({ getSupabase }) {
               profileByToken.get(String(device.expo_push_token).trim())) ||
             null
 
+          const featured = findFeaturedDevice(
+            device.device_id,
+            device.expo_push_token,
+          )
+
           return {
             ...device,
+            featured_device: Boolean(featured),
+            featured_id: featured?.id || null,
+            featured_label: featured?.label || null,
+            featured_role: featured?.role || null,
+            always_notify: featured?.role === 'always_notify',
             user_id: profile?.user_id ?? null,
             platform: profile?.platform ?? null,
             device_model: profile?.device_model ?? null,
@@ -5923,6 +5932,14 @@ export function createNotificationsRouter({ getSupabase }) {
         // Keep alertable first, then partial, then off (incl. zero-ticker profiles).
         const rank = { on: 0, partial: 1, off: 2 }
         enriched.sort((a, b) => {
+          const featuredRank = (row) =>
+            row.featured_role === 'always_notify'
+              ? 0
+              : row.featured_device
+                ? 1
+                : 2
+          const fr = featuredRank(a) - featuredRank(b)
+          if (fr !== 0) return fr
           const dr =
             (rank[a.subscription_status] ?? 9) -
             (rank[b.subscription_status] ?? 9)
@@ -5944,7 +5961,8 @@ export function createNotificationsRouter({ getSupabase }) {
           // Full list for Audience UI (on + partial + off + zero-ticker profiles).
           devices: enriched,
           // Back-compat for any caller that only wants push-ready tokens.
-          recipients: collectPushRecipients(data || [], appKey),
+          recipients: collectPushRecipients(monitorRows || [], appKey),
+          monitor_table: MONITOR_TABLE_DEVICE,
         })
       } catch (error) {
         response.status(500).json({
@@ -7567,10 +7585,25 @@ export function createNotificationsRouter({ getSupabase }) {
           String(request.body?.event_date || '').trim().slice(0, 10) ||
           todayIsoEastern()
 
+        let savedMomentumTemplate = ''
+        try {
+          const {
+            ensurePerplexityPromptsFromSupabase,
+            getMomentumResearchPromptTemplate,
+          } = await import('./momentum/perplexityPrompts.js')
+          await ensurePerplexityPromptsFromSupabase({ force: true })
+          savedMomentumTemplate = String(
+            getMomentumResearchPromptTemplate(cls) || '',
+          ).trim()
+        } catch {
+          savedMomentumTemplate = ''
+        }
         const promptTemplate =
           String(
             request.body?.prompt_template || request.body?.custom_prompt || '',
-          ).trim() || buildMomentumResearchGeminiPromptTemplate(cls)
+          ).trim() ||
+          savedMomentumTemplate ||
+          buildMomentumResearchGeminiPromptTemplate(cls)
 
         let fullPrompt = String(request.body?.prompt || '').trim()
         if (!fullPrompt) {
@@ -7867,6 +7900,10 @@ export function createNotificationsRouter({ getSupabase }) {
         const secondaryDriver = formatDashesToCommas(
           extractSecondaryDriver(summary),
         )
+        const moveClassification = formatDashesToCommas(
+          extractMoveClassification(summary),
+        )
+        const confidence = formatDashesToCommas(extractConfidence(summary))
         summary = formatDashesToCommas(summary)
         const headlineLine = formatDashesToCommas(
           summary
@@ -7973,8 +8010,11 @@ export function createNotificationsRouter({ getSupabase }) {
             reference_price: referencePrice,
             reference_time: referenceTime,
             headline: headlineLine || null,
+            reason: summary,
             likely_driver: likelyDriver || null,
             secondary_driver: secondaryDriver || null,
+            move_classification: moveClassification || null,
+            confidence: confidence || null,
             push_title: pushTitle,
             push_body: pushBody,
             model_version: modelVersion || model,
@@ -8052,6 +8092,8 @@ export function createNotificationsRouter({ getSupabase }) {
           reason: summary,
           likely_driver: likelyDriver || null,
           secondary_driver: secondaryDriver || null,
+          move_classification: moveClassification || null,
+          confidence: confidence || null,
           headline: headlineLine || null,
           push_title: pushTitle,
           push_body: pushBody,

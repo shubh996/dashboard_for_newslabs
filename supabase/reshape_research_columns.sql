@@ -23,7 +23,7 @@ from (
     r2.id,
     ev.episode_id
   from public.research r2
-  join public.episodes_events ev
+  join public.events_episodes ev
     on upper(ev.ticker) = upper(r2.ticker)
    and coalesce(ev.episode_id, '') <> ''
    and ev.event_type in (

@@ -6,6 +6,8 @@
  * Keep in sync with server/momentum/usEquitySession.js.
  */
 
+import { timeZoneSuffix } from '@/lib/localTimeZone'
+
 export const ET_ZONE = 'America/New_York'
 export const UK_ZONE = 'Europe/London'
 
@@ -129,12 +131,15 @@ export function usEquitySessionTone(
 
 export function formatHmInTimeZone(ms: number, timeZone: string) {
   try {
-    return new Intl.DateTimeFormat('en-GB', {
+    const date = new Date(ms)
+    const clock = new Intl.DateTimeFormat('en-GB', {
       timeZone,
       hour: '2-digit',
       minute: '2-digit',
       hour12: false,
-    }).format(new Date(ms))
+    }).format(date)
+    const zone = timeZoneSuffix(date, timeZone)
+    return zone ? `${clock} ${zone}` : clock
   } catch {
     return '—'
   }

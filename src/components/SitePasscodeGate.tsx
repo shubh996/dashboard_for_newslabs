@@ -1,23 +1,19 @@
-import { useMemo, useState, type FormEvent, type ReactNode } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useState, type FormEvent, type ReactNode } from 'react'
 import { Lock } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
-/** Public pages that skip the site passcode. */
-const PUBLIC_PATHS = new Set(['/privacy', '/terms', '/support'])
-
 const SITE_PASSCODE = '6565'
 const UNLOCK_STORAGE_KEY = '9am-site-unlocked'
 
-function isPublicPath(pathname: string) {
-  const path = pathname.replace(/\/+$/, '') || '/'
-  return PUBLIC_PATHS.has(path)
-}
-
 function readUnlocked(): boolean {
+  try {
+    if (localStorage.getItem(UNLOCK_STORAGE_KEY) === '1') return true
+  } catch {
+    /* private mode */
+  }
   try {
     return sessionStorage.getItem(UNLOCK_STORAGE_KEY) === '1'
   } catch {
@@ -26,6 +22,12 @@ function readUnlocked(): boolean {
 }
 
 function writeUnlocked() {
+  // localStorage so a new tab opened from So Far → Trigger stays unlocked
+  try {
+    localStorage.setItem(UNLOCK_STORAGE_KEY, '1')
+  } catch {
+    /* private mode / quota */
+  }
   try {
     sessionStorage.setItem(UNLOCK_STORAGE_KEY, '1')
   } catch {
@@ -33,18 +35,13 @@ function writeUnlocked() {
   }
 }
 
-/**
- * Lightweight site gate. Blocks the whole app until passcode is entered,
- * except Privacy / Terms / Support which stay public.
- */
+/** Lightweight site gate. Blocks the whole app until passcode is entered. */
 export function SitePasscodeGate({ children }: { children: ReactNode }) {
-  const location = useLocation()
-  const publicPage = useMemo(() => isPublicPath(location.pathname), [location.pathname])
   const [unlocked, setUnlocked] = useState(() => readUnlocked())
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
 
-  if (publicPage || unlocked) {
+  if (unlocked) {
     return <>{children}</>
   }
 
@@ -98,10 +95,6 @@ export function SitePasscodeGate({ children }: { children: ReactNode }) {
         <Button type="submit" className="w-full">
           Unlock
         </Button>
-
-        <p className="text-center text-xs text-muted-foreground">
-          Privacy, Terms, and Support are public and do not need a passcode.
-        </p>
       </form>
     </div>
   )

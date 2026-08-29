@@ -16,13 +16,14 @@ import {
 } from './persist.js'
 import { classifyAsset } from '../tradingEconomics.js'
 import {
-  buildMomentumResearchGeminiPromptTemplate,
   buildMomentumUserMovementLine,
   buildMomentumInputFacts,
   fillMomentumResearchPrompt,
   callPerplexityResearch,
   extractLikelyDriver,
   extractSecondaryDriver,
+  extractMoveClassification,
+  extractConfidence,
   structuredReasonHasLikelyDriver,
   sanitizeGeminiSessionHeadline,
   geminiMaxOutputTokens,
@@ -31,10 +32,14 @@ import {
   sendTriggerEpisodePush,
 } from '../notifications.js'
 import {
+  ensurePerplexityPromptsFromSupabase,
+  getMomentumResearchPromptTemplate,
+  getMomentumReversalOverride,
+} from './perplexityPrompts.js'
+import {
   MOMENTUM_AUTO_START_RESEARCH,
   START_PUSH_MAX_AGE_MS,
   getEpisodePolicyForClass,
-  isMomentumDummyResearchMode,
 } from './config.js'
 import { classifyMomentumAsset } from './candles.js'
 import { calendarAllowsHeavyWork } from './engineGate.js'
@@ -49,16 +54,20 @@ import * as store from './store.js'
 /** key → in-flight or completed auto pipeline (start or reverse) */
 const processedStarts = new Map()
 
-function persistTimelineEvents(ticker, events) {
+async function persistTimelineEvents(ticker, events) {
   const list = (events || []).filter(Boolean)
-  if (!list.length) return
-  void insertEvents(ticker, list)
-    .then((rows) => {
-      if (rows?.length) store.markEventsPersisted(ticker, rows)
-    })
-    .catch(() => {
-      /* persist is best-effort */
-    })
+  if (!list.length) return []
+  try {
+    const rows = await insertEvents(ticker, list)
+    if (rows?.length) store.markEventsPersisted(ticker, rows)
+    return rows || []
+  } catch (err) {
+    console.warn(
+      `[${ticker} research] persistTimelineEvents failed:`,
+      err instanceof Error ? err.message : err,
+    )
+    return []
+  }
 }
 
 function getSupabaseOrNull() {
@@ -186,96 +195,17 @@ export async function researchStartMove(input) {
     marketSession,
   })
 
-  const promptTemplate = buildMomentumResearchGeminiPromptTemplate(cls)
+  // Always refresh prompt templates from Supabase → memory before research.
+  await ensurePerplexityPromptsFromSupabase({ force: true })
+  const promptTemplate = getMomentumResearchPromptTemplate(cls)
   let fullPrompt = fillMomentumResearchPrompt(
     promptTemplate,
     userMovement,
     inputFacts,
   )
   if (researchMode === 'reversal') {
-    fullPrompt = [
-      '═══ TASK OVERRIDE: REVERSAL RESEARCH ═══',
-      'This is NOT a fresh momentum start. An existing directional episode just REVERSED.',
-      'Focus your answer on: what likely caused the reverse (profit-taking, news flip, sector rotation, forced liquidations, technical break, etc.).',
-      'Lead with “Likely driver:” for the REVERSAL catalyst specifically.',
-      '',
-      fullPrompt,
-    ].join('\n')
-  }
-
-  // Testing / push-allowlist mode: skip Perplexity API, keep timeline + alert flow
-  if (isMomentumDummyResearchMode()) {
-    const name = companyName || ticker
-    // Detection-time span only (exactMinutes frozen at STARTED) — never Date.now()
-    // direction on REVERSED event = the OLD episode leg that was erased
-    const pushTitle =
-      researchMode === 'reversal'
-        ? dir === 'UP'
-          ? `🔴 ${ticker} reverses lower`
-          : `🟢 ${ticker} rebounds sharply`
-        : buildMomentumAlertTitle({
-            ticker,
-            direction: dir,
-            movePercent: Number.isFinite(movePercent) ? movePercent : null,
-            exactMinutes: Number.isFinite(exactMinutes) ? exactMinutes : null,
-            exactLabel: exactLabel || null,
-            windowKey,
-            referenceTime,
-            marketSession,
-          })
-    const dummyDriver = formatDashesToCommas(
-      researchMode === 'reversal'
-        ? dir === 'UP'
-          ? `Simulated profit-taking / negative catalyst for ${name} after the prior surge reversed.`
-          : `Simulated short-covering / bounce catalyst for ${name} after the prior decline reversed.`
-        : Number.isFinite(movePercent) && movePercent < 0
-          ? `Simulated pressure on ${name} after a sharp session move.`
-          : `Simulated buying interest in ${name} after a sharp session move.`,
-    )
-    const dummyReason = [
-      researchMode === 'reversal'
-        ? `${name} reversed ${preferredTimePhrase}.`
-        : `${name} ${moveText || 'moved'} ${preferredTimePhrase}.`,
-      '',
-      `Likely driver: ${dummyDriver}`,
-      '',
-      'Secondary driver: No clear secondary driver identified.',
-      '',
-      researchMode === 'reversal'
-        ? 'Move classification: reverse catalyst research (dummy).'
-        : 'Move classification: 60% company-specific, 40% sector/market/macro-related.',
-      '',
-      'Confidence: Low — dummy data for push allowlist testing.',
-    ].join('\n')
-
-    // Brief pause so the UI can poll the "Perplexity running" row
-    await new Promise((r) => setTimeout(r, 900))
-
-    return {
-      ok: true,
-      dummy: true,
-      ticker,
-      company_name: companyName || null,
-      asset_class: cls,
-      window_key: windowKey,
-      window_label: windowLabel,
-      exact_label: exactLabel || null,
-      move_percent: Number.isFinite(movePercent) ? movePercent : null,
-      user_movement: userMovement,
-      reason: formatDashesToCommas(dummyReason),
-      likely_driver: dummyDriver,
-      push_title: pushTitle,
-      push_body: dummyDriver,
-      model: 'dummy-test',
-      model_version: 'dummy-test',
-      request_id: `dummy-${Date.now()}`,
-      provider: 'dummy',
-      citations: [],
-      search_results: [],
-      cost_usd_display: '$0.000000',
-      structure_retried: false,
-      supabase_save: { ok: false, skipped: true, reason: 'dummy research' },
-    }
+    const reversalOverride = String(getMomentumReversalOverride() || '').trim()
+    fullPrompt = [reversalOverride, '', fullPrompt].filter(Boolean).join('\n')
   }
 
   const apiKey = String(process.env.PERPLEXITY_API_KEY || '').trim()
@@ -371,6 +301,10 @@ export async function researchStartMove(input) {
   // Robust extract (handles **Likely driver:** and mid-line after [TICKER] header)
   const likelyDriver = formatDashesToCommas(extractLikelyDriver(summary))
   const secondaryDriver = formatDashesToCommas(extractSecondaryDriver(summary))
+  const moveClassification = formatDashesToCommas(
+    extractMoveClassification(summary),
+  )
+  const confidence = formatDashesToCommas(extractConfidence(summary))
   const summaryFormatted = formatDashesToCommas(summary)
   const episodeId = String(input.episodeId || input.episode_id || '').trim() || null
 
@@ -397,11 +331,15 @@ export async function researchStartMove(input) {
   // Strict: body is ONLY the likely driver text (no move restatement)
   const pushBody = likelyDriver || ''
 
-  // Best-effort Supabase save + usage ledger
+  // Persist to public.research so events can link via research_id.
   const supabase = getSupabaseOrNull()
   let saveResult = null
-  try {
-    if (supabase) {
+  if (!supabase) {
+    console.warn(
+      `[${ticker} research] Supabase client missing — research row will not be saved`,
+    )
+  } else {
+    try {
       saveResult = await saveMomentumResearchRow(supabase, {
         ticker,
         company_name: companyName || null,
@@ -417,8 +355,11 @@ export async function researchStartMove(input) {
         live_price: livePrice,
         reference_price: referencePrice,
         reference_time: referenceTime,
+        reason: summaryFormatted || summary,
         likely_driver: likelyDriver || null,
         secondary_driver: secondaryDriver || null,
+        move_classification: moveClassification || null,
+        confidence: confidence || null,
         push_title: pushTitle,
         push_body: pushBody,
         model_version: result.modelVersion || result.model,
@@ -432,6 +373,13 @@ export async function researchStartMove(input) {
         cost: result.cost,
         cost_usd_display: result.cost_usd_display,
       })
+      if (!saveResult?.ok || !saveResult?.id) {
+        console.warn(
+          `[${ticker} research] saveMomentumResearchRow failed:`,
+          saveResult?.error || 'missing id',
+          saveResult,
+        )
+      }
       void recordPerplexityUsageLedger(supabase, {
         ticker,
         credits_used: Number(result.usageRaw?.total_tokens) || 0,
@@ -446,12 +394,22 @@ export async function researchStartMove(input) {
           asset_class: cls,
           structure_retried: structureRetried,
           source: 'auto_start',
+          research_id: saveResult?.id || null,
         },
       })
+    } catch (err) {
+      console.warn(
+        `[${ticker} research] saveMomentumResearchRow threw:`,
+        err instanceof Error ? err.message : err,
+      )
+      saveResult = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      }
     }
-  } catch {
-    /* non-fatal */
   }
+
+  const researchRowId = saveResult?.ok ? saveResult.id || null : null
 
   return {
     ok: true,
@@ -466,7 +424,10 @@ export async function researchStartMove(input) {
     reason: summaryFormatted || summary,
     likely_driver: likelyDriver || null,
     secondary_driver: secondaryDriver || null,
+    move_classification: moveClassification || null,
+    confidence: confidence || null,
     episode_id: episodeId,
+    id: researchRowId,
     push_title: pushTitle,
     push_body: pushBody,
     model: result.model,
@@ -539,13 +500,10 @@ export async function handleAutoStartResearchAlerts(opts) {
       processedStarts.delete(first)
     }
 
-    const dummyMode = isMomentumDummyResearchMode()
     store.pushLog(
       ticker,
       'info',
-      dummyMode
-        ? `Auto-${researchMode} pipeline · DUMMY research for ${startEv.direction || episode?.direction || '?'}…`
-        : `Auto-${researchMode} pipeline · Perplexity research for ${startEv.direction || episode?.direction || '?'}…`,
+      `Auto-${researchMode} pipeline · Perplexity research for ${startEv.direction || episode?.direction || '?'}…`,
       'research',
     )
 
@@ -635,11 +593,10 @@ export async function handleAutoStartResearchAlerts(opts) {
       research: {
         status: 'running',
         mode: researchMode,
-        provider: dummyMode ? 'dummy' : 'perplexity',
+        provider: 'perplexity',
         startedAt: researchStartedAt,
-        reason: dummyMode
-          ? 'Dummy research (no API call)…'
-          : researchMode === 'reversal'
+        reason:
+          researchMode === 'reversal'
             ? 'Researching why the move reversed…'
             : 'Researching likely driver…',
       },
@@ -694,35 +651,51 @@ export async function handleAutoStartResearchAlerts(opts) {
 
     // Flip running → done/error. Keep startedAt on the row; always remove any
     // leftover RESEARCH_RUNNING so the rail cannot show dual "running" + "done".
+    const researchRowId =
+      research.supabase_save?.id || research.id || null
     const researchPayload = research.ok
       ? {
           status: 'done',
           reason: research.reason,
           likely_driver: research.likely_driver,
-          provider: research.provider || (dummyMode ? 'dummy' : 'perplexity'),
+          provider: research.provider || 'perplexity',
           model: research.model_version || research.model,
           citations: research.citations || [],
           cost_usd_display: research.cost_usd_display,
           startedAt: researchStartedAt,
           completedAt: researchAt,
+          researchId: researchRowId,
+          id: researchRowId,
         }
       : {
           status: 'error',
           reason: research.error || 'Research failed',
           likely_driver: null,
-          provider: research.provider || (dummyMode ? 'dummy' : 'perplexity'),
+          provider: research.provider || 'perplexity',
           startedAt: researchStartedAt,
           completedAt: researchAt,
           error: true,
+          researchId: researchRowId,
+          id: researchRowId,
         }
     const researchPatch = {
       eventType: 'MOMENTUM_RESEARCH_DONE',
       detectedAt: researchAt,
+      // Canonical state stays on the episode row / STATE events — not research prose.
+      state: null,
       reason: research.ok
         ? research.reason
         : `Research failed: ${research.error || 'unknown'}`,
+      shortReason: research.ok
+        ? research.likely_driver || null
+        : null,
       likely_driver: research.ok ? research.likely_driver : null,
+      researchId: researchRowId,
       research: researchPayload,
+      shouldNotify: false,
+      notification: null,
+      // Persist layer strips measure for RESEARCH_*; keep event lean in memory too.
+      measureNote: null,
     }
 
     // Prefer in-place upgrade of the running row (same object identity for UI).
@@ -754,14 +727,19 @@ export async function handleAutoStartResearchAlerts(opts) {
         ...researchPatch,
       })
     }
-    // Persist DONE and hard-delete RUNNING rows (different unique key in Supabase).
-    persistTimelineEvents(ticker, [researchEv])
-    void deleteResearchRunningEvents(ticker, episodeId)
+    // Persist DONE (with research_id) and hard-delete RUNNING rows.
+    const persisted = await persistTimelineEvents(ticker, [researchEv])
+    if (research.ok && researchRowId && !persisted?.length) {
+      console.warn(
+        `[${ticker} research] RESEARCH_DONE persist returned no rows · research_id=${researchRowId}`,
+      )
+    }
+    await deleteResearchRunningEvents(ticker, episodeId)
     store.pushLog(
       ticker,
       research.ok ? 'success' : 'error',
       research.ok
-        ? `Perplexity done · ${String(research.likely_driver || research.reason || '').slice(0, 100)}`
+        ? `Perplexity done · id=${researchRowId || '—'} · ${String(research.likely_driver || research.reason || '').slice(0, 100)}`
         : `Perplexity failed · ${research.error || 'unknown'}`,
       'research',
       researchEv,
@@ -1051,14 +1029,17 @@ export async function handleAutoStartResearchAlerts(opts) {
       detectedAt: notifiedAt,
       notifiedAt,
       marketSession: startEv.marketSession || snapshot?.marketSession || null,
+      // Do not put "RESEARCH" into state/reason — notification_* carry the copy.
+      state: episode?.state || startEv.state || 'STARTED',
       reason:
         researchMode === 'reversal'
           ? research.ok
             ? 'REVERSAL_RESEARCH'
             : 'REVERSAL_RESEARCH_FALLBACK'
-          : research.ok
-            ? 'RESEARCH'
-            : 'RESEARCH_FALLBACK',
+          : null,
+      shortReason: research.ok
+        ? research.likely_driver || extractLikelyDriver(research.reason) || null
+        : null,
       shouldNotify: true,
       researchId: research.supabase_save?.id || research.id || null,
       // Full user-facing copy for mobile
@@ -1098,7 +1079,7 @@ export async function handleAutoStartResearchAlerts(opts) {
               extractLikelyDriver(research.reason) ||
               body ||
               null,
-            provider: research.provider || (dummyMode ? 'dummy' : 'perplexity'),
+            provider: research.provider || 'perplexity',
             model: research.model_version || research.model || null,
             completedAt: researchAt,
             push_title: title,
@@ -1123,14 +1104,14 @@ export async function handleAutoStartResearchAlerts(opts) {
         deep_link: pushResult?.deep_link || null,
         device_ids: pushResult?.device_ids || [],
         recipients: pushResult?.recipients || [],
-        forced_allowlist: Boolean(pushResult?.forced_allowlist),
+        always_notify_included: Boolean(pushResult?.always_notify_included),
         tickets: pushResult?.tickets || [],
         at: notifiedAt,
         source: researchMode === 'reversal' ? 'auto_reversal' : 'auto_start',
       },
     }
     store.pushEvent(ticker, alertEv)
-    // Persist alert with full mobile payload (title/body/measure/pushResult)
+    // Persist alert (slim measure; notification title/body + research_id columns)
     const liveForPersist = store.getActiveEpisode(ticker)
     void persistTick(
       ticker,
@@ -1235,4 +1216,88 @@ export async function handleAutoStartResearchAlerts(opts) {
   }
 
   return { ok: true, results }
+}
+
+/**
+ * Re-run real Perplexity research for an existing episode (e.g. after dummy cleanup).
+ * Writes RESEARCH_DONE + public.research row with research_id linked on the event.
+ */
+export async function rerunResearchForEpisode(opts = {}) {
+  const symbol = normTicker(opts.ticker)
+  const eid = String(opts.episodeId || opts.episode_id || '').trim()
+  if (!symbol || !eid) {
+    return { ok: false, error: 'ticker and episodeId required' }
+  }
+
+  const { refreshEpisodesFromSupabase } = await import('./persist.js')
+  await refreshEpisodesFromSupabase(symbol, { force: true }).catch(() => null)
+
+  // Allow another pipeline pass for this episode.
+  for (const key of [...processedStarts.keys()]) {
+    if (String(key).includes(eid)) processedStarts.delete(key)
+  }
+
+  // Drop stale RESEARCH_* rows (memory + Supabase) before re-run.
+  store.removeEvents(
+    symbol,
+    (e) =>
+      String(e?.episodeId || '') === eid &&
+      String(e?.eventType || '').includes('RESEARCH'),
+  )
+  const supabase = getSupabaseOrNull()
+  if (supabase) {
+    const { error } = await supabase
+      .from('events_episodes')
+      .delete()
+      .eq('ticker', symbol)
+      .eq('episode_id', eid)
+      .ilike('event_type', '%RESEARCH%')
+    if (error) {
+      console.warn(
+        `[${symbol} research-rerun] delete old RESEARCH rows failed:`,
+        error.message,
+      )
+    }
+  }
+
+  const events = store.listEvents(symbol, 500)
+  const started = events.find((e) => {
+    if (String(e?.episodeId || '') !== eid) return false
+    const t = String(e?.eventType || '')
+    if (t === 'MOMENTUM_REVERSED') return false
+    if (t === 'MOMENTUM_STARTED' || t.endsWith('_STARTED')) {
+      return String(e?.reason || '').toUpperCase() !== 'AFTER_REVERSAL'
+    }
+    return false
+  })
+  if (!started) {
+    return {
+      ok: false,
+      error: `No STARTED event found for ${symbol} episode ${eid}`,
+    }
+  }
+
+  const live = store.getActiveEpisode(symbol)
+  const history = store.listHistoryEpisodes(symbol, 80)
+  const episode =
+    (live && String(live.episodeId || '') === eid ? live : null) ||
+    history.find((e) => String(e?.episodeId || '') === eid) ||
+    null
+
+  const out = await handleAutoStartResearchAlerts({
+    ticker: symbol,
+    events: [started],
+    episode,
+    snapshot: store.getLastSnapshot(symbol) || null,
+    meta: {
+      shortName: episode?.companyName || null,
+      longName: episode?.companyName || null,
+    },
+  })
+  return {
+    ok: true,
+    ticker: symbol,
+    episodeId: eid,
+    ...out,
+  }
 }

@@ -14,6 +14,9 @@ import {
 } from 'react'
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   BarChart3,
   BellRing,
   Bitcoin,
@@ -24,17 +27,19 @@ import {
   ChevronRight,
   ChevronUp,
   DollarSign,
-  ExternalLink,
+  ArrowUpRight,
   Info,
-  LayoutDashboard,
   LineChart,
+  ListFilter,
   Loader2,
   PieChart,
   Moon,
+  Newspaper,
   Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
+  ScrollText,
   Search,
   Settings,
   Sun,
@@ -53,8 +58,8 @@ import {
   usEquitySessionFromEtClock,
 } from '@/lib/usEquitySession'
 import { YahooInteractiveChart } from '@/components/yahoo/YahooInteractiveChart'
+import { PerplexityPromptsDialog } from '@/components/hub/PerplexityPromptsDialog'
 import {
-  DeskUserActivitiesPanel,
   DeskUserListButton,
   DeskUserProfilePanel,
   deskDeviceKey,
@@ -104,9 +109,9 @@ import type { YahooSearchResult } from '@/types/yahoo'
 import { resolveYahooActiveSession } from '@/lib/yahooMarketSession'
 import {
   YahooFinanceWithMarketState,
-  YahooMarketStateLabel,
 } from '@/components/yahoo/YahooMarketStateLabel'
 import { CompanyLogo } from '@/components/hub/company-logo'
+import { SubscriberHoverCard } from '@/components/hub/subscriber-hover-card'
 import { timeZoneSuffix } from '@/lib/localTimeZone'
 import {
   formatExchangeTime,
@@ -192,6 +197,9 @@ type ActiveEpisodeRow = {
   ticker: string
   episodeId?: string | null
   episodeNo?: number | null
+  /** Exact Supabase origin for the episode row. */
+  sourceTable?: string | null
+  sourceRowId?: string | null
   direction: 'UP' | 'DOWN' | string
   status?: string
   state?: string | null
@@ -206,6 +214,8 @@ type ActiveEpisodeRow = {
   peakPrice?: number | null
   troughPrice?: number | null
   episodeStartedAt?: string | null
+  /** Actual recorded push audience when available; otherwise UI falls back to current subscribers. */
+  notificationRecipientCount?: number | null
   exactMinutes?: number | null
   exactLabel?: string | null
   lastMaterialProgressAt?: string | null
@@ -220,6 +230,26 @@ type ActiveEpisodeRow = {
     id?: string | null
   } | null
 }
+
+type AllEpisodesSortKey =
+  | 'started'
+  | 'peak'
+  | 'now'
+  | 'soFar'
+  | 'status'
+  | 'ticker'
+
+const ALL_EPISODES_SORT_OPTIONS: Array<{
+  key: AllEpisodesSortKey
+  label: string
+}> = [
+  { key: 'soFar', label: 'So Far %' },
+  { key: 'peak', label: 'Peak %' },
+  { key: 'now', label: 'Now %' },
+  { key: 'started', label: 'Started time' },
+  { key: 'status', label: 'Status (Live)' },
+  { key: 'ticker', label: 'Ticker' },
+]
 
 /** Stable key for desk episode list focus / keyboard nav. */
 function deskEpisodeNavKey(row: ActiveEpisodeRow | null | undefined): string {
@@ -261,6 +291,8 @@ type EventResearch = {
   reason?: string | null
   likely_driver?: string | null
   secondary_driver?: string | null
+  move_classification?: string | null
+  confidence?: string | null
   alert?: { title?: string | null; body?: string | null } | null
   provider?: string | null
   model?: string | null
@@ -290,6 +322,10 @@ type MomentumEvent = {
   marketSession?: string
   shouldNotify?: boolean
   reason?: string
+  shortReason?: string | null
+  likely_driver?: string | null
+  researchId?: string | null
+  research?: EventResearch | null
   /** Backend V1 state label on MOMENTUM_STATE / accel rows */
   state?: string
   previousState?: string
@@ -330,12 +366,12 @@ type MomentumEvent = {
     errors?: unknown[]
     dry_run?: boolean
     device_ids?: string[]
-    forced_allowlist?: boolean
+    always_notify_included?: boolean
     recipients?: Array<{
       device_id?: string | null
       expo_push_token?: string
       expo_push_token_masked?: string
-      forced?: boolean
+      always_notify?: boolean
       status?: string
       ticket_id?: string | null
       error?: string | null
@@ -1520,6 +1556,7 @@ function buildEpisodeGroups(
   episodes: Episode[] | null | undefined,
   events: MomentumEvent[] | null | undefined,
   liveEpisode: Episode | null | undefined,
+  opts?: { includeAllWindows?: boolean },
 ): EpisodeEventGroup[] {
   const eventGroups = groupEventsByEpisode(events)
   const byEpisodeId = new Map<string, EpisodeEventGroup>()
@@ -1529,6 +1566,7 @@ function buildEpisodeGroups(
 
   const seen = new Set<string>()
   const merged: EpisodeEventGroup[] = []
+  const includeAllWindows = Boolean(opts?.includeAllWindows)
 
   const rows = [...(episodes || [])]
   if (
@@ -1541,7 +1579,7 @@ function buildEpisodeGroups(
   for (const ep of rows) {
     const eid = ep.episodeId ? String(ep.episodeId) : ''
     if (!eid || seen.has(eid)) continue
-    if (!isEpisodeEligibleForRail(ep)) continue
+    if (!includeAllWindows && !isEpisodeEligibleForRail(ep)) continue
     seen.add(eid)
 
     const fromEvents = byEpisodeId.get(eid)
@@ -1642,6 +1680,9 @@ function shortEventType(
       formatEpisodeState(event?.state || event?.reason) || 'State'
     )
   }
+  if (type === 'MOMENTUM_RALLY_BEGIN' || type.endsWith('_RALLY_BEGIN')) {
+    return 'Rally begin'
+  }
   if (type === 'MOMENTUM_STARTED' || type.endsWith('_STARTED')) return 'Started'
   if (type === 'MOMENTUM_ACCELERATING' || type.includes('ACCELERAT')) {
     const st = String(event?.state || '').toUpperCase()
@@ -1704,6 +1745,8 @@ function mapApiResearchRow(row: Record<string, unknown> | null | undefined): Eve
     episodeId: row.episode_id != null ? String(row.episode_id) : null,
     likely_driver: (row.likely_driver as string) || null,
     secondary_driver: (row.secondary_driver as string) || null,
+    move_classification: (row.move_classification as string) || null,
+    confidence: (row.confidence as string) || null,
     alert,
     model_version: (row.model_version as string) || (row.model as string) || null,
     citations,
@@ -1726,6 +1769,9 @@ function mergeEventResearch(
     reason: full.reason || base.reason,
     likely_driver: full.likely_driver || base.likely_driver,
     secondary_driver: full.secondary_driver || base.secondary_driver,
+    move_classification:
+      full.move_classification || base.move_classification,
+    confidence: full.confidence || base.confidence,
     alert: full.alert || base.alert,
     model_version: full.model_version || base.model_version || full.model || base.model,
     citations: full.citations?.length ? full.citations : base.citations,
@@ -1791,26 +1837,47 @@ function useOnDemandResearch(
   return { full, loading }
 }
 
+function extractLikelyDriverFromReason(reason: string | null | undefined): string | null {
+  const text = String(reason || '').trim()
+  if (!text) return null
+  const m = text.match(/Likely driver:\s*(.+?)(?:\.\s*Secondary driver:|$)/i)
+  if (m?.[1]) return m[1].trim().replace(/\.\s*$/, '')
+  return null
+}
+
 function extractEventResearch(ev: MomentumEvent): EventResearch | null {
-  if (ev.research && (ev.research.reason || ev.research.likely_driver)) {
+  const type = String(ev.eventType || '')
+  const shortFromEv =
+    (ev as { shortReason?: string | null }).shortReason ||
+    ev.likely_driver ||
+    null
+  if (ev.research && (ev.research.reason || ev.research.likely_driver || shortFromEv)) {
+    const reason = ev.research.reason || ev.reason || null
     return {
       ...ev.research,
       researchId: ev.research.researchId || ev.researchId || null,
-      reason: ev.research.reason || ev.reason || null,
+      episodeId: ev.research.episodeId || ev.episodeId || null,
+      reason,
       likely_driver:
-        ev.research.likely_driver || ev.likely_driver || null,
+        ev.research.likely_driver ||
+        shortFromEv ||
+        extractLikelyDriverFromReason(reason) ||
+        null,
     }
   }
-  const type = String(ev.eventType || '')
   if (
-    (type.includes('RESEARCH') || ev.likely_driver) &&
-    (ev.reason || ev.likely_driver)
+    (type.includes('RESEARCH') || shortFromEv || ev.reason) &&
+    (ev.reason || shortFromEv)
   ) {
+    const reason = ev.reason || null
     return {
       researchId: ev.researchId || null,
-      reason: ev.reason || null,
-      likely_driver: ev.likely_driver || null,
+      episodeId: ev.episodeId || null,
+      reason,
+      likely_driver:
+        shortFromEv || extractLikelyDriverFromReason(reason) || null,
       provider: 'perplexity',
+      status: type.includes('RUNNING') ? 'running' : 'done',
       completedAt: ev.detectedAt,
     }
   }
@@ -1819,8 +1886,8 @@ function extractEventResearch(ev: MomentumEvent): EventResearch | null {
 
 /**
  * Expand stored events into display steps.
- * Perplexity only matters for STARTED (reason before start alert).
- * Accel / holding / state rows never get a research step.
+ * Full lifecycle: Rally begin → Started → Holding / Weakening / Accel →
+ * Perplexity → Alert → Ended. Perplexity only attaches on STARTED.
  * Output is chronological (oldest → newest) so “how this move built”
  * reads top-to-bottom end-to-end — nothing mid-story dropped for recency.
  */
@@ -1846,6 +1913,28 @@ type TimelineStep =
       at: string
       notification: { title?: string; body?: string } | null
     }
+
+/** Secondary line under a timeline step: time · $price · window. */
+function timelineStepWhenLine(
+  at: string | null | undefined,
+  ev: MomentumEvent | null | undefined,
+  marketSession: string | null | undefined,
+  assetClass?: string | null,
+  currency?: string | null,
+  extra?: string | null,
+): string {
+  const when = fmtEpisodeWhen(at, ev?.marketSession || marketSession)
+  const bits: string[] = [when]
+  const price =
+    ev?.price != null && Number.isFinite(Number(ev.price))
+      ? fmtPrice(Number(ev.price), assetClass, currency)
+      : null
+  if (price) bits.push(price)
+  const win = ev?.detectedWindow && ev.detectedWindow !== '—' ? ev.detectedWindow : null
+  if (win) bits.push(win)
+  if (extra) bits.push(extra)
+  return bits.join(' · ')
+}
 
 function isStartEventType(eventType: string | null | undefined): boolean {
   const type = String(eventType || '')
@@ -1887,6 +1976,52 @@ function buildTimelineSteps(events: MomentumEvent[]): TimelineStep[] {
   }
 
   const steps: TimelineStep[] = []
+
+  // Synthetic "Rally begin" = reference bar (before Started crossed the threshold).
+  const startEv = (events || []).find((e) => isStartEventType(e.eventType))
+  const refTime =
+    startEv?.referenceTime ||
+    (events || []).find((e) => e.referenceTime)?.referenceTime ||
+    null
+  const refPriceRaw =
+    startEv?.referencePrice ??
+    (events || []).find(
+      (e) => e.referencePrice != null && Number(e.referencePrice) > 0,
+    )?.referencePrice
+  const refPrice =
+    refPriceRaw != null &&
+    Number.isFinite(Number(refPriceRaw)) &&
+    Number(refPriceRaw) > 0
+      ? Number(refPriceRaw)
+      : null
+  const startMs = startEv?.detectedAt
+    ? Date.parse(String(startEv.detectedAt))
+    : NaN
+  const refMs = refTime ? Date.parse(String(refTime)) : NaN
+  if (
+    startEv &&
+    refTime &&
+    Number.isFinite(refMs) &&
+    (!Number.isFinite(startMs) || refMs < startMs - 1000)
+  ) {
+    steps.push({
+      id: `rally-begin-${refTime}`,
+      kind: 'backend',
+      ev: {
+        ...startEv,
+        eventType: 'MOMENTUM_RALLY_BEGIN',
+        state: 'RALLY_BEGIN',
+        detectedAt: String(refTime),
+        price: refPrice ?? startEv.price,
+        movePercent: 0,
+        shouldNotify: false,
+        reason: 'Reference bar · move measured from here',
+      },
+      label: 'Rally begin',
+      isStateOnly: true,
+    })
+  }
+
   for (let i = 0; i < events.length; i += 1) {
     const ev = events[i]
     const type = String(ev.eventType || '')
@@ -1953,10 +2088,64 @@ function buildTimelineSteps(events: MomentumEvent[]): TimelineStep[] {
       continue
     }
 
-    // Timeline UI shows only Research + Push pills — skip Started/Holding/Ended
-    // backend state rows. Still surface Perplexity / push attached to those events.
+    // Full lifecycle on the rail: Started / Holding / Weakening / Ended + prices.
+    const isStateOnly =
+      type === 'MOMENTUM_STATE' ||
+      type === 'MOMENTUM_STATE_CHANGED' ||
+      type.endsWith('_STATE')
     const isStart = isStartEventType(type)
 
+    // Skip redundant MOMENTUM_STATE when a typed row (ACCELERATING / …) already
+    // covers the same timestamp + state — keep Holding / Weakening state rows.
+    if (isStateOnly) {
+      const st = String(ev.state || '').toUpperCase()
+      const sameBeat = (events || []).some((other, j) => {
+        if (j === i || !other) return false
+        const ot = String(other.eventType || '')
+        if (
+          ot === 'MOMENTUM_STATE' ||
+          ot === 'MOMENTUM_STATE_CHANGED' ||
+          ot.endsWith('_STATE')
+        ) {
+          return false
+        }
+        if (other.detectedAt !== ev.detectedAt) return false
+        const ost = String(other.state || '').toUpperCase()
+        if (st && ost && st === ost) return true
+        if (st.includes('ACCELERAT') && ot.includes('ACCELERAT')) return true
+        if (st === 'STARTED' && isStartEventType(ot)) return true
+        if (
+          (st === 'ENDED' || st === 'EXPIRED' || st === 'REVERSED') &&
+          (ot === 'MOMENTUM_ENDED' || ot.endsWith('_ENDED') || ot === 'MOMENTUM_REVERSED')
+        ) {
+          return true
+        }
+        return false
+      })
+      if (sameBeat) {
+        // Still attach alert if this state row alone carried shouldNotify.
+        if (ev.shouldNotify) {
+          steps.push({
+            id: `alert-from-${ev.notifiedAt || ev.detectedAt}-${i}`,
+            kind: 'alert',
+            ev,
+            at: ev.notifiedAt || ev.pushResult?.at || ev.detectedAt,
+            notification: ev.notification || null,
+          })
+        }
+        continue
+      }
+    }
+
+    steps.push({
+      id: `ev-${ev.detectedAt}-${type}-${i}`,
+      kind: 'backend',
+      ev,
+      label: shortEventType(type, ev),
+      isStateOnly,
+    })
+
+    // STARTED only: attach research when present (reason for the start)
     if (isStart) {
       const research = extractEventResearch(ev)
       if (research) {
@@ -1970,6 +2159,7 @@ function buildTimelineSteps(events: MomentumEvent[]): TimelineStep[] {
       }
     }
 
+    // Push-worthy → Alert row (accel / reverse / manual start alert).
     if (ev.shouldNotify) {
       steps.push({
         id: `alert-from-${ev.notifiedAt || ev.detectedAt}-${i}`,
@@ -2332,6 +2522,16 @@ function TimelineDetailInlineBody({
           </p>
         </div>
       ) : null}
+      {detail.research.reason ? (
+        <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Reason
+          </p>
+          <p className="mt-0.5 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/90">
+            {detail.research.reason}
+          </p>
+        </div>
+      ) : null}
       {detail.research.secondary_driver ? (
         <div className="rounded-lg border border-border bg-muted/30 p-2.5">
           <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -2339,6 +2539,26 @@ function TimelineDetailInlineBody({
           </p>
           <p className="mt-0.5 text-[12px] font-medium leading-snug text-foreground">
             {detail.research.secondary_driver}
+          </p>
+        </div>
+      ) : null}
+      {detail.research.move_classification ? (
+        <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Move classification
+          </p>
+          <p className="mt-0.5 text-[12px] font-medium leading-snug text-foreground">
+            {detail.research.move_classification}
+          </p>
+        </div>
+      ) : null}
+      {detail.research.confidence ? (
+        <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Confidence
+          </p>
+          <p className="mt-0.5 text-[12px] font-medium leading-snug text-foreground">
+            {detail.research.confidence}
           </p>
         </div>
       ) : null}
@@ -2390,6 +2610,13 @@ function TimelineDetailInlineBody({
           </ul>
         </div>
       ) : null}
+      {!detail.research.likely_driver &&
+      !detail.research.reason &&
+      !detail.research.alert?.body ? (
+        <p className="text-[11px] text-muted-foreground">
+          No Perplexity reason stored on this event yet.
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -2435,6 +2662,16 @@ function PerplexityDialogPanel({
             </p>
           </div>
         ) : null}
+        {merged.reason ? (
+          <div className="rounded-xl border border-border bg-muted/30 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Reason
+            </p>
+            <p className="mt-1 whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+              {merged.reason}
+            </p>
+          </div>
+        ) : null}
         {merged.secondary_driver ? (
           <div className="rounded-xl border border-border bg-muted/30 p-3.5">
             <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -2442,6 +2679,26 @@ function PerplexityDialogPanel({
             </p>
             <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
               {merged.secondary_driver}
+            </p>
+          </div>
+        ) : null}
+        {merged.move_classification ? (
+          <div className="rounded-xl border border-border bg-muted/30 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Move classification
+            </p>
+            <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
+              {merged.move_classification}
+            </p>
+          </div>
+        ) : null}
+        {merged.confidence ? (
+          <div className="rounded-xl border border-border bg-muted/30 p-3.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Confidence
+            </p>
+            <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">
+              {merged.confidence}
             </p>
           </div>
         ) : null}
@@ -2493,6 +2750,17 @@ function PerplexityDialogPanel({
             </ul>
           </div>
         ) : null}
+        {!loading &&
+        !merged.likely_driver &&
+        !merged.reason &&
+        !merged.alert?.body ? (
+          <p className="text-[12px] text-muted-foreground">
+            No Perplexity reason found on this event
+            {ev.researchId || ev.episodeId
+              ? ' (and no matching row in Supabase research).'
+              : '.'}
+          </p>
+        ) : null}
       </div>
     </>
   )
@@ -2512,6 +2780,9 @@ function timelineStepPillClass(kind: 'backend' | 'perplexity' | 'alert', label: 
       return 'bg-violet-500/20 text-violet-900 dark:text-violet-200'
     }
     return 'bg-violet-500/15 text-violet-800 dark:text-violet-200'
+  }
+  if (l.includes('rally') || l.includes('begin')) {
+    return 'bg-amber-500/15 text-amber-900 dark:text-amber-200'
   }
   if (l.includes('start')) {
     return 'bg-sky-500/15 text-sky-800 dark:text-sky-200'
@@ -2535,25 +2806,30 @@ function timelineStepPillClass(kind: 'backend' | 'perplexity' | 'alert', label: 
 }
 
 
-/** Compact clock for timeline rail markers — e.g. "8:57 AM" (no zone). */
+/** Compact clock for timeline rail markers — e.g. "8:57 AM EDT". */
 function fmtTimelineRailClock(iso: string | null | undefined): string {
   if (!iso) return '—'
   return (
     formatExchangeTime(iso, momentumDisplayTimeZone, {
       hour12: true,
-      withZone: false,
+      withZone: true,
     }) || '—'
   )
 }
 
-/** Split "8:57 AM" → { clock: "8:57", meridiem: "AM" } for stacked rail badges. */
+/** Split "8:57 AM EDT" for stacked rail badges without dropping the zone. */
 function splitTimelineRailClock(iso: string | null | undefined): {
   clock: string
   meridiem: string
 } {
   const full = fmtTimelineRailClock(iso)
-  const m = full.match(/^(\d{1,2}:\d{2})\s*(AM|PM)$/i)
-  if (m) return { clock: m[1], meridiem: m[2].toUpperCase() }
+  const m = full.match(/^(\d{1,2}:\d{2})\s*(AM|PM)(?:\s+(.+))?$/i)
+  if (m) {
+    return {
+      clock: m[1],
+      meridiem: [m[2].toUpperCase(), m[3]].filter(Boolean).join(' '),
+    }
+  }
   return { clock: full, meridiem: '' }
 }
 
@@ -2618,26 +2894,14 @@ function EpisodeTimelineStepRow({
         ) : null}
       </>
     )
-    pill = (
-      <span
-        className={cn(
-          'rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize',
-          timelineStepPillClass('backend', label),
-        )}
-      >
-        {label}
-      </span>
-    )
-    whenLine = (
-      <>
-        {fmtEpisodeWhen(
-          ev.detectedAt,
-          ev.marketSession || group.marketSession,
-        )}
-        {ev.price != null
-          ? ` · ${fmtPrice(ev.price, assetClass, currency)}`
-          : ''}
-      </>
+    // Only Research + Push pills — no duplicate Started / Holding / Accel tags.
+    pill = null
+    whenLine = timelineStepWhenLine(
+      ev.detectedAt,
+      ev,
+      group.marketSession,
+      assetClass,
+      currency,
     )
     detail = (
       <div className="mt-2.5 rounded-xl border border-border/70 bg-muted/20 px-2.5 py-2">
@@ -2680,9 +2944,12 @@ function EpisodeTimelineStepRow({
         {running ? 'live' : failed ? 'error' : 'research'}
       </span>
     )
-    whenLine = fmtEpisodeWhen(
+    whenLine = timelineStepWhenLine(
       step.at,
-      step.ev?.marketSession || group.marketSession,
+      step.ev,
+      group.marketSession,
+      assetClass,
+      currency,
     )
     if (running) {
       canExpand = false
@@ -2730,16 +2997,13 @@ function EpisodeTimelineStepRow({
         push
       </span>
     )
-    whenLine = (
-      <>
-        <span className="tabular-nums">
-          {fmtEpisodeWhen(
-            step.at,
-            step.ev?.marketSession || group.marketSession,
-          )}
-        </span>
-        {titleText ? ` · ${titleText}` : ''}
-      </>
+    whenLine = timelineStepWhenLine(
+      step.at,
+      step.ev,
+      group.marketSession,
+      assetClass,
+      currency,
+      titleText || null,
     )
     detail = (
       <div className="mt-2.5 rounded-xl border border-sky-500/25 bg-sky-500/5 px-2.5 py-2">
@@ -2759,29 +3023,31 @@ function EpisodeTimelineStepRow({
 
   return (
     <li className="flex gap-3">
-      <div className="relative flex w-[4.25rem] shrink-0 flex-col items-center self-stretch">
-        <span
-          className="z-10 inline-flex w-full items-center justify-center px-0.5 py-0.5 text-center"
+      {/* Time + dot + connector — stacked clock so “2:19 / PM EDT” fits cleanly */}
+      <div className="relative flex w-[3.25rem] shrink-0 flex-col items-center self-stretch">
+        <div
+          className="z-10 flex w-full flex-col items-center px-0.5 text-center"
           title={railClock}
           aria-label={railClock}
         >
-          <span className="whitespace-nowrap text-[13px] font-bold leading-tight tabular-nums text-foreground">
+          <span className="text-[12px] font-bold leading-none tabular-nums text-foreground">
             {railParts.clock}
-            {railParts.meridiem ? (
-              <>
-                {' '}
-                <span className="text-[12px] font-bold tracking-wide">
-                  {railParts.meridiem}
-                </span>
-              </>
-            ) : null}
           </span>
-        </span>
+          {railParts.meridiem ? (
+            <span className="mt-0.5 text-[9px] font-semibold leading-tight tracking-wide text-muted-foreground">
+              {railParts.meridiem}
+            </span>
+          ) : null}
+        </div>
+        <span
+          className="relative z-10 mt-1.5 size-2.5 shrink-0 rounded-full bg-foreground ring-[3px] ring-card"
+          aria-hidden
+        />
         {!isLast ? (
-          <span className="mt-1.5 w-px flex-1 bg-border" aria-hidden />
+          <span className="w-px flex-1 bg-border" aria-hidden />
         ) : null}
       </div>
-      <div className={cn('min-w-0 flex-1', !isLast && 'pb-5')}>
+      <div className={cn('min-w-0 flex-1 pt-0.5', !isLast && 'pb-6')}>
         <div className="flex min-w-0 items-stretch gap-2">
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
@@ -2815,9 +3081,106 @@ function EpisodeTimelineStepRow({
   )
 }
 
+// Keep helpers referenced so noUnusedLocals stays clean (detail tooltips / explain).
+void EventMoveCalcBody
+void buildEpisodeExplainSections
+
+/** Price from → to, window, peak, giveback under “How this move built”. */
+function EpisodeMoveSummaryStrip({
+  group,
+  liveEpisode,
+  matchesLive,
+  assetClass,
+  currency,
+}: {
+  group: EpisodeEventGroup
+  liveEpisode?: Episode | null
+  matchesLive?: boolean
+  assetClass?: string | null
+  currency?: string | null
+}) {
+  const startEv =
+    group.events.find(
+      (e) =>
+        e.eventType === 'MOMENTUM_STARTED' ||
+        String(e.eventType || '').endsWith('_STARTED'),
+    ) || group.events[0]
+  const endEv = [...group.events]
+    .reverse()
+    .find(
+      (e) =>
+        e.eventType === 'MOMENTUM_ENDED' ||
+        e.eventType === 'MOMENTUM_REVERSED' ||
+        String(e.eventType || '').endsWith('_ENDED'),
+    )
+  const ep = matchesLive ? liveEpisode : null
+  const fromPrice =
+    ep?.referencePrice ??
+    startEv?.referencePrice ??
+    startEv?.price ??
+    null
+  const toPrice =
+    ep?.currentPrice ??
+    endEv?.price ??
+    [...group.events].reverse().find((e) => e.price != null)?.price ??
+    null
+  const windowLabel = group.window || startEv?.detectedWindow || '—'
+  const peakMove =
+    ep?.peakMovePercent ??
+    (Number.isFinite(group.peakMovePercent) ? group.peakMovePercent : null)
+  const givebackPct = matchesLive && ep
+    ? computeEpisodeGivebackPercent(ep)
+    : lastGivebackFromEvents(group.events)
+  const givebackLabel = fmtGivebackPct(givebackPct)
+  const fmtP = (n: number | null | undefined) =>
+    n != null && Number.isFinite(Number(n))
+      ? fmtPrice(Number(n), assetClass, currency)
+      : '—'
+
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px]">
+      <span className="tabular-nums text-foreground">
+        <span className="text-muted-foreground">Price </span>
+        <span className="font-semibold">{fmtP(fromPrice)}</span>
+        <span className="mx-1 text-muted-foreground">→</span>
+        <span className="font-semibold">{fmtP(toPrice)}</span>
+      </span>
+      <span className="text-muted-foreground/50" aria-hidden>
+        ·
+      </span>
+      <span>
+        <span className="text-muted-foreground">Window </span>
+        <span className="font-semibold text-foreground">{windowLabel}</span>
+      </span>
+      <span className="text-muted-foreground/50" aria-hidden>
+        ·
+      </span>
+      <span className="tabular-nums">
+        <span className="text-muted-foreground">Peak </span>
+        <span
+          className={cn('font-semibold', pctColor(peakMove))}
+        >
+          {peakMove != null && Number.isFinite(Number(peakMove))
+            ? fmtPct(Number(peakMove))
+            : '—'}
+        </span>
+      </span>
+      <span className="text-muted-foreground/50" aria-hidden>
+        ·
+      </span>
+      <span className="tabular-nums">
+        <span className="text-muted-foreground">Giveback </span>
+        <span className="font-semibold text-foreground">
+          {givebackLabel || '—'}
+        </span>
+      </span>
+    </div>
+  )
+}
+
 /**
- * Time-stamped vertical A→Z timeline (rail shows clock) with full
- * formula / numbers / alert / Perplexity detail kept under each step.
+ * Time-stamped vertical timeline (rail shows clock). No A→Z header —
+ * parent “How this move built” heading owns the title.
  */
 function EpisodeAzTimelineInline({
   group,
@@ -2833,7 +3196,6 @@ function EpisodeAzTimelineInline({
   matchesLive?: boolean
 }) {
   const storySteps = buildTimelineSteps(group.events)
-  const isActive = group.status === 'ACTIVE'
   if (!storySteps.length) {
     return (
       <p className="px-1 py-2 text-[11px] text-muted-foreground">
@@ -2843,171 +3205,129 @@ function EpisodeAzTimelineInline({
   }
 
   return (
-    <div className="min-w-0">
-      <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1">
-        <p className="text-[13px] font-semibold tracking-tight text-foreground">
-          Timeline · A→Z
-        </p>
-        <span
-          className={cn(
-            'rounded-full px-2 py-0.5 text-[11px] font-semibold',
-            isActive
-              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-              : 'bg-muted text-muted-foreground',
-          )}
+    <ol className="m-0 list-none space-y-0 p-0">
+      {storySteps.map((step, index) => (
+        <EpisodeTimelineStepRow
+          key={step.id}
+          step={step}
+          isLast={index === storySteps.length - 1}
+          group={group}
+          assetClass={assetClass}
+          currency={currency}
+          liveEpisode={liveEpisode}
+          matchesLive={matchesLive}
+        />
+      ))}
+    </ol>
+  )
+}
+
+/** Main “How this move built” block: heading + summary + step timeline. */
+function EpisodeHowBuiltBlock({
+  group,
+  assetClass,
+  currency,
+  liveEpisode,
+  matchesLive,
+  defaultOpen = true,
+}: {
+  group: EpisodeEventGroup
+  assetClass?: string | null
+  currency?: string | null
+  liveEpisode?: Episode | null
+  matchesLive?: boolean
+  defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  const storySteps = buildTimelineSteps(group.events)
+  const isActive = group.status === 'ACTIVE'
+  const stepCount = storySteps.length
+  const tickerFromId = String(group.episodeId || '').split('-')[0] || ''
+  const supabaseTicker =
+    String(liveEpisode?.ticker || tickerFromId || '')
+      .trim()
+      .toUpperCase() || null
+  const supabaseUrl = supabaseEpisodeRecordUrl(group.episodeId, {
+    ticker: supabaseTicker,
+    assetClass:
+      assetClass ||
+      (supabaseTicker ? detectAssetClass(supabaseTicker) : null),
+  })
+
+  return (
+    <div className="min-w-0 space-y-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            setOpen((v) => !v)
+          }}
+          className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-0.5 py-0.5 text-left transition-colors hover:bg-muted/40"
+          aria-expanded={open}
         >
-          {isActive ? 'Active' : 'Ended'} · {storySteps.length} steps
-        </span>
+          {open ? (
+            <ChevronUp className="size-3.5 shrink-0 text-muted-foreground" strokeWidth={2} />
+          ) : (
+            <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" strokeWidth={2} />
+          )}
+          <span className="text-[13px] font-semibold tracking-tight text-foreground">
+            How this move built
+          </span>
+          <span
+            className={cn(
+              'rounded-full px-2 py-0.5 text-[11px] font-semibold',
+              isActive
+                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                : 'bg-muted text-muted-foreground',
+            )}
+          >
+            {isActive ? 'Active' : 'Ended'}
+            {stepCount > 0 ? ` · ${stepCount} steps` : ''}
+          </span>
+        </button>
+        {supabaseUrl ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 shrink-0 gap-1.5 px-2 text-[11px]"
+            title="Open Supabase SQL: episode + events + research"
+            aria-label="Open episode bundle in Supabase SQL editor"
+            onClick={(e) => {
+              e.stopPropagation()
+              e.preventDefault()
+              void openEpisodeInSupabaseDashboard({
+                episodeId: group.episodeId,
+                ticker: supabaseTicker,
+                assetClass:
+                  assetClass ||
+                  (supabaseTicker ? detectAssetClass(supabaseTicker) : null),
+              })
+            }}
+          >
+            Supabase
+            <ArrowUpRight className="size-3.5" strokeWidth={2} />
+          </Button>
+        ) : null}
       </div>
 
-      <ol className="m-0 list-none space-y-0 p-0">
-        {storySteps.map((step, index) => (
-          <EpisodeTimelineStepRow
-            key={step.id}
-            step={step}
-            isLast={index === storySteps.length - 1}
+      {open ? (
+        <div className="space-y-3">
+          <EpisodeMoveSummaryStrip
+            group={group}
+            liveEpisode={liveEpisode}
+            matchesLive={matchesLive}
+            assetClass={assetClass}
+            currency={currency}
+          />
+          <EpisodeAzTimelineInline
             group={group}
             assetClass={assetClass}
             currency={currency}
             liveEpisode={liveEpisode}
             matchesLive={matchesLive}
           />
-        ))}
-      </ol>
-    </div>
-  )
-}
-
-
-/** Collapsible plain-English explanation + full step-by-step build under episode. */
-function EpisodeExplainCollapse({
-  group,
-  accelPoints,
-  inactivityMinutes,
-  defaultOpen = false,
-}: {
-  group: EpisodeEventGroup
-  accelPoints?: number | null
-  inactivityMinutes?: number | null
-  /** Open by default (e.g. focused episode in the 3rd column). */
-  defaultOpen?: boolean
-}) {
-  const [open, setOpen] = useState(defaultOpen)
-  const sections = buildEpisodeExplainSections(group, {
-    accelPoints,
-    inactivityMinutes,
-  })
-  return (
-    <div className="mt-1.5">
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation()
-          setOpen((v) => !v)
-        }}
-        className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-        aria-expanded={open}
-      >
-        {open ? (
-          <ChevronUp className="size-3.5" strokeWidth={2} />
-        ) : (
-          <ChevronDown className="size-3.5" strokeWidth={2} />
-        )}
-        {open
-          ? 'Hide how this move built'
-          : `How this move built · ${sections.buildSteps.length} steps${
-              sections.isActive ? ' · ACTIVE' : ''
-            }`}
-      </button>
-      {open ? (
-        <div className="mt-1.5 space-y-0 overflow-hidden rounded-xl border border-border/70 bg-background/80 text-[12px] leading-snug">
-          <div className="space-y-1.5 border-b border-border/60 px-2.5 py-2">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                1 · How this move built (step by step)
-              </p>
-              {sections.isActive ? (
-                <span className="rounded-full bg-emerald-500/15 px-1.5 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
-                  Active
-                </span>
-              ) : (
-                <span className="rounded-full bg-muted px-1.5 py-px text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
-                  Ended
-                </span>
-              )}
-            </div>
-            {sections.buildSteps.length > 0 ? (
-              <ol className="mt-1 space-y-1.5">
-                {sections.buildSteps.map((step, i) => (
-                  <li
-                    key={`${step.at}-${i}-${step.line.slice(0, 24)}`}
-                    className="flex min-w-0 gap-2"
-                  >
-                    <span className="mt-0.5 w-4 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
-                      {i + 1}.
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-foreground/90">{step.line}</p>
-                      {step.at ? (
-                        <p className="text-[10px] tabular-nums text-muted-foreground">
-                          {fmtEpisodeWhen(step.at, group.marketSession)}
-                        </p>
-                      ) : null}
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            ) : (
-              <p className="text-muted-foreground">No timeline steps yet.</p>
-            )}
-            <p className="pt-1 text-muted-foreground">{sections.statusNote}</p>
-          </div>
-
-          <div className="space-y-1.5 border-b border-border/60 px-2.5 py-2">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-              2 · Story
-            </p>
-            <p className="text-foreground/90">{sections.start}</p>
-            {sections.during ? (
-              <p className="text-foreground/85">{sections.during}</p>
-            ) : null}
-            <p className="text-foreground/85">{sections.end}</p>
-          </div>
-
-          <div className="space-y-1.5 border-b border-border/60 px-2.5 py-2">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-              3 · How we measure it
-            </p>
-            <p className="text-foreground/85">{sections.howMeasured}</p>
-            {sections.formula ? (
-              <p className="rounded-md bg-muted/60 px-2 py-1.5 font-mono text-[10px] leading-snug text-foreground/90">
-                {sections.formula}
-              </p>
-            ) : null}
-          </div>
-
-          <div className="space-y-1.5 border-b border-border/60 px-2.5 py-2">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-              4 · Example with numbers
-            </p>
-            <p className="text-foreground/85">{sections.numbers}</p>
-          </div>
-
-          <div className="space-y-2 px-2.5 py-2">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-              5 · What we look for next
-            </p>
-            <ul className="space-y-2">
-              {sections.lookingFor.map((item) => (
-                <li key={item.title} className="min-w-0">
-                  <p className="font-semibold text-foreground/90">
-                    {item.title}
-                  </p>
-                  <p className="mt-0.5 text-foreground/80">{item.body}</p>
-                </li>
-              ))}
-            </ul>
-          </div>
         </div>
       ) : null}
     </div>
@@ -3196,16 +3516,16 @@ type MomentumStatus = {
         Record<string, number | boolean | null | undefined>
       >
     }
-    testMode?: {
-      enabled?: boolean
-      dummyResearch?: boolean
-      summary?: string
+    notificationRecipients?: {
+      mode?: string
+      description?: string
       alwaysNotify?: {
+        id?: string
+        label?: string
         device_id?: string
         expo_push_token?: string
       }
     }
-    dummyResearch?: boolean
   }
 }
 
@@ -3371,16 +3691,23 @@ function saveLocalThresholdDraft(
 }
 
 const LOG_COLLAPSE_KEY = 'sndk-momentum-log-collapsed'
-const RIGHT_RAIL_WIDTH_KEY = 'momentum-right-rail-width-v1'
+const RIGHT_RAIL_WIDTH_KEY = 'momentum-right-rail-width-v2'
 /** Floor so the rail stays usable while dragging. */
 const RIGHT_RAIL_MIN_WIDTH = 200
+const NAV_COL_WIDTH_KEY = 'momentum-nav-col-width-v1'
+const LIST_COL_WIDTH_KEY = 'momentum-list-col-width-v1'
+const NAV_COL_MIN_WIDTH = 56
+const NAV_COL_MAX_WIDTH = 120
+const NAV_COL_DEFAULT_WIDTH = 64
+const LIST_COL_MIN_WIDTH = 180
+const LIST_COL_MAX_WIDTH = 480
+const LIST_COL_DEFAULT_WIDTH = 256
 /**
- * Leave enough room for the left entity rail + a usable center column.
- * Upper bound is otherwise free so the user can drag as wide as they want.
+ * Keep the email-style middle list comfortably wide while resizing detail.
  */
 function rightRailMaxWidth(): number {
   if (typeof window === 'undefined') return 1200
-  return Math.max(RIGHT_RAIL_MIN_WIDTH, window.innerWidth - 320)
+  return Math.max(RIGHT_RAIL_MIN_WIDTH, window.innerWidth - 620)
 }
 
 function loadRightRailWidth(): number {
@@ -3403,9 +3730,50 @@ function saveRightRailWidth(px: number) {
   }
 }
 
-const ALL_EPISODES_CACHE_KEY = 'sndk-momentum-all-episodes-v2'
-const TICKER_STATUS_CACHE_PREFIX = 'sndk-momentum-status-v1:'
-const TICKER_STATUS_CACHE_INDEX_KEY = 'sndk-momentum-status-index-v1'
+function loadNavColWidth(): number {
+  try {
+    const n = Number(localStorage.getItem(NAV_COL_WIDTH_KEY))
+    if (Number.isFinite(n) && n >= NAV_COL_MIN_WIDTH) {
+      return Math.round(Math.min(n, NAV_COL_MAX_WIDTH))
+    }
+  } catch {
+    /* ignore */
+  }
+  return NAV_COL_DEFAULT_WIDTH
+}
+
+function saveNavColWidth(px: number) {
+  try {
+    localStorage.setItem(NAV_COL_WIDTH_KEY, String(Math.round(px)))
+  } catch {
+    /* ignore */
+  }
+}
+
+function loadListColWidth(): number {
+  try {
+    const n = Number(localStorage.getItem(LIST_COL_WIDTH_KEY))
+    if (Number.isFinite(n) && n >= LIST_COL_MIN_WIDTH) {
+      return Math.round(Math.min(n, LIST_COL_MAX_WIDTH))
+    }
+  } catch {
+    /* ignore */
+  }
+  return LIST_COL_DEFAULT_WIDTH
+}
+
+function saveListColWidth(px: number) {
+  try {
+    localStorage.setItem(LIST_COL_WIDTH_KEY, String(Math.round(px)))
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Bump when Supabase episode/research rows change so stale browser caches are ignored. */
+const ALL_EPISODES_CACHE_KEY = 'sndk-momentum-all-episodes-v4'
+const TICKER_STATUS_CACHE_PREFIX = 'sndk-momentum-status-v3:'
+const TICKER_STATUS_CACHE_INDEX_KEY = 'sndk-momentum-status-index-v3'
 const ALL_EPISODES_PAGE_SIZE = 40
 const TICKER_STATUS_CACHE_MAX = 24
 
@@ -3769,6 +4137,16 @@ function detectAssetClass(ticker: string): string {
   return 'equity'
 }
 
+function expectedEpisodeSourceTable(ticker: string): string {
+  const assetClass = detectAssetClass(ticker)
+  if (assetClass === 'etf') return 'episodes_etfs'
+  if (assetClass === 'index') return 'episodes_indexes'
+  if (assetClass === 'forex') return 'episodes_forex'
+  if (assetClass === 'crypto') return 'episodes_crypto'
+  if (assetClass === 'commodity') return 'episodes_commodities'
+  return 'episodes_stocks'
+}
+
 /** Left-rail filter: icon-only pills */
 const ASSET_CLASS_TABS: {
   id: 'equity' | 'etf' | 'index' | 'forex' | 'crypto' | 'commodity'
@@ -3786,6 +4164,126 @@ const ASSET_CLASS_TABS: {
 type AssetClassTabId = (typeof ASSET_CLASS_TABS)[number]['id']
 
 const ASSET_CLASS_FILTER_KEY = 'momentum-asset-class-filter-v1'
+const ENTITY_LIST_PREFS_KEY = 'momentum-entity-list-prefs-v1'
+const READ_MARKET_BULLETINS_KEY = 'momentum-read-market-bulletins-v1'
+
+function loadReadMarketBulletinIds(): Set<string> {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(READ_MARKET_BULLETINS_KEY) || '[]',
+    ) as unknown
+    if (!Array.isArray(parsed)) return new Set()
+    return new Set(
+      parsed
+        .map((id) => String(id || '').trim())
+        .filter(Boolean)
+        .slice(-500),
+    )
+  } catch {
+    return new Set()
+  }
+}
+
+function saveReadMarketBulletinIds(ids: Set<string>) {
+  try {
+    localStorage.setItem(
+      READ_MARKET_BULLETINS_KEY,
+      JSON.stringify([...ids].slice(-500)),
+    )
+  } catch {
+    /* ignore unavailable local storage */
+  }
+}
+
+/** Left-rail entity list: who to show. */
+type EntityShowMode = 'subscribers' | 'all'
+/** Left-rail entity list: active-momentum gate. */
+type EntityMomentumFilter = 'any' | 'active' | 'inactive'
+/** Left-rail entity list: sort order. */
+type EntitySortMode = 'name' | 'subscribers_desc' | 'subscribers_asc'
+
+type EntityListPrefs = {
+  show: EntityShowMode
+  momentum: EntityMomentumFilter
+  sort: EntitySortMode
+}
+
+const DEFAULT_ENTITY_LIST_PREFS: EntityListPrefs = {
+  show: 'subscribers',
+  momentum: 'any',
+  sort: 'name',
+}
+
+function loadEntityListPrefs(): EntityListPrefs {
+  try {
+    const raw = localStorage.getItem(ENTITY_LIST_PREFS_KEY)
+    if (!raw) return { ...DEFAULT_ENTITY_LIST_PREFS }
+    const parsed = JSON.parse(raw) as Partial<EntityListPrefs>
+    return {
+      show:
+        parsed.show === 'all' || parsed.show === 'subscribers'
+          ? parsed.show
+          : DEFAULT_ENTITY_LIST_PREFS.show,
+      momentum:
+        parsed.momentum === 'active' ||
+        parsed.momentum === 'inactive' ||
+        parsed.momentum === 'any'
+          ? parsed.momentum
+          : DEFAULT_ENTITY_LIST_PREFS.momentum,
+      sort:
+        parsed.sort === 'subscribers_desc' ||
+        parsed.sort === 'subscribers_asc' ||
+        parsed.sort === 'name'
+          ? parsed.sort
+          : DEFAULT_ENTITY_LIST_PREFS.sort,
+    }
+  } catch {
+    return { ...DEFAULT_ENTITY_LIST_PREFS }
+  }
+}
+
+function saveEntityListPrefs(prefs: EntityListPrefs) {
+  try {
+    localStorage.setItem(ENTITY_LIST_PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    /* ignore */
+  }
+}
+
+const MONITORED_BY_CLASS_CACHE_KEY = 'momentum-monitored-by-class-v1'
+
+type MonitoredByClassCache = {
+  byClass: Partial<Record<AssetClassTabId, WatchTab[]>>
+  table?: string | null
+  counts?: Partial<Record<string, number>>
+  savedAt?: string
+}
+
+function loadMonitoredByClassCache(): MonitoredByClassCache | null {
+  try {
+    const raw = localStorage.getItem(MONITORED_BY_CLASS_CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as MonitoredByClassCache
+    if (!parsed || typeof parsed !== 'object' || !parsed.byClass) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function saveMonitoredByClassCache(payload: MonitoredByClassCache) {
+  try {
+    localStorage.setItem(
+      MONITORED_BY_CLASS_CACHE_KEY,
+      JSON.stringify({
+        ...payload,
+        savedAt: new Date().toISOString(),
+      }),
+    )
+  } catch {
+    /* ignore */
+  }
+}
 
 function loadAssetClassFilter(): AssetClassTabId | null {
   // Desk opens with no bottom tab selected (active-episodes left rail).
@@ -3907,17 +4405,28 @@ function saveWatchlist(list: WatchTab[]) {
 
 function loadActiveTicker(list: WatchTab[]): string {
   try {
-    const saved = localStorage.getItem(ACTIVE_TICKER_KEY)
+    const saved = String(localStorage.getItem(ACTIVE_TICKER_KEY) || '')
+      .trim()
+      .toUpperCase()
     if (saved && list.some((t) => t.ticker === saved)) return saved
+    // Persist only an explicit prior pick — never invent a default ticker.
+    if (saved) return saved
   } catch {
     /* ignore */
   }
-  return list[0]?.ticker || 'SNDK'
+  return ''
 }
 
 function saveActiveTicker(ticker: string) {
   try {
-    localStorage.setItem(ACTIVE_TICKER_KEY, ticker)
+    const t = String(ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!t) {
+      localStorage.removeItem(ACTIVE_TICKER_KEY)
+      return
+    }
+    localStorage.setItem(ACTIVE_TICKER_KEY, t)
   } catch {
     /* ignore */
   }
@@ -3928,6 +4437,162 @@ function yahooFinanceQuoteUrl(symbol: string): string {
   const s = String(symbol || '').trim()
   if (!s) return 'https://finance.yahoo.com/'
   return `https://finance.yahoo.com/quote/${encodeURIComponent(s)}`
+}
+
+/** Live episode class tables in Supabase (post rename_strip_prefixes). */
+const SUPABASE_EPISODE_CLASS_TABLES = [
+  'episodes_stocks',
+  'episodes_etfs',
+  'episodes_indexes',
+  'episodes_forex',
+  'episodes_crypto',
+  'episodes_commodities',
+  'episodes',
+] as const
+
+/**
+ * Pre-filled SQL: one episode_id → episode row (any class table) + all events
+ * + all Perplexity research rows (by episode_id and by events.research_id).
+ */
+function buildEpisodeBundleSql(episodeId: string): string {
+  const safeId = String(episodeId || '').trim().replace(/'/g, "''")
+  const unionEpisode = SUPABASE_EPISODE_CLASS_TABLES.map(
+    (table) =>
+      `  select '${table}'::text as source_table, to_jsonb(t) as row\n  from public.${table} as t\n  where t.episode_id = '${safeId}'`,
+  ).join('\n  union all\n')
+
+  return `-- Everything related to episode_id = ${safeId}
+-- Tables: episodes_* · events_episodes · research (Perplexity)
+with episode_hits as (
+${unionEpisode}
+),
+episode_pick as (
+  select *
+  from episode_hits
+  order by
+    case source_table
+      when 'episodes_stocks' then 1
+      when 'episodes_etfs' then 2
+      when 'episodes_indexes' then 3
+      when 'episodes_forex' then 4
+      when 'episodes_crypto' then 5
+      when 'episodes_commodities' then 6
+      else 9
+    end
+  limit 1
+),
+event_rows as (
+  select e.*
+  from public.events_episodes as e
+  where e.episode_id = '${safeId}'
+  order by e.detected_at asc nulls last
+),
+research_rows as (
+  select distinct on (r.id) r.*
+  from public.research as r
+  where r.episode_id = '${safeId}'
+     or r.id in (
+       select ev.research_id
+       from public.events_episodes as ev
+       where ev.episode_id = '${safeId}'
+         and ev.research_id is not null
+     )
+  order by r.id, r.created_at desc nulls last
+)
+select
+  (select source_table from episode_pick) as episode_source_table,
+  (select row from episode_pick) as episode,
+  (
+    select coalesce(
+      jsonb_agg(to_jsonb(ev) order by ev.detected_at asc nulls last),
+      '[]'::jsonb
+    )
+    from event_rows as ev
+  ) as events,
+  (
+    select coalesce(jsonb_agg(to_jsonb(r) order by r.created_at asc nulls last), '[]'::jsonb)
+    from research_rows as r
+  ) as research,
+  (select count(*)::int from event_rows) as event_count,
+  (select count(*)::int from research_rows) as research_count;`
+}
+
+/** Sync URL → Supabase SQL editor with full episode bundle pre-filled. */
+function supabaseEpisodeRecordUrl(
+  episodeId: string | null | undefined,
+  _opts?: { ticker?: string | null; assetClass?: string | null },
+): string | null {
+  const id = String(episodeId || '').trim()
+  const base = String(import.meta.env.VITE_SUPABASE_URL || '').trim()
+  if (!id || !base) return null
+  let projectRef = ''
+  try {
+    projectRef = new URL(base).hostname.split('.')[0] || ''
+  } catch {
+    return null
+  }
+  if (!projectRef) return null
+  const sql = buildEpisodeBundleSql(id)
+  return `https://supabase.com/dashboard/project/${encodeURIComponent(projectRef)}/sql/new?skip=true&content=${encodeURIComponent(sql)}`
+}
+
+/** Open SQL editor with episode + events + research pre-filled (also copies SQL). */
+async function openEpisodeInSupabaseDashboard(opts: {
+  episodeId: string | null | undefined
+  ticker?: string | null
+  assetClass?: string | null
+}): Promise<void> {
+  const episodeId = String(opts.episodeId || '').trim()
+  if (!episodeId) {
+    window.alert('No episode_id on this row — cannot open Supabase.')
+    return
+  }
+  const ticker = String(opts.ticker || '').trim().toUpperCase()
+  const assetClass = String(opts.assetClass || '').trim()
+  const fallback = supabaseEpisodeRecordUrl(episodeId, { ticker, assetClass })
+  const localSql = buildEpisodeBundleSql(episodeId)
+
+  try {
+    const qs = new URLSearchParams({ episode_id: episodeId })
+    if (ticker) qs.set('ticker', ticker)
+    if (assetClass) qs.set('asset_class', assetClass)
+    const res = await fetch(`/api/desk/supabase-episode-link?${qs}`, {
+      cache: 'no-store',
+    })
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean
+      url?: string
+      sql?: string
+      error?: string
+    }
+    const sql = body.sql || localSql
+    try {
+      await navigator.clipboard?.writeText(sql)
+    } catch {
+      /* clipboard optional */
+    }
+    const url = body.url || fallback
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer')
+      return
+    }
+    window.alert(body.error || 'Could not open Supabase SQL editor.')
+  } catch (err) {
+    try {
+      await navigator.clipboard?.writeText(localSql)
+    } catch {
+      /* ignore */
+    }
+    if (fallback) {
+      window.open(fallback, '_blank', 'noopener,noreferrer')
+      return
+    }
+    window.alert(
+      err instanceof Error
+        ? err.message
+        : 'Failed to open Supabase episode link',
+    )
+  }
 }
 
 function perplexityFinanceQuoteUrl(symbol: string): string {
@@ -4106,6 +4771,29 @@ function fmtDateTime(iso: string | null | undefined) {
       withZone: true,
     }) || String(iso)
   )
+}
+
+/** Time first, then date — used by compact table cells such as Started. */
+function fmtTimeDate(iso: string | null | undefined) {
+  if (!iso) return null
+  const instant = new Date(iso)
+  if (Number.isNaN(instant.getTime())) return String(iso)
+  const clock = formatExchangeTime(instant, momentumDisplayTimeZone, {
+    seconds: true,
+    hour12: true,
+    withZone: true,
+  })
+  try {
+    const date = instant.toLocaleDateString('en-US', {
+      timeZone: momentumDisplayTimeZone,
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    })
+    return clock ? `${clock} · ${date}` : date
+  } catch {
+    return clock || String(iso)
+  }
 }
 
 /** Short clock only — e.g. 4:00 PM EDT (no full date) */
@@ -4729,12 +5417,10 @@ function marketSessionFlag(row: {
 function MarketStatusBadge({
   nowMs,
   className,
-  onClick,
   yahooMarketState,
 }: {
   nowMs: number
   className?: string
-  onClick?: () => void
   /** Raw Yahoo marketState for US probe (SPY), e.g. POST / REGULAR / CLOSED */
   yahooMarketState?: string | null
 }) {
@@ -4749,12 +5435,9 @@ function MarketStatusBadge({
   const londonOpen = formatEtWallInTimeZone(9, 30, UK_ZONE, nowMs)
   const londonClose = formatEtWallInTimeZone(16, 0, UK_ZONE, nowMs)
   return (
-    <button
-      type="button"
-      onClick={onClick}
+    <span
       className={cn(
         'inline-flex items-center gap-1 whitespace-nowrap text-[11px] tabular-nums leading-none',
-        onClick && 'cursor-pointer hover:opacity-80',
         className,
       )}
       title={
@@ -4774,7 +5457,7 @@ function MarketStatusBadge({
       >
         {label}
       </span>
-    </button>
+    </span>
   )
 }
 
@@ -5986,22 +6669,45 @@ export function EpisodeDashboard({
   appSwitcher: _appSwitcher,
   onOpenInTrigger,
   onOpenTriggerApp,
-  onOpenNineAmApp,
+  onOpenNineAmApp: _onOpenNineAmApp,
   theme = 'light',
   onToggleTheme,
 }: {
   /** @deprecated center app pills removed — use settings menu props */
   appSwitcher?: ReactNode
-  /** Open this ticker inside Trigger (parent switches app tab + selects stock) */
-  onOpenInTrigger?: (ticker: string, label?: string) => void
-  /** Switch parent shell to Trigger app */
+  /** Open this ticker inside Trigger share desk (parent navigates + selects stock) */
+  onOpenInTrigger?: (
+    ticker: string,
+    opts?: {
+      label?: string
+      share?: boolean
+      /** scrape = Firecrawl+Gemini then share; direct = share only; research = Perplexity composer */
+      mode?: 'scrape' | 'direct' | 'research'
+      move?: number | null
+      /** End / peak (or live) price for share-card price line */
+      price?: number | null
+      /** Reference / start price — share card shows from → to */
+      priceFrom?: number | null
+      window?: string | null
+      exactLabel?: string | null
+      exactMinutes?: number | null
+      direction?: string | null
+      kind?: 'peak' | 'now' | 'sofar' | string
+      /** Alert heading for direct / sofar share session line */
+      headline?: string | null
+      /** Likely driver for direct share reason body */
+      likelyDriver?: string | null
+    },
+  ) => void
+  /** Switch to Trigger desk */
   onOpenTriggerApp?: () => void
-  /** Switch parent shell to 9AM app */
+  /** Switch to 9AM desk (optional; used when Episode Dashboard is embedded) */
   onOpenNineAmApp?: () => void
   theme?: string
   onToggleTheme?: () => void
 } = {}) {
   void _appSwitcher
+  void _onOpenNineAmApp
   const [watchlist, setWatchlist] = useState<WatchTab[]>(() => loadWatchlist())
   const [assetClassTab, setAssetClassTab] = useState<AssetClassTabId | null>(
     () => loadAssetClassFilter(),
@@ -6010,15 +6716,19 @@ export function EpisodeDashboard({
   /**
    * App-monitored tickers from device_monitor (enabled subscribers).
    * Categorized client-side into Stocks / ETFs / Indices / Forex / Crypto / Commodities.
+   * Hydrate from local cache first so asset lists paint immediately.
    */
   const [monitoredByClass, setMonitoredByClass] = useState<
     Partial<Record<AssetClassTabId, WatchTab[]>>
-  >({})
+  >(() => loadMonitoredByClassCache()?.byClass || {})
   const [monitoredLoading, setMonitoredLoading] = useState(false)
+  const monitoredLoadGenRef = useRef(0)
   const [monitoredSourceTable, setMonitoredSourceTable] = useState<string | null>(
-    null,
+    () => loadMonitoredByClassCache()?.table || null,
   )
-  const [, setMonitoredCounts] = useState<Partial<Record<string, number>>>({})
+  const [, setMonitoredCounts] = useState<Partial<Record<string, number>>>(
+    () => loadMonitoredByClassCache()?.counts || {},
+  )
   const [activeTicker, setActiveTicker] = useState(() => {
     const list = loadWatchlist()
     return loadActiveTicker(list)
@@ -6026,13 +6736,28 @@ export function EpisodeDashboard({
   /** Select a watch tab and remember it (Silver / SpaceX / … survive refresh). */
   const selectTicker = useCallback((ticker: string) => {
     const t = String(ticker || '').trim().toUpperCase()
-    if (!t) return
-    setActiveTicker(t)
+    setActiveTicker((prev) => {
+      if (String(prev || '').toUpperCase() !== t) {
+        setDeskEpisodeFocus(null)
+      }
+      return t
+    })
     saveActiveTicker(t)
   }, [])
 
-  /** Left rail shows all live episodes until an asset-class tab is chosen. */
+  const clearTickerSelection = useCallback(() => {
+    setActiveTicker('')
+    saveActiveTicker('')
+    setStatus(null)
+    setDeskEpisodeFocus(null)
+  }, [])
+
+  /** Home desk is selected until an asset-class tab is chosen. */
   const leftShowsActiveEpisodes = assetClassTab == null
+  /** Asset-class selections use the middle column as their ticker list. */
+  const showLegacyLeftRail = !leftShowsActiveEpisodes
+  /** The ticker list now has its own column, so the duplicate top strip stays off. */
+  const showCompactMarketStrip = false
 
   useEffect(() => {
     let cancelled = false
@@ -6062,68 +6787,97 @@ export function EpisodeDashboard({
     }
   }, [])
 
+  const loadMonitoredTickers = useCallback(async (signal?: AbortSignal) => {
+    const gen = ++monitoredLoadGenRef.current
+    setMonitoredLoading(true)
+    try {
+      const body = await fetchMomentumMonitoredTickers({
+        app: 'trigger',
+        signal,
+      })
+      if (signal?.aborted || gen !== monitoredLoadGenRef.current) return
+      setMonitoredSourceTable(body.table || 'device_monitor')
+      if (body.byClass) setMonitoredCounts(body.byClass)
+      const buckets: Partial<Record<AssetClassTabId, WatchTab[]>> = {
+        equity: [],
+        etf: [],
+        index: [],
+        forex: [],
+        crypto: [],
+        commodity: [],
+      }
+      for (const row of body.items || []) {
+        const ticker = normalizeWatchTicker(row.ticker)
+        if (!ticker) continue
+        const rawCls = String(row.assetClass || detectAssetClass(ticker))
+          .trim()
+          .toLowerCase()
+        const cls = (
+          rawCls === 'etf' || rawCls === 'etfs' || rawCls === 'fund'
+            ? 'etf'
+            : buckets[rawCls as AssetClassTabId]
+              ? rawCls
+              : detectAssetClass(ticker)
+        ) as AssetClassTabId
+        const key: AssetClassTabId = buckets[cls] ? cls : 'equity'
+        const list = buckets[key] || (buckets[key] = [])
+        list.push({
+          ticker,
+          label: String(row.label || ticker).trim() || ticker,
+          assetClass: key,
+          subscriberCount:
+            row.subscriberCount != null &&
+            Number.isFinite(Number(row.subscriberCount))
+              ? Number(row.subscriberCount)
+              : null,
+        })
+      }
+      setMonitoredByClass(buckets)
+      saveMonitoredByClassCache({
+        byClass: buckets,
+        table: body.table || 'device_monitor',
+        counts: body.byClass || {},
+      })
+    } catch {
+      /* aborted or network — keep previous / cached buckets */
+    } finally {
+      if (gen === monitoredLoadGenRef.current) setMonitoredLoading(false)
+    }
+  }, [])
+
   // Desk + asset tabs: load monitored tickers (device_monitor)
   useEffect(() => {
-    let cancelled = false
     const ac = new AbortController()
-    setMonitoredLoading(true)
-    void fetchMomentumMonitoredTickers({
-      app: 'trigger',
-      signal: ac.signal,
-    })
-      .then((body) => {
-        if (cancelled) return
-        setMonitoredSourceTable(body.table || 'device_monitor')
-        if (body.byClass) setMonitoredCounts(body.byClass)
-        const buckets: Partial<Record<AssetClassTabId, WatchTab[]>> = {
-          equity: [],
-          etf: [],
-          index: [],
-          forex: [],
-          crypto: [],
-          commodity: [],
-        }
-        for (const row of body.items || []) {
-          const ticker = normalizeWatchTicker(row.ticker)
-          if (!ticker) continue
-          const rawCls = String(row.assetClass || detectAssetClass(ticker))
-            .trim()
-            .toLowerCase()
-          const cls = (
-            rawCls === 'etf' || rawCls === 'etfs' || rawCls === 'fund'
-              ? 'etf'
-              : buckets[rawCls as AssetClassTabId]
-                ? rawCls
-                : detectAssetClass(ticker)
-          ) as AssetClassTabId
-          const key: AssetClassTabId = buckets[cls] ? cls : 'equity'
-          const list = buckets[key] || (buckets[key] = [])
-          list.push({
-            ticker,
-            label: String(row.label || ticker).trim() || ticker,
-            assetClass: key,
-            subscriberCount:
-              row.subscriberCount != null &&
-              Number.isFinite(Number(row.subscriberCount))
-                ? Number(row.subscriberCount)
-                : null,
-          })
-        }
-        setMonitoredByClass(buckets)
-      })
-      .catch(() => {
-        if (!cancelled) {
-          /* keep previous buckets */
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setMonitoredLoading(false)
-      })
+    void loadMonitoredTickers(ac.signal)
     return () => {
-      cancelled = true
       ac.abort()
     }
-  }, [assetClassTab])
+  }, [assetClassTab, loadMonitoredTickers])
+
+  const [entityListPrefs, setEntityListPrefs] = useState<EntityListPrefs>(
+    () => loadEntityListPrefs(),
+  )
+  const [entityListSearchOpen, setEntityListSearchOpen] = useState(false)
+  const [entityListQuery, setEntityListQuery] = useState('')
+  const entityListSearchRef = useRef<HTMLInputElement | null>(null)
+  /** Live Yahoo matches shown directly below the active asset-class search. */
+  const [entityYahooResults, setEntityYahooResults] = useState<
+    YahooSearchResult[]
+  >([])
+  const [entityYahooLoading, setEntityYahooLoading] = useState(false)
+  const [entityYahooError, setEntityYahooError] = useState<string | null>(null)
+  const [entityYahooHighlight, setEntityYahooHighlight] = useState(0)
+
+  const updateEntityListPrefs = useCallback(
+    (patch: Partial<EntityListPrefs>) => {
+      setEntityListPrefs((prev) => {
+        const next = { ...prev, ...patch }
+        saveEntityListPrefs(next)
+        return next
+      })
+    },
+    [],
+  )
 
   const [addOpen, setAddOpen] = useState(false)
   const [addTicker, setAddTicker] = useState('')
@@ -6143,13 +6897,8 @@ export function EpisodeDashboard({
   const [chartExpanded, setChartExpanded] = useState(false)
   /** 3rd-column mini chart → expanded chart under the quote card */
   const [railChartExpanded, setRailChartExpanded] = useState(false)
-  const [logCollapsed, setLogCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem(LOG_COLLAPSE_KEY) === '1'
-    } catch {
-      return false
-    }
-  })
+  // Three-column desk always starts with its detail column visible.
+  const [logCollapsed, setLogCollapsed] = useState(false)
   const logTopRef = useRef<HTMLDivElement | null>(null)
   const prevLogLen = useRef(0)
   /** Local clock for next-poll countdown (engine default 60s). */
@@ -6157,6 +6906,13 @@ export function EpisodeDashboard({
   const [thresholdDraft, setThresholdDraft] = useState<Record<string, string>>(
     () => loadLocalThresholdDraft('equity'),
   )
+  /**
+   * Asset class being edited inside Thresholds & Episode rules.
+   * Independent of the left-rail market filter so home (Active episodes)
+   * can still open settings and switch Stocks / Crypto / … tabs.
+   */
+  const [settingsAssetClass, setSettingsAssetClass] =
+    useState<AssetClassTabId>('equity')
   /** Episode rules draft (accel / giveback % / inactivity) — separate from window thresholds */
   const [policyDraft, setPolicyDraft] = useState<Record<string, string>>({})
   const policyDraftRef = useRef(policyDraft)
@@ -6167,9 +6923,6 @@ export function EpisodeDashboard({
   >('idle')
   const [policySaving, setPolicySaving] = useState(false)
   const [thresholdSaving, setThresholdSaving] = useState(false)
-  const [testModeEnabled, setTestModeEnabledUi] = useState(false)
-  const [testModeSaving, setTestModeSaving] = useState(false)
-  const [testModeSummary, setTestModeSummary] = useState('')
   /** Edit episode popup (Recent events rail) */
   const [episodeEditOpen, setEpisodeEditOpen] = useState(false)
   const [episodeEditDraft, setEpisodeEditDraft] =
@@ -6227,7 +6980,7 @@ export function EpisodeDashboard({
     ActiveEpisodeRow[]
   >(() => readEpisodeListCache()?.activeEpisodes || [])
   const [activeEpisodesLoading, setActiveEpisodesLoading] = useState(false)
-  const [activeEpisodesUpdatingFromSupabase, setActiveEpisodesUpdatingFromSupabase] =
+  const [, setActiveEpisodesUpdatingFromSupabase] =
     useState(false)
   const [activeEpisodesError, setActiveEpisodesError] = useState('')
   /** Expanded cards in the Active episodes rail (by episodeId or ticker) */
@@ -6241,18 +6994,48 @@ export function EpisodeDashboard({
   const [deskEpisodeFocus, setDeskEpisodeFocus] =
     useState<ActiveEpisodeRow | null>(null)
   /** Left desk tab while on Active-episodes home (assetClassTab == null). */
-  const [deskLeftTab, setDeskLeftTab] = useState<'episodes' | 'users'>(
-    'episodes',
-  )
+  const [deskLeftTab, setDeskLeftTab] = useState<
+    'episodes' | 'users' | 'bulletins'
+  >('episodes')
   const [deskDevices, setDeskDevices] = useState<DeskDevice[]>([])
   const [deskDevicesLoading, setDeskDevicesLoading] = useState(false)
   const [deskDevicesError, setDeskDevicesError] = useState('')
   const [deskUserFocus, setDeskUserFocus] = useState<DeskDevice | null>(null)
-  const [deskUserActivities, setDeskUserActivities] = useState<
-    DeskUserActivity[]
-  >([])
-  const [deskUserActivitiesLoading, setDeskUserActivitiesLoading] =
-    useState(false)
+  const [, setDeskUserActivities] = useState<DeskUserActivity[]>([])
+  const [, setDeskUserActivitiesLoading] = useState(false)
+  type DeskMarketBulletin = {
+    id: string
+    market: 'us' | 'india' | string
+    slot: 'OPEN' | 'CLOSE' | string
+    session_date: string
+    timezone?: string | null
+    title: string
+    body: string
+    body_source?: string | null
+    yahoo_market_state?: string | null
+    probe_symbol?: string | null
+    open_price?: number | null
+    close_or_last_price?: number | null
+    day_change_percent?: number | null
+    previous_close?: number | null
+    quote_snapshot?: Record<string, unknown> | null
+    perplexity_meta?: Record<string, unknown> | null
+    push_sent_ok?: number | null
+    push_sent_failed?: number | null
+    recipient_count?: number | null
+    claimed_at?: string | null
+    sent_at?: string | null
+    created_at?: string | null
+  }
+  const [deskBulletins, setDeskBulletins] = useState<DeskMarketBulletin[]>([])
+  const [readDeskBulletinIds, setReadDeskBulletinIds] = useState<Set<string>>(
+    () => loadReadMarketBulletinIds(),
+  )
+  const [deskBulletinsLoading, setDeskBulletinsLoading] = useState(false)
+  const [deskBulletinsError, setDeskBulletinsError] = useState('')
+  const [deskBulletinFocus, setDeskBulletinFocus] =
+    useState<DeskMarketBulletin | null>(null)
+  const [deskBulletinPromptOpen, setDeskBulletinPromptOpen] = useState(false)
   const [allEpisodesList, setAllEpisodesList] = useState<ActiveEpisodeRow[]>(
     () => readEpisodeListCache()?.episodes || [],
   )
@@ -6274,12 +7057,20 @@ export function EpisodeDashboard({
   const [allEpisodesNextOffset, setAllEpisodesNextOffset] = useState<
     number | null
   >(() => readEpisodeListCache()?.nextOffset ?? null)
-  const [allEpisodesFetchedAt, setAllEpisodesFetchedAt] = useState(
+  const [, setAllEpisodesFetchedAt] = useState(
     () => readEpisodeListCache()?.at || '',
   )
   /** All episodes ticker filter (client-side). */
   const [allEpisodesSearchOpen, setAllEpisodesSearchOpen] = useState(false)
   const [allEpisodesQuery, setAllEpisodesQuery] = useState('')
+  /** All-episodes list sort + filters (near search / refresh). */
+  const [allEpisodesSortKey, setAllEpisodesSortKey] =
+    useState<AllEpisodesSortKey>('started')
+  const [allEpisodesSortDir, setAllEpisodesSortDir] = useState<'asc' | 'desc'>(
+    'desc',
+  )
+  const [allEpisodesLiveOnly, setAllEpisodesLiveOnly] = useState(false)
+  const [allEpisodesEndedOnly, setAllEpisodesEndedOnly] = useState(false)
   /** Detail popup for timeline Alert / Perplexity / state measure explain */
   const [timelineDetail, setTimelineDetail] =
     useState<TimelineDetailState | null>(null)
@@ -6293,6 +7084,35 @@ export function EpisodeDashboard({
   const marketStatusHoverCloseRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   )
+  const [navSettingsOpen, setNavSettingsOpen] = useState(false)
+  const [perplexityPromptsOpen, setPerplexityPromptsOpen] = useState(false)
+  const navSettingsCloseRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const openNavSettings = useCallback(() => {
+    if (navSettingsCloseRef.current) {
+      clearTimeout(navSettingsCloseRef.current)
+      navSettingsCloseRef.current = null
+    }
+    setNavSettingsOpen(true)
+  }, [])
+
+  const scheduleNavSettingsClose = useCallback(() => {
+    if (navSettingsCloseRef.current) {
+      clearTimeout(navSettingsCloseRef.current)
+    }
+    navSettingsCloseRef.current = setTimeout(() => {
+      setNavSettingsOpen(false)
+      navSettingsCloseRef.current = null
+    }, 300)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (navSettingsCloseRef.current) {
+        clearTimeout(navSettingsCloseRef.current)
+      }
+    }
+  }, [])
 
   const loadMarketStatusPopup = useCallback(async (opts?: { open?: boolean }) => {
     setMarketStatusLoading(true)
@@ -6334,7 +7154,7 @@ export function EpisodeDashboard({
     marketStatusHoverCloseRef.current = setTimeout(() => {
       setMarketStatusOpen(false)
       marketStatusHoverCloseRef.current = null
-    }, 160)
+    }, 500)
   }, [cancelMarketStatusHoverClose])
 
   // Prefetch session data on load — do NOT auto-open the popup
@@ -6360,6 +7180,10 @@ export function EpisodeDashboard({
   )
   /** Resizable right column width (px) — restored from last user drag */
   const [rightRailWidth, setRightRailWidth] = useState(loadRightRailWidth)
+  const [navColWidth, setNavColWidth] = useState(loadNavColWidth)
+  const [listColWidth, setListColWidth] = useState(loadListColWidth)
+  const navColDragRef = useRef<{ startX: number; startW: number } | null>(null)
+  const listColDragRef = useRef<{ startX: number; startW: number } | null>(null)
   const rightRailDragRef = useRef<{ startX: number; startW: number } | null>(
     null,
   )
@@ -6564,10 +7388,174 @@ export function EpisodeDashboard({
     allEpisodesList,
   ])
 
+  const tickerHasActiveEpisode = useCallback(
+    (ticker: string) => {
+      const t = String(ticker || '')
+        .trim()
+        .toUpperCase()
+      if (!t) return false
+      if (episodeByTicker[t] || episodeByTicker[ticker]) return true
+      return activeEpisodesList.some(
+        (row) =>
+          String(row.ticker || '')
+            .trim()
+            .toUpperCase() === t,
+      )
+    },
+    [episodeByTicker, activeEpisodesList],
+  )
+
+  /** Apply show / momentum / search / sort prefs on the asset-class entity list. */
+  const filteredDisplayedEntities = useMemo(() => {
+    let list = displayedEntities
+
+    if (entityListPrefs.show === 'subscribers') {
+      list = list.filter((tab) => {
+        const n =
+          tab.subscriberCount != null &&
+          Number.isFinite(Number(tab.subscriberCount))
+            ? Math.max(0, Math.floor(Number(tab.subscriberCount)))
+            : 0
+        return n > 0
+      })
+    }
+
+    if (entityListPrefs.momentum === 'active') {
+      list = list.filter((tab) => tickerHasActiveEpisode(tab.ticker))
+    } else if (entityListPrefs.momentum === 'inactive') {
+      list = list.filter((tab) => !tickerHasActiveEpisode(tab.ticker))
+    }
+
+    const q = entityListQuery.trim().toUpperCase()
+    if (q) {
+      list = list.filter((tab) => {
+        const ticker = String(tab.ticker || '')
+          .trim()
+          .toUpperCase()
+        const label = String(tab.label || '')
+          .trim()
+          .toUpperCase()
+        return ticker.includes(q) || label.includes(q)
+      })
+    }
+
+    const ranked = [...list]
+    if (entityListPrefs.sort === 'subscribers_desc') {
+      ranked.sort((a, b) => {
+        const ac =
+          a.subscriberCount != null && Number.isFinite(Number(a.subscriberCount))
+            ? Number(a.subscriberCount)
+            : 0
+        const bc =
+          b.subscriberCount != null && Number.isFinite(Number(b.subscriberCount))
+            ? Number(b.subscriberCount)
+            : 0
+        return bc - ac || a.ticker.localeCompare(b.ticker)
+      })
+    } else if (entityListPrefs.sort === 'subscribers_asc') {
+      ranked.sort((a, b) => {
+        const ac =
+          a.subscriberCount != null && Number.isFinite(Number(a.subscriberCount))
+            ? Number(a.subscriberCount)
+            : 0
+        const bc =
+          b.subscriberCount != null && Number.isFinite(Number(b.subscriberCount))
+            ? Number(b.subscriberCount)
+            : 0
+        return ac - bc || a.ticker.localeCompare(b.ticker)
+      })
+    } else {
+      ranked.sort((a, b) => a.ticker.localeCompare(b.ticker))
+    }
+    return ranked
+  }, [
+    displayedEntities,
+    entityListPrefs,
+    entityListQuery,
+    tickerHasActiveEpisode,
+  ])
+
   const entityListLoading =
     assetClassTab != null &&
     monitoredLoading &&
     !displayedEntities.length
+  /** Asset-class list hydrate from Supabase (device monitor). */
+  const entityListUpdatingFromSupabase =
+    assetClassTab != null && monitoredLoading
+
+  const assetClassLabel =
+    ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label || 'Stocks'
+  const entityFilterActive =
+    entityListPrefs.show !== DEFAULT_ENTITY_LIST_PREFS.show ||
+    entityListPrefs.momentum !== DEFAULT_ENTITY_LIST_PREFS.momentum ||
+    entityListPrefs.sort !== DEFAULT_ENTITY_LIST_PREFS.sort ||
+    entityListQuery.trim().length > 0
+
+  useEffect(() => {
+    if (!entityListSearchOpen) return
+    const id = window.setTimeout(() => {
+      entityListSearchRef.current?.focus()
+      entityListSearchRef.current?.select()
+    }, 0)
+    return () => window.clearTimeout(id)
+  }, [entityListSearchOpen])
+
+  // The sidebar search used to filter only monitored/local rows. Search Yahoo
+  // as well, then keep only results belonging to the selected asset class.
+  useEffect(() => {
+    const q = entityListQuery.trim()
+    if (!entityListSearchOpen || !assetClassTab || !q) {
+      setEntityYahooResults([])
+      setEntityYahooLoading(false)
+      setEntityYahooError(null)
+      setEntityYahooHighlight(0)
+      return
+    }
+
+    let cancelled = false
+    setEntityYahooResults([])
+    setEntityYahooLoading(true)
+    setEntityYahooError(null)
+
+    const timer = window.setTimeout(() => {
+      searchYahooSaved(q)
+        .then((body) => {
+          if (cancelled) return
+          const seen = new Set<string>()
+          const rows = (body.tickers || [])
+            .filter((row) => {
+              const ticker = normalizeWatchTicker(row.ticker)
+              if (!ticker || seen.has(ticker)) return false
+              if (assetClassFromSearch(row) !== assetClassTab) return false
+              seen.add(ticker)
+              return true
+            })
+            .slice(0, 10)
+          setEntityYahooResults(rows)
+          setEntityYahooHighlight(0)
+          setEntityYahooError(null)
+        })
+        .catch((err) => {
+          if (cancelled) return
+          setEntityYahooResults([])
+          setEntityYahooError(
+            err instanceof Error
+              ? err.message
+              : typeof err === 'string'
+                ? err
+                : 'Yahoo Finance search failed',
+          )
+        })
+        .finally(() => {
+          if (!cancelled) setEntityYahooLoading(false)
+        })
+    }, 200)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [assetClassTab, entityListQuery, entityListSearchOpen])
 
   const episodeFallbackTab = useMemo((): WatchTab | null => {
     const t = String(activeTicker || '')
@@ -6588,19 +7576,68 @@ export function EpisodeDashboard({
     }
   }, [activeTicker, activeEpisodesList, watchlist])
 
-  const activeTab =
-    displayedEntities.find((t) => t.ticker === activeTicker) ||
-    watchlist.find((t) => t.ticker === activeTicker) ||
-    episodeFallbackTab ||
-    displayedEntities[0] ||
-    watchlist[0] ||
-    DEFAULT_WATCHLIST[0]
-  const displayTicker = activeTab?.ticker || 'SNDK'
+  /** Explicit pick only — never invent a default stock for the detail column. */
+  const activeTab = useMemo((): WatchTab | null => {
+    const t = String(activeTicker || '')
+      .trim()
+      .toUpperCase()
+    if (!t) return null
+    return (
+      displayedEntities.find((row) => row.ticker.toUpperCase() === t) ||
+      watchlist.find((row) => row.ticker.toUpperCase() === t) ||
+      episodeFallbackTab ||
+      null
+    )
+  }, [activeTicker, displayedEntities, watchlist, episodeFallbackTab])
+  const displayTicker = activeTab?.ticker || ''
+  const hasSelectedTicker = Boolean(displayTicker)
+  /** Right detail rail: home desk always; asset tabs only after an episode is clicked. */
+  const showDetailRightRail =
+    leftShowsActiveEpisodes ||
+    (showLegacyLeftRail && deskEpisodeFocus != null)
 
   // Collapse expanded chart when switching entities
   useEffect(() => {
     setChartExpanded(false)
   }, [displayTicker])
+
+  /**
+   * Ticker pick → Rolling returns by default; flip to Episodes once we know
+   * this ticker has a live ≤24h/1D active episode (once per selection).
+   */
+  const autoMainTabTickerRef = useRef('')
+  useEffect(() => {
+    if (!displayTicker) {
+      autoMainTabTickerRef.current = ''
+      return
+    }
+    // Optimistic default while status hydrates for the new ticker.
+    autoMainTabTickerRef.current = ''
+    setMainPanelTab('returns')
+  }, [displayTicker])
+
+  useEffect(() => {
+    if (!displayTicker || !status) return
+    const t = displayTicker.toUpperCase()
+    if (String(status.ticker || '').toUpperCase() !== t) return
+    if (autoMainTabTickerRef.current === t) return
+    const ep = status.episode
+    const st = String(ep?.status || 'ACTIVE').toUpperCase()
+    const hasActive =
+      Boolean(ep) &&
+      st !== 'ENDED' &&
+      st !== 'EXPIRED' &&
+      st !== 'REVERSED' &&
+      isIntradayOr24hEventWindow(ep?.detectedWindow)
+    autoMainTabTickerRef.current = t
+    setMainPanelTab(hasActive ? 'episode' : 'returns')
+  }, [
+    displayTicker,
+    status?.ticker,
+    status?.episode?.episodeId,
+    status?.episode?.status,
+    status?.episode?.detectedWindow,
+  ])
 
   /**
    * Load Trigger devices subscribed to `ticker` (push-ready / enabled).
@@ -6662,6 +7699,7 @@ export function EpisodeDashboard({
   }, [])
 
   useEffect(() => {
+    if (!displayTicker) return
     void loadTickerSubscribers(displayTicker)
   }, [displayTicker, loadTickerSubscribers])
 
@@ -6694,20 +7732,20 @@ export function EpisodeDashboard({
         ...(monitoredByClass[next] || []),
         ...watchlist.filter((tab) => tabAssetClass(tab) === next),
       ]
-      if (!inClass.length) return
-      const stillActive = inClass.some(
-        (tab) => tab.ticker.toUpperCase() === activeTicker.toUpperCase(),
-      )
-      if (!stillActive) {
-        selectTicker(inClass[0].ticker)
-      }
+      const stillActive =
+        Boolean(activeTicker) &&
+        inClass.some(
+          (tab) => tab.ticker.toUpperCase() === activeTicker.toUpperCase(),
+        )
+      // Asset tabs never auto-pick a ticker — 3rd column stays empty until click.
+      if (!stillActive) clearTickerSelection()
     },
     [
       assetClassTab,
       watchlist,
       monitoredByClass,
       activeTicker,
-      selectTicker,
+      clearTickerSelection,
       setLogCollapsedPersist,
     ],
   )
@@ -6720,11 +7758,44 @@ export function EpisodeDashboard({
       if (!ticker) return
       setDeskLeftTab('episodes')
       setDeskUserFocus(null)
-      setDeskEpisodeFocus(row)
+      setDeskBulletinFocus(null)
       selectTicker(ticker)
+      setDeskEpisodeFocus(row)
       setRightRailMode('yahoo')
       setLogCollapsedPersist(false)
       setRailChartExpanded(false)
+    },
+    [selectTicker, setLogCollapsedPersist],
+  )
+
+  /** 4th-column symbol click → open that ticker inside Stocks/Crypto/… desk. */
+  const openTickerInMarketSection = useCallback(
+    (ticker: string) => {
+      const t = String(ticker || '')
+        .trim()
+        .toUpperCase()
+      if (!t) return
+      const raw = detectAssetClass(t)
+      const cls = (
+        ASSET_CLASS_TABS.some((tab) => tab.id === raw)
+          ? raw
+          : tabAssetClass({ ticker: t, assetClass: raw })
+      ) as AssetClassTabId
+      const resolved = (
+        ASSET_CLASS_TABS.some((tab) => tab.id === cls) ? cls : 'equity'
+      ) as AssetClassTabId
+      setDeskLeftTab('episodes')
+      setDeskUserFocus(null)
+      setDeskBulletinFocus(null)
+      setDeskEpisodeFocus(null)
+      setAssetClassTab(resolved)
+      saveAssetClassFilter(resolved)
+      selectTicker(t)
+      setMainPanelTab('returns')
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+      setRailChartExpanded(false)
+      setChartExpanded(false)
     },
     [selectTicker, setLogCollapsedPersist],
   )
@@ -6767,10 +7838,70 @@ export function EpisodeDashboard({
     (device: DeskDevice) => {
       setDeskUserFocus(device)
       setDeskEpisodeFocus(null)
+      setDeskBulletinFocus(null)
       setRightRailMode('yahoo')
       setLogCollapsedPersist(false)
     },
     [setLogCollapsedPersist],
+  )
+
+  const loadDeskBulletins = useCallback(async () => {
+    setDeskBulletinsLoading(true)
+    setDeskBulletinsError('')
+    try {
+      const res = await deskFetch(
+        `/api/momentum/market-bulletins?limit=40&_=${Date.now()}`,
+      )
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        bulletins?: DeskMarketBulletin[]
+        error?: string
+      }
+      if (!res.ok) throw new Error(body.error || `Status ${res.status}`)
+      const list = Array.isArray(body.bulletins) ? body.bulletins : []
+      setDeskBulletins(list)
+      setDeskBulletinFocus((prev) => {
+        if (!prev) return prev
+        return list.find((b) => b.id === prev.id) || prev
+      })
+    } catch (err) {
+      setDeskBulletins([])
+      setDeskBulletinsError(
+        err instanceof Error ? err.message : 'Failed to load market bulletins',
+      )
+    } finally {
+      setDeskBulletinsLoading(false)
+    }
+  }, [])
+
+  const selectDeskBulletin = useCallback(
+    (row: DeskMarketBulletin) => {
+      const id = String(row.id || '').trim()
+      if (id) {
+        setReadDeskBulletinIds((prev) => {
+          if (prev.has(id)) return prev
+          const next = new Set(prev)
+          next.add(id)
+          saveReadMarketBulletinIds(next)
+          return next
+        })
+      }
+      setDeskBulletinFocus(row)
+      setDeskUserFocus(null)
+      setDeskEpisodeFocus(null)
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+    },
+    [setLogCollapsedPersist],
+  )
+
+  const unreadDeskBulletinCount = useMemo(
+    () =>
+      deskBulletins.reduce((count, row) => {
+        const id = String(row.id || '').trim()
+        return id && !readDeskBulletinIds.has(id) ? count + 1 : count
+      }, 0),
+    [deskBulletins, readDeskBulletinIds],
   )
 
   const loadDeskUserActivities = useCallback(async (device: DeskDevice) => {
@@ -6915,7 +8046,7 @@ export function EpisodeDashboard({
     setLogCollapsedPersist(false)
   }, [setLogCollapsedPersist])
 
-  /** Open right rail on the activity / engine log (bottom Settings → Activity log). */
+  /** Open right rail on the activity / engine log. */
   const openActivityLogInLogColumn = useCallback(() => {
     setRightRailMode('logs')
     setLogCollapsedPersist(false)
@@ -6966,120 +8097,88 @@ export function EpisodeDashboard({
     }
   }
 
+  const loadSettingsDraftsForClass = useCallback(
+    (classId: AssetClassTabId | string | null | undefined) => {
+      const cls = thresholdClassKey(classId || 'equity')
+      const snapByClass = (
+        status?.config?.thresholdSnapshot as
+          | { byClass?: Record<string, Record<string, number | null>> }
+          | undefined
+      )?.byClass?.[cls]
+      if (snapByClass && typeof snapByClass === 'object') {
+        const draft: Record<string, string> = {}
+        for (const k of THRESHOLD_EDIT_KEYS) {
+          const v = snapByClass[k]
+          draft[k] = v != null && Number(v) > 0 ? String(v) : ''
+        }
+        setThresholdDraft(draft)
+        thresholdDraftRef.current = draft
+      } else {
+        const local = loadLocalThresholdDraft(cls)
+        setThresholdDraft(local)
+        thresholdDraftRef.current = local
+      }
+      const epSnap = status?.config?.episodePolicy as
+        | {
+            byClass?: Record<
+              string,
+              Record<string, number | boolean | null | undefined>
+            >
+            accelerationAlertDeltaPp?: number
+            materialProgressDeltaPp?: number
+            holdingToWeakeningGiveback?: number
+            weakeningToHoldingGiveback?: number
+            strongWeakeningGiveback?: number
+            episodeInactivityExpiryMin?: number
+            rearmBufferPp?: number
+            majorFadeAlertEnabled?: boolean
+            startPushMaxAgeMs?: number
+          }
+        | undefined
+      const polForClass =
+        (epSnap?.byClass?.[cls] as typeof epSnap | undefined) || epSnap
+      const polDraft = policyDraftFromSnapshot(polForClass)
+      setPolicyDraft(polDraft)
+      policyDraftRef.current = polDraft
+      setPolicySaveState('idle')
+      setThresholdSaveState('idle')
+    },
+    [status?.config?.thresholdSnapshot, status?.config?.episodePolicy],
+  )
+
   /** Rolling-return thresholds open in the right (3rd) column — not a floating popover. */
   const openThresholdSettings = useCallback(() => {
-    // Load draft for the currently selected asset class
-    const cls = thresholdClassKey(assetClassTab)
-    const snapByClass = (
-      status?.config?.thresholdSnapshot as
-        | { byClass?: Record<string, Record<string, number | null>> }
-        | undefined
-    )?.byClass?.[cls]
-    if (snapByClass && typeof snapByClass === 'object') {
-      const draft: Record<string, string> = {}
-      for (const k of THRESHOLD_EDIT_KEYS) {
-        const v = snapByClass[k]
-        draft[k] = v != null && Number(v) > 0 ? String(v) : ''
-      }
-      setThresholdDraft(draft)
-      thresholdDraftRef.current = draft
-    } else {
-      const local = loadLocalThresholdDraft(cls)
-      setThresholdDraft(local)
-      thresholdDraftRef.current = local
-    }
-    // Episode rules draft — same asset class as the threshold tab
-    const epSnap = status?.config?.episodePolicy as
-      | {
-          byClass?: Record<string, Record<string, number | boolean | null | undefined>>
-          accelerationAlertDeltaPp?: number
-          materialProgressDeltaPp?: number
-          holdingToWeakeningGiveback?: number
-          weakeningToHoldingGiveback?: number
-          strongWeakeningGiveback?: number
-          episodeInactivityExpiryMin?: number
-          rearmBufferPp?: number
-          majorFadeAlertEnabled?: boolean
-          startPushMaxAgeMs?: number
-        }
-      | undefined
-    const polForClass =
-      (epSnap?.byClass?.[cls] as typeof epSnap | undefined) || epSnap
-    const polDraft = policyDraftFromSnapshot(polForClass)
-    setPolicyDraft(polDraft)
-    policyDraftRef.current = polDraft
-    setPolicySaveState('idle')
-    // Sync test-mode toggle from live config / API
-    const tm = status?.config?.testMode
-    if (tm && typeof tm.enabled === 'boolean') {
-      setTestModeEnabledUi(tm.enabled)
-      setTestModeSummary(String(tm.summary || ''))
-    } else {
-      void deskFetch(`/api/momentum/test-mode?_=${Date.now()}`)
-        .then((r) => r.json().catch(() => ({})))
-        .then((body) => {
-          if (body?.ok) {
-            setTestModeEnabledUi(Boolean(body.enabled))
-            setTestModeSummary(String(body.summary || ''))
-          }
-        })
-        .catch(() => {})
-    }
-    setThresholdSaveState('idle')
+    const initial =
+      (assetClassTab &&
+      ASSET_CLASS_TABS.some((t) => t.id === assetClassTab)
+        ? assetClassTab
+        : 'equity') as AssetClassTabId
+    setSettingsAssetClass(initial)
+    loadSettingsDraftsForClass(initial)
     setRightRailMode('settings')
     setLogCollapsedPersist(false)
-  }, [setLogCollapsedPersist, assetClassTab, status?.config?.thresholdSnapshot, status?.config?.testMode, status?.config?.episodePolicy, status?.config?.accelerationPoints, status?.config?.inactivityMinutes])
+  }, [
+    setLogCollapsedPersist,
+    assetClassTab,
+    loadSettingsDraftsForClass,
+  ])
 
-  const toggleTestMode = useCallback(async (next: boolean) => {
-    setTestModeSaving(true)
-    setTestModeEnabledUi(next) // optimistic
-    try {
-      const res = await deskFetch('/api/momentum/test-mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: next }),
-      })
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok || body?.ok === false) {
-        throw new Error(body?.error || `HTTP ${res.status}`)
+  const selectSettingsAssetClass = useCallback(
+    (next: AssetClassTabId) => {
+      if (next === settingsAssetClass) return
+      // Manual Save only — switching class drops unsaved draft for the previous class.
+      if (thresholdAutosaveTimer.current) {
+        clearTimeout(thresholdAutosaveTimer.current)
+        thresholdAutosaveTimer.current = null
       }
-      setTestModeEnabledUi(Boolean(body.enabled))
-      setTestModeSummary(String(body.summary || ''))
-    } catch (err) {
-      setTestModeEnabledUi(!next) // revert
-      console.warn(
-        '[testMode] toggle failed',
-        err instanceof Error ? err.message : err,
-      )
-    } finally {
-      setTestModeSaving(false)
-    }
-  }, [])
-
-  // Keep bottom Settings menu in sync with server test-mode (even before opening thresholds rail)
-  useEffect(() => {
-    let cancelled = false
-    void deskFetch(`/api/momentum/test-mode?_=${Date.now()}`)
-      .then((r) => r.json().catch(() => ({})))
-      .then((body) => {
-        if (cancelled || !body?.ok) return
-        setTestModeEnabledUi(Boolean(body.enabled))
-        setTestModeSummary(String(body.summary || ''))
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  // Also mirror from live momentum status config when it arrives
-  useEffect(() => {
-    const tm = status?.config?.testMode
-    if (tm && typeof tm.enabled === 'boolean') {
-      setTestModeEnabledUi(tm.enabled)
-      if (tm.summary) setTestModeSummary(String(tm.summary))
-    }
-  }, [status?.config?.testMode])
+      if (policyAutosaveTimer.current) {
+        clearTimeout(policyAutosaveTimer.current)
+        policyAutosaveTimer.current = null
+      }
+      setSettingsAssetClass(next)
+    },
+    [settingsAssetClass],
+  )
 
   const closeThresholdSettings = useCallback(() => {
     setRightRailMode('events')
@@ -7163,10 +8262,12 @@ export function EpisodeDashboard({
   }, [leftShowsActiveEpisodes, setLogCollapsedPersist, loadAllEpisodesHistory])
 
   const deskUsersMode = leftShowsActiveEpisodes && deskLeftTab === 'users'
+  const deskBulletinsMode =
+    leftShowsActiveEpisodes && deskLeftTab === 'bulletins'
 
   /** Center stays on All episodes while desk is open — focus only updates the 3rd column. */
   const showAllEpisodesCenter =
-    leftShowsActiveEpisodes && !deskUsersMode
+    leftShowsActiveEpisodes && !deskUsersMode && !deskBulletinsMode
 
   /** Ticker → enabled Trigger subscriber count (from device_monitor). */
   const subscriberCountByTicker = useMemo(() => {
@@ -7190,14 +8291,100 @@ export function EpisodeDashboard({
 
   const filteredAllEpisodesList = useMemo(() => {
     const q = allEpisodesQuery.trim().toUpperCase()
-    if (!q) return allEpisodesList
-    return allEpisodesList.filter((row) =>
-      String(row.ticker || '')
+    let list = allEpisodesList
+    if (q) {
+      list = list.filter((row) =>
+        String(row.ticker || '')
+          .trim()
+          .toUpperCase()
+          .includes(q),
+      )
+    }
+    if (allEpisodesLiveOnly && !allEpisodesEndedOnly) {
+      list = list.filter(
+        (row) => String(row.status || '').toUpperCase() === 'ACTIVE',
+      )
+    } else if (allEpisodesEndedOnly && !allEpisodesLiveOnly) {
+      list = list.filter(
+        (row) => String(row.status || '').toUpperCase() !== 'ACTIVE',
+      )
+    } else if (allEpisodesLiveOnly && allEpisodesEndedOnly) {
+      // both on = no status filter (show all)
+    }
+
+    const soFarOf = (row: ActiveEpisodeRow): number | null => {
+      const t = String(row.ticker || '')
         .trim()
         .toUpperCase()
-        .includes(q),
-    )
-  }, [allEpisodesList, allEpisodesQuery])
+      const quote =
+        watchQuotes[t] || watchQuotes[String(row.ticker || '').trim()] || null
+      return quoteChangePercent(quote)
+    }
+    const peakOf = (row: ActiveEpisodeRow): number | null => {
+      const n = Number(row.peakMovePercent)
+      return Number.isFinite(n) ? n : null
+    }
+    const nowOf = (row: ActiveEpisodeRow): number | null => {
+      const cur = Number(row.currentMovePercent)
+      if (Number.isFinite(cur)) return cur
+      return peakOf(row)
+    }
+    const startedMs = (row: ActiveEpisodeRow): number => {
+      const t = Date.parse(String(row.episodeStartedAt || ''))
+      return Number.isFinite(t) ? t : 0
+    }
+    const statusRank = (row: ActiveEpisodeRow): number => {
+      const live = String(row.status || '').toUpperCase() === 'ACTIVE'
+      return live ? 1 : 0
+    }
+    const dir = allEpisodesSortDir === 'asc' ? 1 : -1
+    const cmpNullLast = (a: number | null, b: number | null): number => {
+      if (a == null && b == null) return 0
+      if (a == null) return 1
+      if (b == null) return -1
+      return (a - b) * dir
+    }
+
+    return [...list].sort((a, b) => {
+      let primary = 0
+      switch (allEpisodesSortKey) {
+        case 'peak':
+          primary = cmpNullLast(peakOf(a), peakOf(b))
+          break
+        case 'now':
+          primary = cmpNullLast(nowOf(a), nowOf(b))
+          break
+        case 'soFar':
+          primary = cmpNullLast(soFarOf(a), soFarOf(b))
+          break
+        case 'status':
+          primary = (statusRank(a) - statusRank(b)) * dir
+          break
+        case 'ticker':
+          primary =
+            String(a.ticker || '')
+              .localeCompare(String(b.ticker || ''), undefined, {
+                sensitivity: 'base',
+              }) * dir
+          break
+        case 'started':
+        default:
+          primary = (startedMs(a) - startedMs(b)) * dir
+          break
+      }
+      if (primary !== 0) return primary
+      // Stable tie-break: newer started first
+      return startedMs(b) - startedMs(a)
+    })
+  }, [
+    allEpisodesList,
+    allEpisodesQuery,
+    allEpisodesLiveOnly,
+    allEpisodesEndedOnly,
+    allEpisodesSortKey,
+    allEpisodesSortDir,
+    watchQuotes,
+  ])
 
   /** Arrow Up/Down → previous/next row in the All episodes center list. */
   const navigateDeskEpisodeByArrow = useCallback(
@@ -7266,11 +8453,17 @@ export function EpisodeDashboard({
     el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
   }, [showAllEpisodesCenter, deskEpisodeFocus])
 
-  // Load Trigger devices when Users tab is open
+  // Prefetch Trigger devices for Users tab count (and when Users tab is open)
   useEffect(() => {
-    if (!deskUsersMode) return
+    if (!leftShowsActiveEpisodes && !deskUsersMode) return
     void loadDeskDevices()
-  }, [deskUsersMode, loadDeskDevices])
+  }, [leftShowsActiveEpisodes, deskUsersMode, loadDeskDevices])
+
+  // Prefetch market bulletins for nav badge + when Market tab is open
+  useEffect(() => {
+    if (!leftShowsActiveEpisodes && !deskBulletinsMode) return
+    void loadDeskBulletins()
+  }, [leftShowsActiveEpisodes, deskBulletinsMode, loadDeskBulletins])
 
   // Load push activity for the focused desk user
   useEffect(() => {
@@ -7281,7 +8474,7 @@ export function EpisodeDashboard({
     void loadDeskUserActivities(deskUserFocus)
   }, [deskUsersMode, deskUserFocus, loadDeskUserActivities])
 
-  // Yahoo / user-profile detail rail after focus from the left list
+  // Yahoo / user-profile detail rail after focus from the center lists
   useEffect(() => {
     if (!leftShowsActiveEpisodes) return
     if (deskEpisodeFocus || deskUserFocus) {
@@ -7295,45 +8488,14 @@ export function EpisodeDashboard({
     setLogCollapsedPersist,
   ])
 
-  // When asset class changes while settings are open, swap threshold + episode-rule drafts
+  // Reload drafts when the settings asset-class pill changes.
   useEffect(() => {
     if (rightRailMode !== 'settings') return
-    const cls = thresholdClassKey(assetClassTab || 'equity')
-    const snapByClass = (
-      status?.config?.thresholdSnapshot as
-        | { byClass?: Record<string, Record<string, number | null>> }
-        | undefined
-    )?.byClass?.[cls]
-    if (snapByClass && typeof snapByClass === 'object') {
-      const draft: Record<string, string> = {}
-      for (const k of THRESHOLD_EDIT_KEYS) {
-        const v = snapByClass[k]
-        draft[k] = v != null && Number(v) > 0 ? String(v) : ''
-      }
-      setThresholdDraft(draft)
-      thresholdDraftRef.current = draft
-    } else {
-      const local = loadLocalThresholdDraft(cls)
-      setThresholdDraft(local)
-      thresholdDraftRef.current = local
-    }
-    setThresholdSaveState('idle')
-
-    const epSnap = status?.config?.episodePolicy as
-      | {
-          byClass?: Record<string, Record<string, number | boolean | null | undefined>>
-        }
-      | undefined
-    const polForClass =
-      (epSnap?.byClass?.[cls] as Parameters<typeof policyDraftFromSnapshot>[0]) ||
-      (status?.config?.episodePolicy as Parameters<
-        typeof policyDraftFromSnapshot
-      >[0])
-    const polDraft = policyDraftFromSnapshot(polForClass)
-    setPolicyDraft(polDraft)
-    policyDraftRef.current = polDraft
-    setPolicySaveState('idle')
-  }, [assetClassTab, rightRailMode, status?.config?.thresholdSnapshot, status?.config?.episodePolicy])
+    loadSettingsDraftsForClass(settingsAssetClass)
+    // Intentionally not depending on loadSettingsDraftsForClass — status polls
+    // must not wipe in-progress edits for the open class.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsAssetClass, rightRailMode])
 
   // Active episode on this ticker → Recent Events rail (skip when desk is in
   // episodes-first mode with Yahoo chart in the third column).
@@ -7393,7 +8555,74 @@ export function EpisodeDashboard({
     [rightRailWidth],
   )
 
+  const onNavColResizeStart = useCallback(
+    (e: ReactMouseEvent) => {
+      e.preventDefault()
+      navColDragRef.current = { startX: e.clientX, startW: navColWidth }
+      let lastW = navColWidth
+      const onMove = (ev: MouseEvent) => {
+        const drag = navColDragRef.current
+        if (!drag) return
+        lastW = Math.min(
+          NAV_COL_MAX_WIDTH,
+          Math.max(
+            NAV_COL_MIN_WIDTH,
+            drag.startW + (ev.clientX - drag.startX),
+          ),
+        )
+        setNavColWidth(lastW)
+      }
+      const onUp = () => {
+        navColDragRef.current = null
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+        saveNavColWidth(lastW)
+      }
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    },
+    [navColWidth],
+  )
+
+  const onListColResizeStart = useCallback(
+    (e: ReactMouseEvent) => {
+      e.preventDefault()
+      listColDragRef.current = { startX: e.clientX, startW: listColWidth }
+      let lastW = listColWidth
+      const onMove = (ev: MouseEvent) => {
+        const drag = listColDragRef.current
+        if (!drag) return
+        lastW = Math.min(
+          LIST_COL_MAX_WIDTH,
+          Math.max(
+            LIST_COL_MIN_WIDTH,
+            drag.startW + (ev.clientX - drag.startX),
+          ),
+        )
+        setListColWidth(lastW)
+      }
+      const onUp = () => {
+        listColDragRef.current = null
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+        saveListColWidth(lastW)
+      }
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    },
+    [listColWidth],
+  )
+
   const loadLive = useCallback(async () => {
+    if (!displayTicker) return
     const path = `${momentumApiPath(displayTicker)}/live`
     try {
       const res = await deskFetch(path)
@@ -7433,6 +8662,12 @@ export function EpisodeDashboard({
   }, [displayTicker])
 
   const load = useCallback(async () => {
+    if (!displayTicker) {
+      setStatus(null)
+      setLoading(false)
+      setTickerUpdatingFromSupabase(false)
+      return
+    }
     // Ticker switch: hydrate this ticker's latest episodes/events from Supabase.
     const path = `${momentumApiPath(displayTicker)}?refresh=1`
     setTickerUpdatingFromSupabase(true)
@@ -7690,6 +8925,13 @@ export function EpisodeDashboard({
 
   // Prefer cached ticker status immediately; avoid blank flash while Supabase hydrates.
   useEffect(() => {
+    if (!displayTicker) {
+      setStatus(null)
+      setLoading(false)
+      setError(null)
+      prevLogLen.current = 0
+      return
+    }
     const cached = readTickerStatusCache(displayTicker)
     if (cached) {
       setStatus(cached)
@@ -7703,14 +8945,16 @@ export function EpisodeDashboard({
   }, [displayTicker])
 
   useEffect(() => {
+    if (!displayTicker) return
     void load()
     const id = setInterval(() => void loadLive(), 3_000)
     return () => clearInterval(id)
-  }, [load, loadLive])
+  }, [displayTicker, load, loadLive])
 
   // Kick a Yahoo tick when landing on a tab so returns/episode populate quickly
   // (background loop covers the full watchlist on its own cadence)
   useEffect(() => {
+    if (!displayTicker) return
     let cancelled = false
     void deskFetch(momentumApiPath(displayTicker, 'tick'), { method: 'POST' })
       .then((res) => res.json().catch(() => ({})))
@@ -7732,6 +8976,7 @@ export function EpisodeDashboard({
   // Live Yahoo quote for any tab (poll ~30s so crypto/FX/cmdty stay fresh)
   const refreshTabQuote = useCallback(
     async (opts?: { silent?: boolean }) => {
+      if (!displayTicker) return
       if (!opts?.silent) setTabQuoteLoading(true)
       try {
         const body = await fetchYahooQuote(displayTicker)
@@ -7754,6 +8999,11 @@ export function EpisodeDashboard({
   )
 
   useEffect(() => {
+    if (!displayTicker) {
+      setTabQuote(null)
+      setTabQuoteLoading(false)
+      return
+    }
     let cancelled = false
     setTabQuote(null)
     setTabQuoteLoading(true)
@@ -7801,12 +9051,13 @@ export function EpisodeDashboard({
     }
   }, [displayTicker])
 
-  // Lightweight batch quotes for every tab — % under labels + ≥3% blink
+  // Lightweight batch quotes for every tab + All episodes So Far % (Yahoo session move)
   useEffect(() => {
     const tickers = [
       ...new Set([
         ...watchlist.map((t) => t.ticker),
         ...displayedEntities.map((t) => t.ticker),
+        ...allEpisodesList.map((r) => String(r.ticker || '').trim()),
       ]),
     ].filter(Boolean)
     if (!tickers.length) return
@@ -7833,7 +9084,7 @@ export function EpisodeDashboard({
       cancelled = true
       clearInterval(id)
     }
-  }, [watchlist, displayedEntities])
+  }, [watchlist, displayedEntities, allEpisodesList])
 
   // Smooth 1s tick for the “next poll in Ns” countdown
   useEffect(() => {
@@ -7883,15 +9134,14 @@ export function EpisodeDashboard({
   }
 
   /**
-   * Persist thresholds to server (disk + Supabase). Used by auto-save on each
-   * settings keystroke (debounced) and the optional Save button.
+   * Persist thresholds to server (disk + Supabase). Manual Save only.
    */
   async function persistThresholdsNow(
     draft: Record<string, string>,
     opts?: { closeAfter?: boolean },
   ) {
     const path = '/api/momentum/thresholds'
-    const assetClass = thresholdClassKey(assetClassTab || activeAssetClass)
+    const assetClass = thresholdClassKey(settingsAssetClass)
     // Always send a full map for every edit key so blanks clear server bands
     const thresholds: Record<string, number | null> = {}
     for (const k of THRESHOLD_EDIT_KEYS) {
@@ -7952,29 +9202,18 @@ export function EpisodeDashboard({
     }
   }
 
-  function scheduleThresholdAutosave(nextDraft: Record<string, string>) {
-    saveLocalThresholdDraft(nextDraft, assetClassTab || activeAssetClass)
-    setThresholdSaveState('saving')
-    if (thresholdAutosaveTimer.current) {
-      clearTimeout(thresholdAutosaveTimer.current)
-    }
-    thresholdAutosaveTimer.current = setTimeout(() => {
-      void persistThresholdsNow(thresholdDraftRef.current)
-    }, 450)
-  }
-
   function onThresholdDraftChange(key: string, value: string) {
     setThresholdDraft((d) => {
       const next = { ...d, [key]: value }
       thresholdDraftRef.current = next
-      scheduleThresholdAutosave(next)
       return next
     })
+    setThresholdSaveState('idle')
   }
 
   async function persistPolicyNow(draft: Record<string, string>) {
     const path = '/api/momentum/episode-policy'
-    const assetClass = thresholdClassKey(assetClassTab || activeAssetClass)
+    const assetClass = thresholdClassKey(settingsAssetClass)
     const toRatio = (pctStr: string, fallback: number) => {
       const n = Number(pctStr)
       if (!Number.isFinite(n)) return fallback
@@ -8039,21 +9278,20 @@ export function EpisodeDashboard({
     }
   }
 
-  function schedulePolicyAutosave(_nextDraft: Record<string, string>) {
-    setPolicySaveState('saving')
-    if (policyAutosaveTimer.current) clearTimeout(policyAutosaveTimer.current)
-    policyAutosaveTimer.current = setTimeout(() => {
-      void persistPolicyNow(policyDraftRef.current)
-    }, 450)
-  }
-
   function onPolicyDraftChange(key: string, value: string) {
     setPolicyDraft((d) => {
       const next = { ...d, [key]: value }
       policyDraftRef.current = next
-      schedulePolicyAutosave(next)
       return next
     })
+    setPolicySaveState('idle')
+  }
+
+  async function saveSettingsNow() {
+    await Promise.all([
+      persistThresholdsNow(thresholdDraftRef.current),
+      persistPolicyNow(policyDraftRef.current),
+    ])
   }
 
   const snap = status?.snapshot ?? null
@@ -8066,6 +9304,36 @@ export function EpisodeDashboard({
     episodeRaw && isIntradayOr24hEventWindow(episodeRaw.detectedWindow)
       ? episodeRaw
       : null
+  /** All durable + live episodes for the selected ticker (2nd main tab). */
+  const tickerEpisodeGroups = useMemo(() => {
+    return buildEpisodeGroups(
+      status?.episodes,
+      status?.events,
+      episodeRaw,
+      { includeAllWindows: true },
+    ).map((g) => {
+      const next = ensureGroupHasStartedEvent(g)
+      if (
+        next.status === 'ACTIVE' &&
+        episodeRaw?.state &&
+        (!next.episodeId || next.episodeId === episodeRaw.episodeId)
+      ) {
+        return {
+          ...next,
+          liveState: episodeRaw.state,
+          marketSession:
+            next.marketSession || status?.snapshot?.marketSession || null,
+          episodeNo: next.episodeNo ?? episodeRaw.episodeNo ?? null,
+        }
+      }
+      return next
+    })
+  }, [
+    status?.episodes,
+    status?.events,
+    status?.snapshot?.marketSession,
+    episodeRaw,
+  ])
   const logs = status?.logs || []
   const sq = snap?.sessionQuote
 
@@ -8133,6 +9401,36 @@ export function EpisodeDashboard({
     snap?.assetClass ||
     sq?.assetClass ||
     detectAssetClass(displayTicker)
+  /** Equity/index/etc. off REGULAR — rolling returns are not being calculated. */
+  const rollingReturnsClosed = (() => {
+    const cls = String(activeAssetClass || 'equity').toLowerCase()
+    if (cls === 'crypto' || cls === 'forex') return false
+    const sess = String(sessionFromQuote || snap?.marketSession || '')
+      .trim()
+      .toUpperCase()
+    return (
+      sess === 'CLOSED' ||
+      sess === 'CLOSE' ||
+      sess === 'PRE' ||
+      sess === 'PREPRE' ||
+      sess === 'POST' ||
+      sess === 'POSTPOST' ||
+      !sess
+    )
+  })()
+  const rollingReturnsClosedReason = (() => {
+    if (!rollingReturnsClosed) return null
+    const sess = String(sessionFromQuote || snap?.marketSession || '')
+      .trim()
+      .toUpperCase()
+    if (sess === 'PRE' || sess === 'PREPRE') {
+      return 'Pre-market / overnight — momentum rolling returns only run in regular cash hours for this asset class, so short windows stay blank until the open.'
+    }
+    if (sess === 'POST' || sess === 'POSTPOST') {
+      return 'After-hours — momentum rolling returns only run in regular cash hours for this asset class, so short windows stay blank until the next session.'
+    }
+    return 'Market closed — momentum is not calculating rolling returns for this asset class until the regular session is open again.'
+  })()
   // Asset-aware last session (stocks ≠ gold ≠ bitcoin)
   const lastSessionMeta = resolveLastSessionMetaClient(displayTicker, activeAssetClass)
   // Time: Yahoo regularMarketTime when it is the frozen last print; else class estimate
@@ -8232,6 +9530,15 @@ export function EpisodeDashboard({
       label: name,
       assetClass: assetClassFromSearch(row),
     })
+  }
+
+  function pickEntityYahooResult(row: YahooSearchResult) {
+    pickSearchResult(row)
+    setEntityListQuery('')
+    setEntityListSearchOpen(false)
+    setEntityYahooResults([])
+    setEntityYahooError(null)
+    setEntityYahooHighlight(0)
   }
 
   // Debounced Yahoo Finance typeahead while typing in Add
@@ -8800,6 +10107,221 @@ export function EpisodeDashboard({
   }
 
   /**
+   * Resolve existing Perplexity alert heading + likely driver for an episode
+   * (no new crawl — only stored research).
+   */
+  async function resolveStoredShareCopy(row: ActiveEpisodeRow): Promise<{
+    headline: string
+    likelyDriver: string
+  }> {
+    const symbol = String(row.ticker || '')
+      .trim()
+      .toUpperCase()
+    const eid = row.episodeId != null ? String(row.episodeId).trim() : ''
+    let headline = ''
+    let likelyDriver = ''
+
+    const consider = (r: EventResearch | null | undefined) => {
+      if (!r) return
+      if (!headline) {
+        headline = String(r.alert?.title || r.reason || '').trim()
+      }
+      if (!likelyDriver) {
+        likelyDriver = String(
+          r.likely_driver || r.alert?.body || '',
+        ).trim()
+      }
+    }
+
+    // Prefer research already attached to in-memory events for this ticker
+    const sameTicker =
+      String(displayTicker || '')
+        .trim()
+        .toUpperCase() === symbol
+    if (sameTicker && status?.events?.length) {
+      for (const ev of status.events) {
+        if (eid && ev.episodeId && String(ev.episodeId) !== eid) continue
+        consider(extractEventResearch(ev))
+        if (headline && likelyDriver) break
+      }
+    }
+
+    if ((!headline || !likelyDriver) && eid) {
+      try {
+        const ac = new AbortController()
+        const timer = window.setTimeout(() => ac.abort(), 2500)
+        const res = await deskFetch(
+          `/api/momentum/episodes/${encodeURIComponent(eid)}/research`,
+          { signal: ac.signal },
+        )
+        window.clearTimeout(timer)
+        const body = await res.json().catch(() => ({}))
+        const raw = body?.research
+        const rowRaw = Array.isArray(raw) ? raw[0] : raw
+        consider(mapApiResearchRow(rowRaw as Record<string, unknown>))
+      } catch {
+        /* best-effort — still open share with move % */
+      }
+    }
+
+    return { headline, likelyDriver }
+  }
+
+  /**
+   * Peak → Trigger research composer (like So Far), but pre-fill likely driver
+   * from the episode’s STARTED Perplexity research (no need to re-run first).
+   * Now → direct share with stored copy (unchanged).
+   */
+  async function openEpisodeShareInTrigger(
+    row: ActiveEpisodeRow,
+    kind: 'peak' | 'now',
+  ) {
+    const symbol = String(row.ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!symbol || !onOpenInTrigger) {
+      if (onOpenTriggerApp) onOpenTriggerApp()
+      return
+    }
+    const quote =
+      watchQuotes[symbol] || watchQuotes[symbol.toUpperCase()] || null
+    const label =
+      quote?.shortName || quote?.longName || symbol
+    const moveRaw =
+      kind === 'peak'
+        ? row.peakMovePercent
+        : row.currentMovePercent ?? row.peakMovePercent
+    const move =
+      moveRaw != null && Number.isFinite(Number(moveRaw))
+        ? Number(moveRaw)
+        : null
+    const copy = await resolveStoredShareCopy(row)
+    const dir =
+      row.direction || (move != null && move < 0 ? 'DOWN' : 'UP')
+
+    if (kind === 'peak') {
+      const pctLabel =
+        move != null
+          ? `${move > 0 ? '+' : ''}${move.toFixed(2)}%`
+          : null
+      const exactLabel =
+        String(row.exactLabel || '').trim() ||
+        formatWallSpan(row.exactMinutes) ||
+        null
+      const timePhrase = exactLabel
+        ? `in the last ${exactLabel}`
+        : row.detectedWindow &&
+            String(row.detectedWindow).toLowerCase() !== 'day'
+          ? `in the last ${returnKeyDisplayLabel(String(row.detectedWindow), row.marketSession)}`
+          : 'since episode start'
+      const headline = pctLabel
+        ? `$${symbol} ${pctLabel} ${timePhrase}`
+        : `$${symbol} peak move ${timePhrase}`
+      const peakPriceRaw =
+        row.peakPrice != null && Number.isFinite(Number(row.peakPrice))
+          ? Number(row.peakPrice)
+          : dir === 'DOWN' &&
+              row.troughPrice != null &&
+              Number.isFinite(Number(row.troughPrice))
+            ? Number(row.troughPrice)
+            : null
+      const refPriceRaw =
+        row.referencePrice != null && Number.isFinite(Number(row.referencePrice))
+          ? Number(row.referencePrice)
+          : null
+      const livePriceRaw =
+        quoteLivePrice(quote) ?? quote?.regularMarketPrice ?? null
+      const price =
+        peakPriceRaw != null
+          ? peakPriceRaw
+          : livePriceRaw != null && Number.isFinite(Number(livePriceRaw))
+            ? Number(livePriceRaw)
+            : null
+      onOpenInTrigger(symbol, {
+        label,
+        share: true,
+        mode: 'research',
+        move,
+        price,
+        priceFrom: refPriceRaw,
+        window: row.detectedWindow || null,
+        exactLabel: row.exactLabel || exactLabel || null,
+        exactMinutes:
+          row.exactMinutes != null && Number.isFinite(Number(row.exactMinutes))
+            ? Number(row.exactMinutes)
+            : null,
+        direction: dir,
+        kind: 'peak',
+        headline,
+        // STARTED research likely driver — composer / notify / share pre-fill
+        likelyDriver: copy.likelyDriver || null,
+      })
+      return
+    }
+
+    // Now % — direct share with stored research copy
+    onOpenInTrigger(symbol, {
+      label,
+      share: true,
+      mode: 'direct',
+      move,
+      price:
+        quoteLivePrice(quote) ??
+        (quote?.regularMarketPrice != null &&
+        Number.isFinite(Number(quote.regularMarketPrice))
+          ? Number(quote.regularMarketPrice)
+          : null),
+      window: row.detectedWindow || null,
+      direction: dir,
+      kind: 'now',
+      headline: copy.headline || null,
+      likelyDriver: copy.likelyDriver || null,
+    })
+  }
+
+  /** So Far % → Trigger new tab · Perplexity research composer → notify / share. */
+  function openSofarShareInTrigger(row: ActiveEpisodeRow, soFarPct: number | null) {
+    const symbol = String(row.ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!symbol || !onOpenInTrigger) return
+    const quote =
+      watchQuotes[symbol] || watchQuotes[symbol.toUpperCase()] || null
+    const label =
+      quote?.shortName || quote?.longName || symbol
+    const move =
+      soFarPct != null && Number.isFinite(soFarPct) ? soFarPct : null
+    const pctLabel =
+      move != null
+        ? `${move > 0 ? '+' : ''}${move.toFixed(2)}%`
+        : null
+    const dir =
+      row.direction ||
+      (move != null && move < 0 ? 'DOWN' : 'UP')
+    const headline = pctLabel
+      ? `$${symbol} ${pctLabel} so far in regular trading`
+      : `$${symbol} so far in regular trading`
+    // Prefer session-aware last print (same number shown on the desk)
+    const priceRaw =
+      quoteLivePrice(quote) ?? quote?.regularMarketPrice ?? null
+    const price =
+      priceRaw != null && Number.isFinite(Number(priceRaw))
+        ? Number(priceRaw)
+        : null
+    onOpenInTrigger(symbol, {
+      label,
+      share: true,
+      mode: 'research',
+      move,
+      price,
+      window: row.detectedWindow || 'day',
+      direction: dir,
+      kind: 'sofar',
+      headline,
+    })
+  }
+
+  /**
    * Manually end / exit a live momentum episode (no push).
    * Defaults to the focused ticker; pass `ticker` from the Active episodes rail.
    * Pass `skipConfirm` when bulk-ending from “End all”.
@@ -8863,6 +10385,20 @@ export function EpisodeDashboard({
           (row) => String(row.ticker || '').toUpperCase() !== symbol,
         ),
       )
+      setAllEpisodesList((prev) =>
+        prev.map((row) => {
+          if (String(row.ticker || '').toUpperCase() !== symbol) return row
+          const st = String(row.status || row.state || '').toUpperCase()
+          if (st !== 'ACTIVE') return row
+          return {
+            ...row,
+            status: 'ENDED',
+            state: 'ENDED',
+            endReason: 'MANUAL',
+            endedAt: new Date().toISOString(),
+          }
+        }),
+      )
       if (rightRailMode === 'activeEpisodes' && !opts?.skipRefreshList) {
         void loadActiveEpisodesList()
       }
@@ -8921,6 +10457,20 @@ export function EpisodeDashboard({
               (r) => String(r.ticker || '').toUpperCase() !== symbol,
             ),
           )
+          setAllEpisodesList((prev) =>
+            prev.map((row) => {
+              if (String(row.ticker || '').toUpperCase() !== symbol) return row
+              const st = String(row.status || row.state || '').toUpperCase()
+              if (st !== 'ACTIVE') return row
+              return {
+                ...row,
+                status: 'ENDED',
+                state: 'ENDED',
+                endReason: 'MANUAL',
+                endedAt: new Date().toISOString(),
+              }
+            }),
+          )
         } catch (err) {
           failed.push(
             `${symbol}: ${err instanceof Error ? err.message : 'failed'}`,
@@ -8928,6 +10478,7 @@ export function EpisodeDashboard({
         }
       }
       await loadActiveEpisodesList()
+      void loadAllEpisodesHistory({ refresh: true })
       if (failed.length) {
         window.alert(
           `Ended with ${failed.length} error${failed.length === 1 ? '' : 's'}:\n\n${failed.slice(0, 8).join('\n')}${failed.length > 8 ? '\n…' : ''}`,
@@ -9146,7 +10697,7 @@ export function EpisodeDashboard({
       `Delete episode ${label} (${dir}, ${st}) for ${displayTicker}?\n\n` +
         `This permanently removes it from Supabase:\n` +
         `• episodes (class table)\n` +
-        `• episodes_events\n\n` +
+        `• events_episodes\n\n` +
         `episode_id: ${episodeId}\n\n` +
         `This cannot be undone.`,
     )
@@ -9289,104 +10840,403 @@ export function EpisodeDashboard({
     }
   }
 
+  const deskAllEpisodesCount = Math.max(
+    Number(allEpisodesTotal) || 0,
+    allEpisodesList.length,
+  )
+  const deskHomeTabs = (
+    <div
+      className="flex w-fit max-w-full items-center gap-0.5 rounded-full border border-border bg-muted p-0.5"
+      role="tablist"
+      aria-label="Episode desk views"
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={showAllEpisodesCenter}
+        onClick={() => {
+          setDeskLeftTab('episodes')
+          setDeskUserFocus(null)
+          setDeskBulletinFocus(null)
+          void loadAllEpisodesHistory()
+        }}
+        className={cn(
+          'flex items-center justify-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold transition-colors',
+          showAllEpisodesCenter
+            ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+            : 'text-muted-foreground hover:text-foreground',
+        )}
+      >
+        <span>All episodes</span>
+        <span className="tabular-nums opacity-70">
+          {deskAllEpisodesCount}
+        </span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={deskUsersMode}
+        onClick={() => {
+          setDeskLeftTab('users')
+          setDeskEpisodeFocus(null)
+          setDeskUserFocus(null)
+          setDeskBulletinFocus(null)
+          setRightRailMode('yahoo')
+          setLogCollapsedPersist(false)
+          void loadDeskDevices()
+        }}
+        className={cn(
+          'flex items-center justify-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold transition-colors',
+          deskUsersMode
+            ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+            : 'text-muted-foreground hover:text-foreground',
+        )}
+      >
+        <span>All users</span>
+        <span className="tabular-nums opacity-70">{deskDevices.length}</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={deskBulletinsMode}
+        onClick={() => {
+          setDeskLeftTab('bulletins')
+          setDeskEpisodeFocus(null)
+          setDeskUserFocus(null)
+          setDeskBulletinFocus(null)
+          setRightRailMode('yahoo')
+          setLogCollapsedPersist(false)
+          void loadDeskBulletins()
+        }}
+        className={cn(
+          'flex items-center justify-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold transition-colors',
+          deskBulletinsMode
+            ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+            : 'text-muted-foreground hover:text-foreground',
+        )}
+      >
+        <span>Market</span>
+        <span className="tabular-nums opacity-70">{deskBulletins.length}</span>
+      </button>
+    </div>
+  )
+
   return (
     <div
       data-momentum-dashboard
       className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background"
     >
-      {/* ── Full-height split: left rail | detail (+ log) ── */}
+      {/* ── Three-column desk: navigation | list | detail ── */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Column 1 — active episodes (default) or asset-class entity list */}
-        <aside className="flex w-[min(100%,16.5rem)] shrink-0 flex-col border-r border-border bg-background sm:w-64">
-          <div className="flex shrink-0 flex-col px-2 pt-2">
-            {/* Class label + list tabs + entities (asset switcher is bottom-center) */}
-            <div className="flex items-start justify-between gap-2 px-1 pb-1">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-semibold leading-tight">
-                  {leftShowsActiveEpisodes
-                    ? deskUsersMode
-                      ? 'Users'
-                      : 'Active episodes'
-                    : ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
-                        ?.label || 'Stocks'}
-                </p>
-                <p
-                  className="truncate text-[11px] tabular-nums text-muted-foreground"
-                  title={
-                    !leftShowsActiveEpisodes && monitoredSourceTable
-                      ? `Source · ${monitoredSourceTable} + momentum episodes`
-                      : undefined
-                  }
-                >
-                  {leftShowsActiveEpisodes
-                    ? deskUsersMode
-                      ? deskDevicesLoading && !deskDevices.length
-                        ? 'Loading users…'
-                        : `${deskDevices.length} device${deskDevices.length === 1 ? '' : 's'}`
-                      : activeEpisodesUpdatingFromSupabase
-                        ? 'Updating from Supabase…'
-                        : activeEpisodesLoading && !activeEpisodesList.length
-                          ? 'Loading episodes…'
-                          : `${activeEpisodesList.length} live`
-                    : entityListLoading
-                      ? `Loading ${(
-                          ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
-                            ?.label || 'tickers'
-                        ).toLowerCase()}…`
-                      : `${displayedEntities.length} ticker${
-                          displayedEntities.length === 1 ? '' : 's'
-                        }${monitoredSourceTable ? ' · monitored' : ''}`}
-                </p>
-              </div>
-              {!leftShowsActiveEpisodes ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon-sm"
-                  onClick={() => setAddOpen((o) => !o)}
-                  title="Add entity"
-                  aria-label="Add entity"
-                >
-                  <Plus className="size-3.5" strokeWidth={2.25} />
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon-sm"
-                  onClick={() =>
-                    deskUsersMode
-                      ? void loadDeskDevices()
-                      : void loadActiveEpisodesList({ refresh: true })
-                  }
-                  title={
-                    deskUsersMode
-                      ? 'Refresh users'
-                      : 'Refresh active episodes'
-                  }
-                  aria-label={
-                    deskUsersMode
-                      ? 'Refresh users'
-                      : 'Refresh active episodes'
-                  }
-                  disabled={
-                    deskUsersMode
-                      ? deskDevicesLoading
-                      : activeEpisodesLoading ||
-                        activeEpisodesUpdatingFromSupabase
-                  }
-                >
-                  {(deskUsersMode
-                    ? deskDevicesLoading
-                    : activeEpisodesLoading ||
-                      activeEpisodesUpdatingFromSupabase) ? (
-                    <Loader2 className="size-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="size-3.5" strokeWidth={2.25} />
-                  )}
-                </Button>
-              )}
+        <aside
+          className="relative flex shrink-0 flex-col items-center border-r border-border bg-muted/25 py-2"
+          style={{
+            width: navColWidth,
+            minWidth: NAV_COL_MIN_WIDTH,
+            maxWidth: NAV_COL_MAX_WIDTH,
+          }}
+          aria-label="Dashboard navigation"
+        >
+          <button
+            type="button"
+            aria-label="Resize navigation column"
+            title="Drag to resize"
+            onMouseDown={onNavColResizeStart}
+            className="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize border-0 bg-transparent p-0 hover:bg-foreground/15 active:bg-foreground/20"
+          />
+          <TooltipProvider delayDuration={150}>
+            <div className="flex w-full flex-col items-center gap-1 px-1.5">
+              {ASSET_CLASS_TABS.map((tab) => {
+                const active = assetClassTab === tab.id
+                const Icon = tab.Icon
+                return (
+                  <Tooltip key={tab.id}>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label={tab.label}
+                        aria-pressed={active}
+                        onClick={() => selectAssetClassTab(tab.id)}
+                        className={cn(
+                          'inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                          active
+                            ? 'border-border bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:bg-background hover:text-foreground',
+                        )}
+                      >
+                        <Icon className="size-4" strokeWidth={1.75} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="right" sideOffset={8}>
+                      {tab.label}
+                    </TooltipContent>
+                  </Tooltip>
+                )
+              })}
             </div>
+
+            <div className="my-2 h-px w-7 shrink-0 bg-border" />
+
+            <div className="flex w-full flex-col items-center gap-1 px-1.5">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Active episodes"
+                    aria-pressed={
+                      leftShowsActiveEpisodes &&
+                      !deskUsersMode &&
+                      !deskBulletinsMode
+                    }
+                    onClick={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('episodes')
+                      setDeskUserFocus(null)
+                      setDeskEpisodeFocus(null)
+                      setDeskBulletinFocus(null)
+                      setMainPanelTab('episode')
+                      setRightRailMode('yahoo')
+                      setLogCollapsedPersist(false)
+                      void loadActiveEpisodesList()
+                      void loadAllEpisodesHistory()
+                    }}
+                    className={cn(
+                      'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      leftShowsActiveEpisodes &&
+                        !deskUsersMode &&
+                        !deskBulletinsMode
+                        ? 'border-border bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-foreground',
+                    )}
+                  >
+                    <Activity className="size-4" strokeWidth={1.75} />
+                    {activeEpisodesList.length > 0 ? (
+                      <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-foreground px-0.5 text-[9px] font-bold leading-none text-background">
+                        {activeEpisodesList.length > 99
+                          ? '99+'
+                          : activeEpisodesList.length}
+                      </span>
+                    ) : null}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  Active episodes
+                </TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Users"
+                    aria-pressed={deskUsersMode}
+                    onClick={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('users')
+                      setDeskEpisodeFocus(null)
+                      setDeskUserFocus(null)
+                      setDeskBulletinFocus(null)
+                      setRightRailMode('yahoo')
+                      setLogCollapsedPersist(false)
+                      void loadDeskDevices()
+                    }}
+                    className={cn(
+                      'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      deskUsersMode
+                        ? 'border-border bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-foreground',
+                    )}
+                  >
+                    <Users className="size-4" strokeWidth={1.75} />
+                    {deskDevices.length > 0 ? (
+                      <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-muted-foreground px-0.5 text-[9px] font-bold leading-none text-background">
+                        {deskDevices.length > 99 ? '99+' : deskDevices.length}
+                      </span>
+                    ) : null}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  Users
+                </TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={
+                      unreadDeskBulletinCount > 0
+                        ? `Market bulletins, ${unreadDeskBulletinCount} unread`
+                        : 'Market bulletins'
+                    }
+                    aria-pressed={deskBulletinsMode}
+                    onClick={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('bulletins')
+                      setDeskEpisodeFocus(null)
+                      setDeskUserFocus(null)
+                      setDeskBulletinFocus(null)
+                      setRightRailMode('yahoo')
+                      setLogCollapsedPersist(false)
+                      void loadDeskBulletins()
+                    }}
+                    className={cn(
+                      'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      deskBulletinsMode
+                        ? 'border-border bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-foreground',
+                    )}
+                  >
+                    <Newspaper className="size-4" strokeWidth={1.75} />
+                    {unreadDeskBulletinCount > 0 ? (
+                      <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-muted-foreground px-0.5 text-[9px] font-bold leading-none text-background">
+                        {unreadDeskBulletinCount > 99
+                          ? '99+'
+                          : unreadDeskBulletinCount}
+                      </span>
+                    ) : null}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  {unreadDeskBulletinCount > 0
+                    ? `Market bulletins · ${unreadDeskBulletinCount} unread`
+                    : 'Market bulletins'}
+                </TooltipContent>
+              </Tooltip>
+            </div>
+
+            <div className="mt-auto flex w-full flex-col items-center px-1.5">
+              <DropdownMenu
+                open={navSettingsOpen}
+                onOpenChange={setNavSettingsOpen}
+                modal={false}
+              >
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Settings"
+                    aria-pressed={
+                      navSettingsOpen ||
+                      (leftShowsActiveEpisodes && rightRailMode === 'settings')
+                    }
+                    onPointerEnter={openNavSettings}
+                    onPointerLeave={scheduleNavSettingsClose}
+                    onFocus={openNavSettings}
+                    className={cn(
+                      'inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      navSettingsOpen ||
+                        (leftShowsActiveEpisodes && rightRailMode === 'settings')
+                        ? 'border-border bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-foreground',
+                    )}
+                  >
+                    <Settings className="size-4" strokeWidth={1.75} />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  side="right"
+                  align="end"
+                  sideOffset={8}
+                  className="min-w-[17rem] max-w-[20rem]"
+                  onPointerEnter={openNavSettings}
+                  onPointerLeave={scheduleNavSettingsClose}
+                  onCloseAutoFocus={(event) => event.preventDefault()}
+                >
+                  <DropdownMenuLabel className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Settings
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onSelect={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('episodes')
+                      setDeskUserFocus(null)
+                      setDeskEpisodeFocus(null)
+                      setDeskBulletinFocus(null)
+                      openThresholdSettings()
+                    }}
+                  >
+                    <Settings className="size-3.5" strokeWidth={1.75} />
+                    Thresholds & episode rules
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onSelect={() => setPerplexityPromptsOpen(true)}
+                  >
+                    <ScrollText className="size-3.5" strokeWidth={1.75} />
+                    Perplexity prompts
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="gap-2 text-rose-700 focus:text-rose-700 dark:text-rose-300 dark:focus:text-rose-300"
+                    onSelect={() => void clearDeskCache()}
+                  >
+                    <RotateCcw className="size-3.5" strokeWidth={1.75} />
+                    Clear Cache
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onSelect={() => {
+                      if (onOpenTriggerApp) onOpenTriggerApp()
+                      else if (onOpenInTrigger) {
+                        onOpenInTrigger(displayTicker, {
+                          label: activeTab?.label || displayTicker,
+                        })
+                      }
+                    }}
+                  >
+                    <Zap className="size-3.5" strokeWidth={1.75} />
+                    Trigger dashboard
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onSelect={(event) => {
+                      event.preventDefault()
+                      onToggleTheme?.()
+                    }}
+                  >
+                    {theme === 'dark' ? (
+                      <Sun className="size-3.5" strokeWidth={1.75} />
+                    ) : (
+                      <Moon className="size-3.5" strokeWidth={1.75} />
+                    )}
+                    <span className="flex-1">
+                      {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {theme === 'dark' ? 'On' : 'Off'}
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </TooltipProvider>
+        </aside>
+
+        {/* Asset mode: the middle column is the selected market's ticker list. */}
+        {showLegacyLeftRail ? (
+        <aside
+          className="relative flex shrink-0 flex-col border-r border-border bg-background"
+          style={{
+            width: listColWidth,
+            minWidth: LIST_COL_MIN_WIDTH,
+            maxWidth: LIST_COL_MAX_WIDTH,
+          }}
+        >
+          <button
+            type="button"
+            aria-label="Resize ticker list column"
+            title="Drag to resize"
+            onMouseDown={onListColResizeStart}
+            className="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize border-0 bg-transparent p-0 hover:bg-foreground/15 active:bg-foreground/20"
+          />
+          <div className="flex shrink-0 flex-col px-2 pt-2">
             {leftShowsActiveEpisodes ? (
               <div
                 className="mb-1 flex w-full items-center gap-0.5 rounded-full border border-border bg-muted p-0.5"
@@ -9402,13 +11252,16 @@ export function EpisodeDashboard({
                     setDeskUserFocus(null)
                   }}
                   className={cn(
-                    'flex-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
+                    'flex flex-1 items-center justify-center gap-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
                     !deskUsersMode
                       ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
                       : 'text-muted-foreground hover:text-foreground',
                   )}
                 >
-                  Active episodes
+                  <span>Active episodes</span>
+                  <span className="tabular-nums opacity-70">
+                    {activeEpisodesList.length}
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -9422,16 +11275,374 @@ export function EpisodeDashboard({
                     void loadDeskDevices()
                   }}
                   className={cn(
-                    'flex-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
+                    'flex flex-1 items-center justify-center gap-1 rounded-full px-2 py-1.5 text-[11px] font-semibold transition-colors',
                     deskUsersMode
                       ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
                       : 'text-muted-foreground hover:text-foreground',
                   )}
                 >
-                  Users
+                  <span>Users</span>
+                  <span className="tabular-nums opacity-70">
+                    {deskDevices.length}
+                  </span>
                 </button>
               </div>
-            ) : null}
+            ) : (
+              <div className="space-y-1.5 px-1 pb-1">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold leading-tight">
+                      {assetClassLabel}
+                    </p>
+                    <p
+                      className="truncate text-[11px] tabular-nums text-muted-foreground"
+                      title={
+                        monitoredSourceTable
+                          ? `Source · ${monitoredSourceTable} + momentum episodes`
+                          : undefined
+                      }
+                    >
+                      {entityListUpdatingFromSupabase ? (
+                        <span className="inline-flex items-center gap-1.5">
+                          <Loader2 className="size-3 animate-spin" />
+                          Updating from Supabase
+                        </span>
+                      ) : (
+                        `${filteredDisplayedEntities.length} ticker${
+                          filteredDisplayedEntities.length === 1 ? '' : 's'
+                        }${
+                          entityListPrefs.show === 'subscribers' &&
+                          entityListPrefs.momentum === 'any' &&
+                          entityListPrefs.sort === 'name' &&
+                          !entityListQuery.trim()
+                            ? ' · with subscribers'
+                            : entityListPrefs.show === 'all' &&
+                                entityListPrefs.momentum === 'any' &&
+                                entityListPrefs.sort === 'name' &&
+                                !entityListQuery.trim()
+                              ? ' · all'
+                              : entityFilterActive
+                                ? ' · filtered'
+                                : monitoredSourceTable
+                                  ? ' · monitored'
+                                  : ''
+                        }`
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      type="button"
+                      variant={entityListSearchOpen ? 'secondary' : 'outline'}
+                      size="icon-sm"
+                      onClick={() =>
+                        setEntityListSearchOpen((open) => {
+                          const next = !open
+                          if (!next) setEntityListQuery('')
+                          return next
+                        })
+                      }
+                      title="Search tickers"
+                      aria-label="Search tickers"
+                      aria-pressed={entityListSearchOpen}
+                    >
+                      <Search className="size-3.5" strokeWidth={2.25} />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon-sm"
+                      disabled={monitoredLoading}
+                      onClick={() => void loadMonitoredTickers()}
+                      title="Refresh monitored tickers"
+                      aria-label="Refresh monitored tickers"
+                    >
+                      {monitoredLoading ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="size-3.5" strokeWidth={2.25} />
+                      )}
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          type="button"
+                          variant={entityFilterActive ? 'secondary' : 'outline'}
+                          size="icon-sm"
+                          title="Filter tickers"
+                          aria-label="Filter tickers"
+                        >
+                          <ListFilter
+                            className="size-3.5"
+                            strokeWidth={2.25}
+                          />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-56">
+                        <DropdownMenuLabel>Show</DropdownMenuLabel>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.show === 'subscribers'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ show: 'subscribers' })
+                          }
+                        >
+                          Subscribers only
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.show === 'all'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ show: 'all' })
+                          }
+                        >
+                          All {assetClassLabel}
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuLabel>Momentum</DropdownMenuLabel>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.momentum === 'any'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ momentum: 'any' })
+                          }
+                        >
+                          Any
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.momentum === 'active'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ momentum: 'active' })
+                          }
+                        >
+                          Active episode only
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.momentum === 'inactive'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ momentum: 'inactive' })
+                          }
+                        >
+                          No active episode
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuLabel>Sort</DropdownMenuLabel>
+                        <DropdownMenuCheckboxItem
+                          checked={entityListPrefs.sort === 'name'}
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({ sort: 'name' })
+                          }
+                        >
+                          Alphabetical A–Z
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuCheckboxItem
+                          checked={
+                            entityListPrefs.sort === 'subscribers_desc'
+                          }
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({
+                              sort: 'subscribers_desc',
+                            })
+                          }
+                        >
+                          High subscribers first
+                        </DropdownMenuCheckboxItem>
+                        <DropdownMenuCheckboxItem
+                          checked={
+                            entityListPrefs.sort === 'subscribers_asc'
+                          }
+                          onCheckedChange={() =>
+                            updateEntityListPrefs({
+                              sort: 'subscribers_asc',
+                            })
+                          }
+                        >
+                          Low subscribers first
+                        </DropdownMenuCheckboxItem>
+                        {entityFilterActive ? (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => {
+                                updateEntityListPrefs({
+                                  ...DEFAULT_ENTITY_LIST_PREFS,
+                                })
+                                setEntityListQuery('')
+                                setEntityListSearchOpen(false)
+                              }}
+                            >
+                              Reset filters
+                            </DropdownMenuItem>
+                          </>
+                        ) : null}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                </div>
+                {entityListSearchOpen ? (
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      ref={entityListSearchRef}
+                      value={entityListQuery}
+                      onChange={(e) => {
+                        setEntityListQuery(e.target.value)
+                        setEntityYahooHighlight(0)
+                      }}
+                      placeholder={`Search ${assetClassLabel.toLowerCase()}…`}
+                      className="h-8 pl-8 pr-8 text-[12px]"
+                      aria-label={`Search ${assetClassLabel}`}
+                      role="combobox"
+                      aria-expanded={Boolean(entityListQuery.trim())}
+                      aria-controls="entity-yahoo-search-results"
+                      aria-autocomplete="list"
+                      onKeyDown={(event) => {
+                        if (event.key === 'Escape') {
+                          setEntityListQuery('')
+                          setEntityListSearchOpen(false)
+                          return
+                        }
+                        if (event.key === 'ArrowDown') {
+                          event.preventDefault()
+                          setEntityYahooHighlight((index) =>
+                            entityYahooResults.length
+                              ? Math.min(
+                                  index + 1,
+                                  entityYahooResults.length - 1,
+                                )
+                              : 0,
+                          )
+                          return
+                        }
+                        if (event.key === 'ArrowUp') {
+                          event.preventDefault()
+                          setEntityYahooHighlight((index) =>
+                            Math.max(index - 1, 0),
+                          )
+                          return
+                        }
+                        if (
+                          event.key === 'Enter' &&
+                          entityYahooResults[entityYahooHighlight]
+                        ) {
+                          event.preventDefault()
+                          pickEntityYahooResult(
+                            entityYahooResults[entityYahooHighlight],
+                          )
+                        }
+                      }}
+                    />
+                    {entityListQuery ? (
+                      <button
+                        type="button"
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                        aria-label="Clear search"
+                        onClick={() => setEntityListQuery('')}
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    ) : null}
+
+                    {entityListQuery.trim() ? (
+                      <div
+                        id="entity-yahoo-search-results"
+                        role="listbox"
+                        aria-label={`Yahoo Finance ${assetClassLabel} results`}
+                        className="absolute left-0 right-0 top-full z-40 mt-1 max-h-72 overflow-y-auto rounded-xl border border-border bg-popover py-1 text-popover-foreground shadow-xl"
+                      >
+                        <div className="flex items-center justify-between gap-2 border-b border-border/70 px-2.5 py-1.5">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                            Yahoo Finance · {assetClassLabel}
+                          </span>
+                          {entityYahooLoading ? (
+                            <Loader2 className="size-3 animate-spin text-muted-foreground" />
+                          ) : null}
+                        </div>
+
+                        {!entityYahooLoading && entityYahooError ? (
+                          <div className="px-2.5 py-2 text-[11px] leading-snug text-destructive">
+                            {entityYahooError}
+                          </div>
+                        ) : null}
+
+                        {!entityYahooLoading &&
+                        !entityYahooError &&
+                        !entityYahooResults.length ? (
+                          <div className="px-2.5 py-2.5">
+                            <p className="text-[11px] font-medium text-foreground">
+                              No {assetClassLabel.toLowerCase()} found
+                            </p>
+                            <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">
+                              Try a company, fund, currency, coin or Yahoo symbol.
+                            </p>
+                          </div>
+                        ) : null}
+
+                        {entityYahooResults.map((row, index) => {
+                          const ticker = normalizeWatchTicker(row.ticker)
+                          const name =
+                            row.companyName ||
+                            row.longName ||
+                            row.shortName ||
+                            row.label ||
+                            ticker
+                          const inList =
+                            displayedEntities.some(
+                              (tab) =>
+                                tab.ticker.toUpperCase() ===
+                                ticker.toUpperCase(),
+                            ) ||
+                            watchlist.some(
+                              (tab) =>
+                                tab.ticker.toUpperCase() ===
+                                ticker.toUpperCase(),
+                            )
+                          const active = index === entityYahooHighlight
+                          return (
+                            <button
+                              key={`${ticker}-${row.exchange || ''}-${index}`}
+                              type="button"
+                              role="option"
+                              aria-selected={active}
+                              onMouseEnter={() =>
+                                setEntityYahooHighlight(index)
+                              }
+                              onClick={() => pickEntityYahooResult(row)}
+                              className={cn(
+                                'flex w-full items-start gap-2 px-2.5 py-2 text-left transition-colors',
+                                active ? 'bg-muted' : 'hover:bg-muted/70',
+                              )}
+                            >
+                              <CompanyLogo
+                                ticker={ticker}
+                                companyName={name}
+                                size="sm"
+                                className="size-7 bg-background"
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="flex items-center gap-1.5">
+                                  <span className="truncate font-mono text-[12px] font-semibold">
+                                    {ticker}
+                                  </span>
+                                  <span className="shrink-0 rounded bg-muted px-1 py-px text-[8px] font-semibold uppercase text-muted-foreground">
+                                    {quoteTypeLabel(row)}
+                                  </span>
+                                </span>
+                                <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">
+                                  {[name, row.exchange]
+                                    .filter(Boolean)
+                                    .join(' · ')}
+                                </span>
+                              </span>
+                              <span className="mt-1 shrink-0 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                {inList ? 'Open' : 'Add'}
+                              </span>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            )}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="space-y-0.5 px-2 pb-2 pt-1">
@@ -9524,12 +11735,20 @@ export function EpisodeDashboard({
                           active && 'bg-muted hover:bg-muted',
                         )}
                       >
-                        <span
-                          className={cn(
-                            'size-1.5 shrink-0 rounded-full',
-                            dirUp ? 'bg-emerald-500' : 'bg-rose-500',
-                          )}
-                          aria-hidden
+                        <CompanyLogo
+                          ticker={ticker}
+                          companyName={
+                            watchQuotes[ticker]?.longName ||
+                            watchQuotes[ticker]?.shortName ||
+                            ticker
+                          }
+                          quote={
+                            watchQuotes[ticker] ||
+                            watchQuotes[ticker.toUpperCase()] ||
+                            null
+                          }
+                          size="sm"
+                          className="self-center"
                         />
                         <span className="min-w-0 flex-1">
                           <span className="flex min-w-0 items-center gap-1.5">
@@ -9566,32 +11785,30 @@ export function EpisodeDashboard({
                     )
                   })
                 )
-              ) : entityListLoading ? (
-                <div className="flex items-center justify-center gap-2 px-2 py-8 text-xs text-muted-foreground">
-                  <Loader2 className="size-3.5 animate-spin" />
-                  Loading{' '}
-                  {(
-                    ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label ||
-                    'tickers'
-                  ).toLowerCase()}
-                  …
-                </div>
               ) : displayedEntities.length === 0 ? (
                 <div className="space-y-1 px-2 py-8 text-center">
                   <p className="text-xs font-medium text-foreground">
-                    No{' '}
-                    {(
-                      ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
-                        ?.label || 'items'
-                    ).toLowerCase()}{' '}
-                    yet
+                    No {assetClassLabel.toLowerCase()} yet
                   </p>
                   <p className="text-[11px] text-muted-foreground">
                     Showing device-monitored tickers and momentum episodes only.
                   </p>
                 </div>
+              ) : filteredDisplayedEntities.length === 0 ? (
+                <div className="space-y-1 px-2 py-8 text-center">
+                  <p className="text-xs font-medium text-foreground">
+                    No matching {assetClassLabel.toLowerCase()}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {entityListPrefs.show === 'subscribers'
+                      ? 'Default list hides tickers with 0 subscribers. Open Filter → All ' +
+                        assetClassLabel +
+                        ' to see everything.'
+                      : 'Try clearing search or resetting filters.'}
+                  </p>
+                </div>
               ) : (
-                displayedEntities.map((tab) => {
+                filteredDisplayedEntities.map((tab) => {
                   const dayPct = tabDayPct(tab.ticker)
                   const active =
                     tab.ticker.toUpperCase() === displayTicker.toUpperCase()
@@ -9669,7 +11886,7 @@ export function EpisodeDashboard({
                             fullName && fullName !== tab.ticker ? fullName : '',
                             subCount != null
                               ? `${subCount} subscriber${subCount === 1 ? '' : 's'}`
-                              : '',
+                              : '0 subscribers',
                             hasActiveEp
                               ? `active ${epHint!.direction} episode${epHint!.window ? ` (${epHint!.window})` : ''}`
                               : '',
@@ -9687,69 +11904,44 @@ export function EpisodeDashboard({
                         />
                         <span className="min-w-0 flex-1">
                           <span className="flex min-w-0 items-baseline justify-between gap-2">
-                            <span className="flex min-w-0 items-center gap-1">
+                            <span className="flex min-w-0 items-center gap-1.5">
                               <span className="truncate font-mono text-[13px] font-semibold tracking-tight">
                                 {tab.ticker}
                               </span>
-                              {subCount != null ? (
-                                <>
-                                  <span
-                                    className="shrink-0 text-[11px] text-muted-foreground/70"
-                                    aria-hidden
-                                  >
-                                    ·
-                                  </span>
-                                  <span
-                                    className="inline-flex shrink-0 items-center gap-0.5 text-muted-foreground"
-                                    title={`${subCount} subscriber${subCount === 1 ? '' : 's'}`}
-                                    aria-label={`${subCount} subscriber${subCount === 1 ? '' : 's'}`}
-                                  >
-                                    <Users
-                                      className="size-3 shrink-0"
-                                      strokeWidth={1.75}
-                                    />
-                                    <span className="font-mono text-[11px] font-semibold tabular-nums">
-                                      {subCount}
-                                    </span>
-                                  </span>
-                                </>
-                              ) : null}
-                              {hasActiveEp ? (
+                              <SubscriberHoverCard
+                                ticker={tab.ticker}
+                                count={subCount ?? 0}
+                              >
                                 <span
-                                  className={cn(
-                                    'relative ml-0.5 inline-flex size-2 shrink-0',
-                                  )}
-                                  title={`Active ${epHint!.direction} episode`}
-                                  aria-label={`Active ${epHint!.direction} episode`}
+                                  className="inline-flex shrink-0 cursor-help items-center gap-0.5 rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground ring-1 ring-border/60"
+                                  aria-label={`${subCount ?? 0} subscriber${(subCount ?? 0) === 1 ? '' : 's'}`}
                                 >
-                                  <span
-                                    className={cn(
-                                      'absolute inline-flex size-full animate-ping rounded-full opacity-60',
-                                      epHint!.direction === 'DOWN'
-                                        ? 'bg-rose-500'
-                                        : 'bg-emerald-500',
-                                    )}
+                                  <Users
+                                    className="size-2.5 shrink-0"
+                                    strokeWidth={1.75}
                                   />
-                                  <span
-                                    className={cn(
-                                      'relative inline-flex size-2 rounded-full',
-                                      epHint!.direction === 'DOWN'
-                                        ? 'bg-rose-500'
-                                        : 'bg-emerald-500',
-                                    )}
-                                  />
+                                  <span className="font-mono text-[10px] font-semibold tabular-nums leading-none">
+                                    {subCount ?? 0}
+                                  </span>
                                 </span>
-                              ) : null}
+                              </SubscriberHoverCard>
                             </span>
                             <span
                               className={cn(
-                                'shrink-0 tabular-nums text-[14px] font-semibold',
+                                'inline-flex min-w-9 shrink-0 items-center justify-end tabular-nums text-[14px] font-semibold',
                                 dayPct != null
                                   ? pctColor(dayPct)
                                   : 'text-muted-foreground',
                               )}
                             >
-                              {dayPct != null ? fmtPct(dayPct) : '—'}
+                              {dayPct != null ? (
+                                fmtPct(dayPct)
+                              ) : (
+                                <Loader2
+                                  className="size-3.5 animate-spin"
+                                  aria-label={`Loading ${tab.ticker} daily change`}
+                                />
+                              )}
                             </span>
                           </span>
                           {showName ? (
@@ -9804,51 +11996,238 @@ export function EpisodeDashboard({
           ) : null}
 
         </aside>
+        ) : null}
 
         {/* Right stack: detail · optional log */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {/* Column 2 — users activity · all episodes · or focused episode detail */}
-        <div className="mom-hide-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto">
+        <div
+          className={cn(
+            'mom-hide-scrollbar min-h-0 min-w-0 overflow-y-auto',
+            'flex-1',
+          )}
+        >
           {deskUsersMode ? (
-            <DeskUserActivitiesPanel
-              device={deskUserFocus}
-              pushActivities={deskUserActivities}
-              loading={deskUserActivitiesLoading}
-            />
+            <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+              <div className="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">{deskHomeTabs}</div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon-sm"
+                    className="size-7"
+                    onClick={() => void loadDeskDevices()}
+                    disabled={deskDevicesLoading}
+                    title="Refresh all users"
+                    aria-label="Refresh all users"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        'size-3.5',
+                        deskDevicesLoading && 'animate-spin',
+                      )}
+                    />
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+                  {deskDevicesError ? (
+                    <p className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-8 text-center text-xs text-destructive">
+                      {deskDevicesError}
+                    </p>
+                  ) : deskDevicesLoading && !deskDevices.length ? (
+                    <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-sm text-muted-foreground">
+                      <Loader2 className="size-4 animate-spin" />
+                      Loading users…
+                    </div>
+                  ) : !deskDevices.length ? (
+                    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-center">
+                      <Users
+                        className="size-6 text-muted-foreground/70"
+                        strokeWidth={1.5}
+                      />
+                      <p className="text-sm font-medium">No users yet</p>
+                      <p className="max-w-sm text-[12px] text-muted-foreground">
+                        Trigger devices with monitored tickers appear here.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-1">
+                      {deskDevices.map((device) => {
+                        const key = deskDeviceKey(device)
+                        const active =
+                          deskUserFocus != null &&
+                          deskDeviceKey(deskUserFocus) === key
+                        return (
+                          <DeskUserListButton
+                            key={key || String(device.expo_push_token)}
+                            device={device}
+                            active={active}
+                            onClick={() => selectDeskUser(device)}
+                          />
+                        )
+                      })}
+                    </div>
+                  )}
+              </div>
+            </div>
+          ) : deskBulletinsMode ? (
+            <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+              <div className="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">{deskHomeTabs}</div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1.5 px-2 text-[11px]"
+                    disabled={!deskBulletinFocus && !deskBulletins.length}
+                    onClick={() => {
+                      if (!deskBulletinFocus && deskBulletins[0]) {
+                        setDeskBulletinFocus(deskBulletins[0])
+                      }
+                      setDeskBulletinPromptOpen(true)
+                    }}
+                    title="Show the exact Perplexity market-research prompt"
+                    aria-label="Show Perplexity market research prompt"
+                  >
+                    <Info className="size-3.5" strokeWidth={1.9} />
+                    Prompt
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon-sm"
+                    className="size-7"
+                    onClick={() => void loadDeskBulletins()}
+                    disabled={deskBulletinsLoading}
+                    title="Refresh market bulletins"
+                    aria-label="Refresh market bulletins"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        'size-3.5',
+                        deskBulletinsLoading && 'animate-spin',
+                      )}
+                    />
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+                {deskBulletinsError ? (
+                  <p className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-8 text-center text-xs text-destructive">
+                    {deskBulletinsError}
+                  </p>
+                ) : deskBulletinsLoading && !deskBulletins.length ? (
+                  <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-sm text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" />
+                    Loading market bulletins…
+                  </div>
+                ) : !deskBulletins.length ? (
+                  <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-center">
+                    <Newspaper
+                      className="size-6 text-muted-foreground/70"
+                      strokeWidth={1.5}
+                    />
+                    <p className="text-sm font-medium">No market bulletins yet</p>
+                    <p className="max-w-sm text-[12px] text-muted-foreground">
+                      US and India OPEN / CLOSE pushes with Perplexity research
+                      appear here after they fire.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-1">
+                    {deskBulletins.map((row) => {
+                      const active = deskBulletinFocus?.id === row.id
+                      const marketLabel =
+                        String(row.market || '').toLowerCase() === 'india'
+                          ? 'India'
+                          : 'US'
+                      const slotLabel = String(row.slot || '').toUpperCase()
+                      const dayPct =
+                        row.day_change_percent != null &&
+                        Number.isFinite(Number(row.day_change_percent))
+                          ? Number(row.day_change_percent)
+                          : null
+                      return (
+                        <button
+                          key={row.id}
+                          type="button"
+                          onClick={() => selectDeskBulletin(row)}
+                          className={cn(
+                            'flex w-full flex-col gap-1 rounded-xl border px-3 py-2.5 text-left transition-colors',
+                            active
+                              ? 'border-border bg-muted'
+                              : 'border-transparent hover:bg-muted/60',
+                          )}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-[13px] font-semibold leading-tight">
+                              {row.title || `${marketLabel} market ${slotLabel}`}
+                            </span>
+                            <Badge
+                              variant="outline"
+                              className="ml-auto shrink-0 text-[10px] font-semibold uppercase"
+                            >
+                              {marketLabel} · {slotLabel}
+                            </Badge>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+                            <span className="tabular-nums">
+                              {row.session_date || '—'}
+                            </span>
+                            {dayPct != null ? (
+                              <span
+                                className={cn(
+                                  'tabular-nums font-medium',
+                                  dayPct > 0
+                                    ? 'text-emerald-600'
+                                    : dayPct < 0
+                                      ? 'text-rose-600'
+                                      : '',
+                                )}
+                              >
+                                {dayPct > 0 ? '+' : ''}
+                                {dayPct.toFixed(2)}%
+                              </span>
+                            ) : null}
+                            <span className="truncate">
+                              {row.body_source === 'perplexity'
+                                ? 'Perplexity'
+                                : row.body_source || 'body'}
+                            </span>
+                            <span className="tabular-nums">
+                              push {Number(row.push_sent_ok) || 0}/
+                              {Number(row.recipient_count) || 0}
+                            </span>
+                          </div>
+                          {row.body ? (
+                            <p className="line-clamp-2 text-[12px] leading-snug text-muted-foreground">
+                              {row.body}
+                            </p>
+                          ) : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
           ) : showAllEpisodesCenter ? (
             <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
               <div className="mb-3 flex shrink-0 items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <h2 className="text-base font-semibold tracking-tight">
-                    All episodes
-                  </h2>
-                  <p className="text-[12px] text-muted-foreground">
-                    History + live across tickers · click a left active episode
-                    for full detail
-                    {filteredAllEpisodesList.length
-                      ? ` · ${filteredAllEpisodesList.length} shown`
-                      : ''}
-                    {allEpisodesTotal > filteredAllEpisodesList.length
-                      ? ` of ${allEpisodesTotal}`
-                      : allEpisodesQuery.trim() &&
-                          filteredAllEpisodesList.length !==
-                            allEpisodesList.length
-                        ? ` of ${allEpisodesList.length}`
-                        : ''}
-                    {activeEpisodesList.length
-                      ? ` · ${activeEpisodesList.length} live now`
-                      : ''}
-                    {allEpisodesFetchedAt
-                      ? ` · live ${new Date(allEpisodesFetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-                      : ''}
-                  </p>
+                  {deskHomeTabs}
                   <UpdatingFromSupabaseNote
                     show={allEpisodesUpdatingFromSupabase}
                     className="mt-1"
                   />
                 </div>
-                <div className="flex shrink-0 items-center gap-1.5">
+                <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
                   {allEpisodesSearchOpen ? (
                     <div className="relative">
                       <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -9900,6 +12279,105 @@ export function EpisodeDashboard({
                       <Search className="size-3.5" />
                     </Button>
                   )}
+                  {activeEpisodesList.length > 0 ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 gap-1.5 text-rose-700 hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
+                      disabled={
+                        endingEpisode ||
+                        allEpisodesLoading ||
+                        allEpisodesUpdatingFromSupabase
+                      }
+                      title="End all active episodes (no push)"
+                      aria-label="End all active episodes"
+                      onClick={() => void endAllActiveEpisodes()}
+                    >
+                      {endingEpisode ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          Ending…
+                        </>
+                      ) : (
+                        <>
+                          <X className="size-3.5" strokeWidth={2} />
+                          End all
+                          {activeEpisodesList.length
+                            ? ` · ${activeEpisodesList.length}`
+                            : ''}
+                        </>
+                      )}
+                    </Button>
+                  ) : null}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 shrink-0 gap-1.5"
+                        title="Sort and filter All episodes"
+                      >
+                        <ArrowUpDown className="size-3.5" />
+                        Sort
+                        {allEpisodesLiveOnly || allEpisodesEndedOnly ? (
+                          <span className="rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground">
+                            {(allEpisodesLiveOnly ? 1 : 0) +
+                              (allEpisodesEndedOnly ? 1 : 0)}
+                          </span>
+                        ) : null}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-56">
+                      <DropdownMenuLabel>Sort by</DropdownMenuLabel>
+                      {ALL_EPISODES_SORT_OPTIONS.map((opt) => (
+                        <DropdownMenuCheckboxItem
+                          key={opt.key}
+                          checked={allEpisodesSortKey === opt.key}
+                          onCheckedChange={() =>
+                            setAllEpisodesSortKey(opt.key)
+                          }
+                        >
+                          {opt.label}
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel>Direction</DropdownMenuLabel>
+                      <DropdownMenuCheckboxItem
+                        checked={allEpisodesSortDir === 'desc'}
+                        onCheckedChange={() => setAllEpisodesSortDir('desc')}
+                      >
+                        <ArrowDown className="mr-1.5 size-3.5" />
+                        High → low / newest
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuCheckboxItem
+                        checked={allEpisodesSortDir === 'asc'}
+                        onCheckedChange={() => setAllEpisodesSortDir('asc')}
+                      >
+                        <ArrowUp className="mr-1.5 size-3.5" />
+                        Low → high / oldest
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel>Filters</DropdownMenuLabel>
+                      <DropdownMenuCheckboxItem
+                        checked={allEpisodesLiveOnly}
+                        onCheckedChange={(v) =>
+                          setAllEpisodesLiveOnly(Boolean(v))
+                        }
+                      >
+                        Live only
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuCheckboxItem
+                        checked={allEpisodesEndedOnly}
+                        onCheckedChange={(v) =>
+                          setAllEpisodesEndedOnly(Boolean(v))
+                        }
+                      >
+                        Ended only
+                      </DropdownMenuCheckboxItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                   <Button
                     type="button"
                     size="sm"
@@ -9967,19 +12445,142 @@ export function EpisodeDashboard({
                 </div>
               ) : (
                 <TooltipProvider delayDuration={200}>
+                <div className="hidden">
+                  {filteredAllEpisodesList.map((row) => {
+                    const ticker = String(row.ticker || '')
+                      .trim()
+                      .toUpperCase()
+                    const isLive =
+                      String(row.status || '').toUpperCase() === 'ACTIVE'
+                    const up = row.direction !== 'DOWN'
+                    const peakMove =
+                      row.peakMovePercent ?? row.currentMovePercent ?? null
+                    const nowMove = row.currentMovePercent ?? null
+                    const no = formatEpisodeNo(row.episodeNo)
+                    const navKey = deskEpisodeNavKey(row)
+                    const selected =
+                      deskEpisodeFocus != null &&
+                      deskEpisodeNavKey(deskEpisodeFocus) === navKey
+                    return (
+                      <Button
+                        key={navKey || `${ticker}-${row.episodeStartedAt || ''}`}
+                        type="button"
+                        variant="ghost"
+                        data-pill="false"
+                        data-episode-nav-key={navKey}
+                        onClick={() => selectActiveEpisodeFromLeft(row)}
+                        className={cn(
+                          'h-auto min-h-[4.5rem] w-full items-start justify-start gap-2 rounded-xl border border-transparent px-2.5 py-2 text-left',
+                          selected
+                            ? 'border-border bg-muted shadow-sm hover:bg-muted'
+                            : 'hover:border-border hover:bg-muted/60',
+                        )}
+                      >
+                        <CompanyLogo
+                          ticker={ticker}
+                          companyName={
+                            watchQuotes[ticker]?.longName ||
+                            watchQuotes[ticker]?.shortName ||
+                            ticker
+                          }
+                          quote={watchQuotes[ticker] || null}
+                          size="sm"
+                          className="mt-0.5 shrink-0"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            <span className="truncate font-mono text-[13px] font-semibold tracking-tight">
+                              {ticker || '—'}
+                            </span>
+                            {no ? (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">
+                                {no}
+                              </span>
+                            ) : null}
+                            <Badge
+                              variant={isLive ? 'default' : 'outline'}
+                              className="ml-auto h-5 shrink-0 px-1.5 text-[9px]"
+                            >
+                              {isLive ? 'Live' : 'Ended'}
+                            </Badge>
+                          </span>
+                          <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+                            <span
+                              className={cn(
+                                'size-1.5 shrink-0 rounded-full',
+                                up ? 'bg-emerald-500' : 'bg-rose-500',
+                              )}
+                            />
+                            <span className="truncate">
+                              {String(row.direction || '—')} ·{' '}
+                              {row.detectedWindow || 'No window'}
+                            </span>
+                            <span className="ml-auto shrink-0 tabular-nums">
+                              {fmtDateTime(row.episodeStartedAt) || '—'}
+                            </span>
+                          </span>
+                          <span className="mt-1.5 flex items-center justify-between gap-3 text-[11px]">
+                            <span className="text-muted-foreground">
+                              Peak{' '}
+                              <span className={cn('font-semibold tabular-nums', pctColor(peakMove))}>
+                                {peakMove == null ? '—' : fmtPct(peakMove)}
+                              </span>
+                            </span>
+                            <span className="text-muted-foreground">
+                              Now{' '}
+                              <span className={cn('font-semibold tabular-nums', pctColor(nowMove))}>
+                                {nowMove == null ? '—' : fmtPct(nowMove)}
+                              </span>
+                            </span>
+                          </span>
+                        </span>
+                      </Button>
+                    )
+                  })}
+                </div>
                 <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-auto rounded-xl border border-border">
-                  <table className="w-full text-left text-[12px]">
+                  <table className="w-full table-fixed text-[12px]">
+                    <colgroup>
+                      <col className="w-[20%]" />
+                      <col className="w-[10%]" />
+                      <col className="w-[10%]" />
+                      <col className="w-[11%]" />
+                      <col className="w-[12%]" />
+                      <col className="w-[9%]" />
+                      <col className="w-[20%]" />
+                      <col className="w-[8%]" />
+                    </colgroup>
                     <thead className="sticky top-0 z-10 bg-muted/80 backdrop-blur">
                       <tr className="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground">
-                        <th className="px-3 py-2 font-semibold">Ticker</th>
-                        <th className="px-2 py-2 font-semibold">Episode</th>
-                        <th className="px-2 py-2 font-semibold">Status</th>
-                        <th className="px-2 py-2 font-semibold">Window</th>
-                        <th className="px-2 py-2 text-right font-semibold">
-                          Move
+                        <th
+                          className="px-4 py-2.5 text-left font-semibold"
+                          title="Ticker · Yahoo session move so far (vs previous close)"
+                        >
+                          Ticker
                         </th>
-                        <th className="px-3 py-2 text-right font-semibold">
+                        <th
+                          className="px-2 py-2.5 text-center font-semibold"
+                          title="Actual alert recipients when recorded; otherwise current enabled ticker subscribers"
+                        >
+                          Subscribers
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
+                          Status
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
+                          Peak
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
+                          Now
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
+                          Window
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
                           Started
+                        </th>
+                        <th className="px-3 py-2.5 text-center font-semibold">
+                          Episode
                         </th>
                       </tr>
                     </thead>
@@ -9991,34 +12592,75 @@ export function EpisodeDashboard({
                         const isLive =
                           String(row.status || '').toUpperCase() === 'ACTIVE'
                         const up = row.direction !== 'DOWN'
-                        const move =
-                          row.currentMovePercent ??
-                          row.peakMovePercent ??
-                          row.initialMovePercent ??
-                          null
-                        const moveKind: 'current' | 'peak' | 'initial' =
+                        const peakMove =
+                          row.peakMovePercent != null &&
+                          Number.isFinite(Number(row.peakMovePercent))
+                            ? Number(row.peakMovePercent)
+                            : null
+                        const nowMove =
+                          row.currentMovePercent != null &&
+                          Number.isFinite(Number(row.currentMovePercent))
+                            ? Number(row.currentMovePercent)
+                            : peakMove != null
+                              ? peakMove
+                              : row.initialMovePercent != null &&
+                                  Number.isFinite(Number(row.initialMovePercent))
+                                ? Number(row.initialMovePercent)
+                                : null
+                        const nowKind: 'current' | 'peak' | 'initial' =
                           row.currentMovePercent != null &&
                           Number.isFinite(Number(row.currentMovePercent))
                             ? 'current'
-                            : row.peakMovePercent != null &&
-                                Number.isFinite(Number(row.peakMovePercent))
+                            : peakMove != null
                               ? 'peak'
                               : 'initial'
                         const no = formatEpisodeNo(row.episodeNo)
+                        const sourceTable =
+                          String(row.sourceTable || '').trim() ||
+                          expectedEpisodeSourceTable(ticker)
+                        const sourceTableResolved = Boolean(row.sourceTable)
+                        const sourceRowId =
+                          String(row.sourceRowId || row.episodeId || '').trim() ||
+                          'Unavailable'
+                        const stateLabel = formatEpisodeState(
+                          isLive ? row.state || row.status : row.status || row.state,
+                        )
+                        const liveStateLabel = isLive
+                          ? formatEpisodeState(row.state) || 'Live'
+                          : null
                         const subCount =
                           subscriberCountByTicker.get(ticker) ?? null
+                        const recordedRecipientCount =
+                          row.notificationRecipientCount != null &&
+                          Number.isFinite(
+                            Number(row.notificationRecipientCount),
+                          )
+                            ? Math.max(
+                                0,
+                                Math.floor(
+                                  Number(row.notificationRecipientCount),
+                                ),
+                              )
+                            : null
+                        const displayedSubscriberCount =
+                          recordedRecipientCount ?? subCount ?? 0
                         const quote =
                           watchQuotes[ticker] ||
                           watchQuotes[ticker.toUpperCase()] ||
                           null
+                        const soFarPct = tabDayPct(ticker)
                         const rowSelected = deskEpisodeRowsMatch(
                           row,
                           deskEpisodeFocus,
                         )
-                        const moveLabel =
-                          move == null || !Number.isFinite(Number(move))
+                        const peakLabel =
+                          peakMove == null
                             ? '—'
-                            : `${Number(move) > 0 ? '+' : ''}${Number(move).toFixed(2)}%`
+                            : `${peakMove > 0 ? '+' : ''}${peakMove.toFixed(2)}%`
+                        const nowLabel =
+                          nowMove == null
+                            ? '—'
+                            : `${nowMove > 0 ? '+' : ''}${nowMove.toFixed(2)}%`
                         return (
                           <tr
                             key={`${row.episodeId || ticker}-${row.episodeNo || row.episodeStartedAt}`}
@@ -10029,8 +12671,8 @@ export function EpisodeDashboard({
                             )}
                             onClick={() => selectActiveEpisodeFromLeft(row)}
                           >
-                            <td className="px-3 py-2 font-medium">
-                              <span className="inline-flex min-w-0 items-center gap-2">
+                            <td className="px-4 py-2.5 text-left align-middle font-medium">
+                              <span className="inline-flex max-w-full flex-wrap items-center justify-start gap-x-1.5 gap-y-0.5">
                                 <CompanyLogo
                                   ticker={ticker}
                                   companyName={
@@ -10041,80 +12683,202 @@ export function EpisodeDashboard({
                                   quote={quote}
                                   size="sm"
                                 />
+                                <span className="truncate text-[13px] font-semibold tracking-tight">
+                                  {ticker}
+                                </span>
                                 <span
                                   className={cn(
                                     'size-1.5 shrink-0 rounded-full',
                                     up ? 'bg-emerald-500' : 'bg-rose-500',
                                   )}
-                                  aria-hidden
+                                  title={up ? 'UP' : 'DOWN'}
+                                  aria-label={up ? 'UP' : 'DOWN'}
                                 />
-                                <span className="truncate text-[13px] font-semibold tracking-tight">
-                                  {ticker}
+                                <button
+                                  type="button"
+                                  className={cn(
+                                    'border-0 bg-transparent p-0 text-[12px] font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
+                                    soFarPct != null
+                                      ? pctColor(soFarPct)
+                                      : 'text-muted-foreground',
+                                  )}
+                                  title="So Far · Yahoo session % · click opens Trigger share"
+                                  aria-label={`Share ${ticker} So Far on Trigger`}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    e.preventDefault()
+                                    openSofarShareInTrigger(row, soFarPct)
+                                  }}
+                                >
+                                  {soFarPct != null ? fmtPct(soFarPct) : '—'}
+                                </button>
+                              </span>
+                            </td>
+                            <td className="px-2 py-2.5 text-center align-middle">
+                              <SubscriberHoverCard
+                                ticker={ticker}
+                                count={subCount ?? displayedSubscriberCount}
+                              >
+                                <span
+                                  className="inline-flex cursor-help items-center justify-center gap-1 rounded-full bg-muted px-2 py-1 font-mono text-[11px] font-semibold tabular-nums text-foreground"
+                                  aria-label={`${displayedSubscriberCount} subscribers for ${ticker}`}
+                                >
+                                  <Users className="size-3 text-muted-foreground" strokeWidth={1.9} />
+                                  {displayedSubscriberCount}
                                 </span>
-                                {subCount != null ? (
-                                  <Badge
-                                    variant="secondary"
-                                    className="h-5 shrink-0 rounded-full px-1.5 font-mono text-[10px] tabular-nums"
-                                    title={`${subCount} Trigger subscriber${subCount === 1 ? '' : 's'}`}
+                              </SubscriberHoverCard>
+                            </td>
+                            <td className="px-3 py-2.5 text-center align-middle">
+                              <span className="inline-flex flex-wrap items-center justify-center gap-1.5">
+                                <Badge
+                                  variant={isLive ? 'default' : 'outline'}
+                                  className="text-[10px]"
+                                >
+                                  {isLive
+                                    ? 'Live'
+                                    : stateLabel || '—'}
+                                </Badge>
+                                {isLive ? (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      endingEpisode ||
+                                      endingEpisodeTicker === ticker
+                                    }
+                                    title={`End active episode for ${ticker} (no push)`}
+                                    aria-label={`End active episode for ${ticker}`}
+                                    className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-rose-700 transition-colors hover:bg-rose-500/10 hover:text-rose-800 disabled:opacity-50 dark:text-rose-400"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      e.preventDefault()
+                                      void endActiveEpisode({
+                                        ticker,
+                                        direction: row.direction,
+                                        peakMovePercent:
+                                          row.peakMovePercent ??
+                                          row.currentMovePercent ??
+                                          null,
+                                      })
+                                    }}
                                   >
-                                    {subCount}
-                                  </Badge>
+                                    {endingEpisodeTicker === ticker ? (
+                                      <Loader2 className="size-3 animate-spin" />
+                                    ) : (
+                                      <X className="size-3" strokeWidth={2.25} />
+                                    )}
+                                  </button>
                                 ) : null}
                               </span>
                             </td>
-                            <td className="px-2 py-2 tabular-nums text-muted-foreground">
-                              {no || '—'}
-                            </td>
-                            <td className="px-2 py-2">
-                              <Badge
-                                variant={isLive ? 'default' : 'outline'}
-                                className="text-[10px]"
-                              >
-                                {isLive
-                                  ? 'Live'
-                                  : formatEpisodeState(
-                                      row.status || row.state,
-                                    ) || '—'}
-                              </Badge>
-                            </td>
-                            <td className="px-2 py-2 text-muted-foreground">
-                              {row.detectedWindow || '—'}
+                            <td
+                              className={cn(
+                                'px-3 py-2.5 text-center align-middle font-semibold tabular-nums',
+                                pctColor(peakMove),
+                              )}
+                            >
+                              {peakMove == null ? (
+                                '—'
+                              ) : (
+                                <button
+                                  type="button"
+                                  className={cn(
+                                    'cursor-pointer border-0 bg-transparent p-0 font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
+                                    pctColor(peakMove),
+                                  )}
+                                  title="Click: Trigger Peak research (calc details are on the timeline Peak chip)"
+                                  aria-label={`${peakLabel} peak — click for Trigger research`}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    e.preventDefault()
+                                    void openEpisodeShareInTrigger(row, 'peak')
+                                  }}
+                                >
+                                  {peakLabel}
+                                </button>
+                              )}
                             </td>
                             <td
                               className={cn(
-                                'px-2 py-2 text-right font-semibold tabular-nums',
-                                pctColor(move),
+                                'px-3 py-2.5 text-center align-middle font-semibold tabular-nums',
+                                pctColor(nowMove),
                               )}
-                              onClick={(e) => e.stopPropagation()}
                             >
-                              {move == null || !Number.isFinite(Number(move)) ? (
-                                '—'
-                              ) : (
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <button
-                                      type="button"
-                                      className={cn(
-                                        'cursor-help border-0 bg-transparent p-0 font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
-                                        pctColor(move),
-                                      )}
-                                      aria-label={`${moveLabel} — how calculated`}
-                                    >
-                                      {moveLabel}
-                                    </button>
-                                  </TooltipTrigger>
-                                  <CalcTooltipContent side="left">
-                                    <EpisodeListMoveCalcBody
-                                      row={row}
-                                      shownMove={Number(move)}
-                                      shownKind={moveKind}
-                                    />
-                                  </CalcTooltipContent>
-                                </Tooltip>
-                              )}
+                              <span className="inline-flex flex-wrap items-center justify-center gap-1.5">
+                                {nowMove == null ? (
+                                  <span className="text-muted-foreground">—</span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className={cn(
+                                      'cursor-pointer border-0 bg-transparent p-0 font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
+                                      pctColor(nowMove),
+                                    )}
+                                    title="Click: open Trigger share (calc details are on the timeline)"
+                                    aria-label={`${nowLabel} now — click to share`}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      e.preventDefault()
+                                      void openEpisodeShareInTrigger(row, 'now')
+                                    }}
+                                  >
+                                    {nowLabel}
+                                  </button>
+                                )}
+                                {liveStateLabel ? (
+                                  <span
+                                    className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-wide text-muted-foreground"
+                                    title="Live episode state"
+                                  >
+                                    {liveStateLabel}
+                                  </span>
+                                ) : null}
+                              </span>
                             </td>
-                            <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                              {fmtDateTime(row.episodeStartedAt) || '—'}
+                            <td className="px-3 py-2.5 text-center align-middle text-muted-foreground">
+                              {row.detectedWindow || '—'}
+                            </td>
+                            <td className="px-3 py-2.5 text-center align-middle tabular-nums text-muted-foreground">
+                              {fmtTimeDate(row.episodeStartedAt) || '—'}
+                            </td>
+                            <td className="px-3 py-2.5 text-center align-middle tabular-nums text-muted-foreground">
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex cursor-help items-center rounded-md px-1.5 py-0.5 font-medium underline decoration-dotted decoration-muted-foreground/60 underline-offset-2">
+                                    {no || '—'}
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="left"
+                                  align="center"
+                                  className="w-[22rem] max-w-[calc(100vw-2rem)] p-3 text-left"
+                                >
+                                  <p className="text-[12px] font-semibold">
+                                    Supabase source row
+                                  </p>
+                                  <div className="mt-2 grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1.5 text-[11px]">
+                                    <span className="opacity-70">Table</span>
+                                    <code className="break-all font-mono font-semibold">
+                                      public.{sourceTable}
+                                    </code>
+                                    <span className="opacity-70">Row key</span>
+                                    <code className="break-all font-mono">
+                                      episode_id = {sourceRowId}
+                                    </code>
+                                    <span className="opacity-70">Ticker</span>
+                                    <code className="font-mono">{ticker}</code>
+                                    <span className="opacity-70">Episode</span>
+                                    <code className="font-mono">
+                                      {no || 'No episode_no'}
+                                    </code>
+                                  </div>
+                                  {!sourceTableResolved ? (
+                                    <p className="mt-2 border-t border-current/20 pt-2 text-[10px] opacity-70">
+                                      Table asset class se inferred hai; next Supabase
+                                      refresh exact source metadata confirm karega.
+                                    </p>
+                                  ) : null}
+                                </TooltipContent>
+                              </Tooltip>
                             </td>
                           </tr>
                         )
@@ -10156,8 +12920,236 @@ export function EpisodeDashboard({
                 </>
               )}
             </div>
+          ) : !hasSelectedTicker ? (
+            <div className="flex h-full min-h-[24rem] flex-1 flex-col items-center justify-center gap-2 px-6 py-16 text-center">
+              <LineChart
+                className="size-8 text-muted-foreground/45"
+                strokeWidth={1.5}
+              />
+              <p className="text-sm font-semibold text-foreground">
+                Select a ticker
+              </p>
+              <p className="max-w-sm text-[12px] leading-relaxed text-muted-foreground">
+                Choose one from the {assetClassLabel.toLowerCase()} list to open
+                rolling returns and episodes here.
+              </p>
+            </div>
           ) : (
           <div className="w-full space-y-4 px-3 py-3 sm:px-4 sm:py-4">
+          {showCompactMarketStrip && !leftShowsActiveEpisodes ? (
+            <div className="rounded-xl border border-border bg-muted/20 p-2">
+              <div className="mb-2 flex items-center justify-between gap-2 px-1">
+                <div className="min-w-0">
+                  <p className="truncate text-[13px] font-semibold">
+                    {assetClassLabel}
+                  </p>
+                  <p className="text-[10px] tabular-nums text-muted-foreground">
+                    {entityListUpdatingFromSupabase ? (
+                      <span className="inline-flex items-center gap-1">
+                        <Loader2 className="size-2.5 animate-spin" />
+                        Updating from Supabase
+                      </span>
+                    ) : (
+                      `${filteredDisplayedEntities.length} ticker${
+                        filteredDisplayedEntities.length === 1 ? '' : 's'
+                      }`
+                    )}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <Button
+                    type="button"
+                    variant={entityListSearchOpen ? 'secondary' : 'outline'}
+                    size="icon-sm"
+                    className="h-7 w-7"
+                    onClick={() =>
+                      setEntityListSearchOpen((open) => {
+                        const next = !open
+                        if (!next) setEntityListQuery('')
+                        return next
+                      })
+                    }
+                    title="Search tickers"
+                    aria-label="Search tickers"
+                  >
+                    <Search className="size-3.5" strokeWidth={2.25} />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon-sm"
+                    className="h-7 w-7"
+                    disabled={monitoredLoading}
+                    onClick={() => void loadMonitoredTickers()}
+                    title="Refresh monitored tickers"
+                    aria-label="Refresh monitored tickers"
+                  >
+                    {monitoredLoading ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="size-3.5" strokeWidth={2.25} />
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1.5 px-2.5 text-[11px]"
+                    onClick={() => setAddOpen((open) => !open)}
+                  >
+                    <Plus className="size-3.5" strokeWidth={2.25} />
+                    Add
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mom-hide-scrollbar flex min-w-0 gap-1.5 overflow-x-auto pb-0.5">
+                {filteredDisplayedEntities.length === 0 ? (
+                  <p className="px-2 py-2.5 text-[11px] text-muted-foreground">
+                    No tickers match this filter.
+                  </p>
+                ) : (
+                  filteredDisplayedEntities.map((tab) => {
+                    const ticker = tab.ticker.toUpperCase()
+                    const active = ticker === displayTicker.toUpperCase()
+                    const dayPct = tabDayPct(ticker)
+                    const rowQuote =
+                      watchQuotes[ticker] ||
+                      watchQuotes[tab.ticker] ||
+                      (active ? tabQuote : null)
+                    const subscriberCount =
+                      tab.subscriberCount != null &&
+                      Number.isFinite(Number(tab.subscriberCount))
+                        ? Math.max(0, Math.floor(Number(tab.subscriberCount)))
+                        : null
+                    return (
+                      <button
+                        key={ticker}
+                        type="button"
+                        aria-current={active ? 'true' : undefined}
+                        onClick={() => {
+                          setWatchContextMenu(null)
+                          if (
+                            !watchlist.some(
+                              (row) => row.ticker.toUpperCase() === ticker,
+                            )
+                          ) {
+                            addWatchTicker(tab)
+                          } else {
+                            selectTicker(ticker)
+                          }
+                        }}
+                        onContextMenu={(event) => {
+                          const canRemove =
+                            watchlist.some(
+                              (row) => row.ticker.toUpperCase() === ticker,
+                            ) && watchlist.length > 1
+                          if (!canRemove) return
+                          event.preventDefault()
+                          event.stopPropagation()
+                          setWatchContextMenu({
+                            ticker,
+                            label: String(tab.label || ticker),
+                            x: event.clientX,
+                            y: event.clientY,
+                          })
+                        }}
+                        className={cn(
+                          'flex h-10 shrink-0 items-center gap-2 rounded-lg border px-2.5 text-left transition-colors',
+                          active
+                            ? 'border-foreground/20 bg-background text-foreground shadow-sm'
+                            : 'border-border bg-background/60 text-foreground hover:bg-background',
+                          hotBlinkClass(dayPct, thrSnap?.day ?? null, 'day'),
+                        )}
+                        title={`${ticker} · ${subscriberCount ?? 0} subscribers`}
+                      >
+                        <CompanyLogo
+                          ticker={ticker}
+                          companyName={tab.label || ticker}
+                          quote={rowQuote}
+                          size="sm"
+                        />
+                        <span className="font-mono text-[12px] font-semibold">
+                          {ticker}
+                        </span>
+                        <SubscriberHoverCard
+                          ticker={ticker}
+                          count={subscriberCount ?? 0}
+                        >
+                          <span className="inline-flex cursor-help items-center gap-0.5 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-muted-foreground ring-1 ring-border/60">
+                            <Users className="size-2.5" strokeWidth={1.75} />
+                            {subscriberCount ?? 0}
+                          </span>
+                        </SubscriberHoverCard>
+                        <span
+                          className={cn(
+                            'inline-flex min-w-8 items-center justify-end text-[11px] font-semibold tabular-nums',
+                            dayPct != null
+                              ? pctColor(dayPct)
+                              : 'text-muted-foreground',
+                          )}
+                        >
+                          {dayPct != null ? (
+                            fmtPct(dayPct)
+                          ) : (
+                            <Loader2
+                              className="size-3 animate-spin"
+                              aria-label={`Loading ${ticker} daily change`}
+                            />
+                          )}
+                        </span>
+                      </button>
+                    )
+                  })
+                )}
+              </div>
+
+              {watchContextMenu ? (
+                <>
+                  <button
+                    type="button"
+                    className="fixed inset-0 z-[60] cursor-default bg-transparent"
+                    aria-label="Close menu"
+                    onClick={() => setWatchContextMenu(null)}
+                    onContextMenu={(event) => {
+                      event.preventDefault()
+                      setWatchContextMenu(null)
+                    }}
+                  />
+                  <div
+                    role="menu"
+                    className="fixed z-[70] min-w-[10.5rem] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg ring-1 ring-foreground/10"
+                    style={{
+                      left: Math.min(
+                        watchContextMenu.x,
+                        window.innerWidth - 180,
+                      ),
+                      top: Math.min(
+                        watchContextMenu.y,
+                        window.innerHeight - 56,
+                      ),
+                    }}
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm text-destructive transition-colors hover:bg-destructive/10"
+                      onClick={() => {
+                        removeWatchTicker(watchContextMenu.ticker)
+                        setWatchContextMenu(null)
+                      }}
+                    >
+                      <Trash2
+                        className="size-3.5 shrink-0"
+                        strokeWidth={1.75}
+                      />
+                      Remove
+                    </button>
+                  </div>
+                </>
+              ) : null}
+            </div>
+          ) : null}
           {leftShowsActiveEpisodes && deskEpisodeFocus ? (
             <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted/30 px-2.5 py-1.5">
               <p className="truncate text-[12px] text-muted-foreground">
@@ -10234,60 +13226,61 @@ export function EpisodeDashboard({
                           : activeAssetClass}
                       </Badge>
                     ) : null}
-                    <a
-                      href={yahooFinanceQuoteUrl(displayTicker)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                      title={`Open ${displayTicker} on Yahoo Finance`}
+                    <YahooFinanceWithMarketState
+                      marketState={tabQuote?.marketState}
+                      className="self-center"
                     >
-                      Yahoo Finance
-                    </a>
-                    <a
-                      href={perplexityFinanceQuoteUrl(displayTicker)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                      title={`Open ${displayTicker} on Perplexity Finance`}
+                      <a
+                        href={yahooFinanceQuoteUrl(displayTicker)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex shrink-0 items-center text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                        title={`Open ${displayTicker} on Yahoo Finance`}
+                      >
+                        Yahoo Finance
+                      </a>
+                    </YahooFinanceWithMarketState>
+                    <SubscriberHoverCard
+                      ticker={displayTicker}
+                      count={subCount}
                     >
-                      Perplexity Finance
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (
-                          !logCollapsed &&
-                          rightRailMode === 'subscribers'
-                        ) {
-                          setRightRailMode('logs')
-                          return
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (
+                            !logCollapsed &&
+                            rightRailMode === 'subscribers'
+                          ) {
+                            setRightRailMode('logs')
+                            return
+                          }
+                          openSubscribersInLogColumn()
+                        }}
+                        className={cn(
+                          'inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[12px] font-medium transition-colors',
+                          !logCollapsed && rightRailMode === 'subscribers'
+                            ? 'border-foreground/20 bg-foreground text-background'
+                            : 'border-border bg-muted/40 text-foreground hover:bg-muted',
+                        )}
+                        title={`${subCount ?? '…'} Trigger subscriber${subCount === 1 ? '' : 's'} for ${displayTicker}`}
+                        aria-label={`View ${subCount ?? 0} subscribers for ${displayTicker}`}
+                        aria-pressed={
+                          !logCollapsed && rightRailMode === 'subscribers'
                         }
-                        openSubscribersInLogColumn()
-                      }}
-                      className={cn(
-                        'inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[12px] font-medium transition-colors',
-                        !logCollapsed && rightRailMode === 'subscribers'
-                          ? 'border-foreground/20 bg-foreground text-background'
-                          : 'border-border bg-muted/40 text-foreground hover:bg-muted',
-                      )}
-                      title={`${subCount ?? '…'} Trigger subscriber${subCount === 1 ? '' : 's'} for ${displayTicker}`}
-                      aria-label={`View ${subCount ?? 0} subscribers for ${displayTicker}`}
-                      aria-pressed={
-                        !logCollapsed && rightRailMode === 'subscribers'
-                      }
-                    >
-                      {subsLoading && subCount == null ? (
-                        <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-                      ) : (
-                        <Users
-                          className="size-3.5 text-muted-foreground"
-                          strokeWidth={1.75}
-                        />
-                      )}
-                      <span className="tabular-nums font-semibold">
-                        {subCount != null ? subCount : '—'}
-                      </span>
-                    </button>
+                      >
+                        {subsLoading && subCount == null ? (
+                          <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                        ) : (
+                          <Users
+                            className="size-3.5 text-muted-foreground"
+                            strokeWidth={1.75}
+                          />
+                        )}
+                        <span className="tabular-nums font-semibold">
+                          {subCount != null ? subCount : '—'}
+                        </span>
+                      </button>
+                    </SubscriberHoverCard>
                   </div>
                   <a
                     href={yahooLiveUrl}
@@ -10467,40 +13460,51 @@ export function EpisodeDashboard({
             </div>
           ) : null}
 
-          {/* Row 2: Rolling returns | Active episode — shared Tabs (cn) */}
-          <div className="mb-4 mt-2 w-full space-y-2.5 rounded-2xl border border-border bg-muted/20 p-3 sm:p-4">
+          {/* Off-hours note sits above the whole Rolling returns / Episodes card */}
+          {rollingReturnsClosedReason ? (
+            <p className="!my-5 rounded-xl border border-rose-500/70 bg-rose-500/10 px-4 py-3 text-[11px] leading-relaxed text-rose-800 dark:border-rose-400/60 dark:bg-rose-500/10 dark:text-rose-200 sm:!my-6 sm:px-4 sm:py-3.5">
+              {rollingReturnsClosedReason}
+            </p>
+          ) : null}
+
+          {/* Row 2: Rolling returns | Episodes — shared Tabs (cn) */}
+          <div className="mb-4 w-full space-y-3 rounded-2xl border border-border bg-muted/20 p-3 sm:space-y-3.5 sm:p-4">
             <Tabs
               value={mainPanelTab}
               onValueChange={(v) =>
                 setMainPanelTab(v === 'episode' ? 'episode' : 'returns')
               }
-              className="w-full gap-2.5"
+              className="w-full gap-3"
             >
-              <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                <TabsList className="h-8">
-                  <TabsTrigger value="returns" className="px-2.5 text-[13px]">
-                    Rolling returns
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+                <TabsList className="h-9 gap-1 p-1">
+                  <TabsTrigger
+                    value="returns"
+                    className="gap-2 px-3 text-[13px]"
+                  >
+                    <span>Rolling returns</span>
+                    {rollingReturnsClosed ? (
+                      <Badge
+                        variant="outline"
+                        className="ml-0.5 h-5 shrink-0 rounded-full px-2 text-[10px] font-semibold tracking-wide text-muted-foreground"
+                      >
+                        Closed
+                      </Badge>
+                    ) : null}
                   </TabsTrigger>
                   <TabsTrigger
                     value="episode"
-                    className="gap-1.5 px-2.5 text-[13px]"
+                    className="gap-2 px-3 text-[13px]"
                   >
-                    Active episode
-                    {episode ? (
-                      <Badge
-                        variant="secondary"
-                        className="h-5 rounded-full px-1.5 text-[10px] font-semibold"
-                      >
-                        {formatEpisodeState(episode.state) || 'Active'}
-                      </Badge>
-                    ) : (
-                      <Badge
-                        variant="outline"
-                        className="h-5 rounded-full px-1.5 text-[10px] font-medium text-muted-foreground"
-                      >
-                        —
-                      </Badge>
-                    )}
+                    <span>Episodes</span>
+                    <Badge
+                      variant={
+                        tickerEpisodeGroups.length ? 'secondary' : 'outline'
+                      }
+                      className="h-5 shrink-0 rounded-full px-2 text-[10px] font-semibold tabular-nums"
+                    >
+                      {tickerEpisodeGroups.length || '—'}
+                    </Badge>
                   </TabsTrigger>
                 </TabsList>
                 <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -10511,49 +13515,6 @@ export function EpisodeDashboard({
                       pollProgress={pollProgress}
                     />
                   ) : null}
-                  {mainPanelTab === 'returns' ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => {
-                        if (!logCollapsed && rightRailMode === 'settings') {
-                          closeThresholdSettings()
-                          return
-                        }
-                        openThresholdSettings()
-                      }}
-                      title="Rolling-return threshold settings"
-                      aria-label="Rolling-return threshold settings"
-                      aria-expanded={
-                        !logCollapsed && rightRailMode === 'settings'
-                      }
-                      aria-pressed={
-                        !logCollapsed && rightRailMode === 'settings'
-                      }
-                    >
-                      <Settings
-                        className={cn(
-                          'size-3.5',
-                          !logCollapsed &&
-                            rightRailMode === 'settings' &&
-                            'text-foreground',
-                        )}
-                        strokeWidth={2}
-                      />
-                    </Button>
-                  ) : (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => openEventsInLogColumn()}
-                      title="Open full episode rail"
-                      aria-label="Open full episode rail"
-                    >
-                      <Zap className="size-3.5" strokeWidth={2} />
-                    </Button>
-                  )}
                   <UpdatingFromSupabaseNote show={tickerUpdatingFromSupabase} />
                   {busy ? (
                     <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
@@ -10856,346 +13817,160 @@ export function EpisodeDashboard({
 
               <TabsContent value="episode" className="mt-0 outline-none">
             <div className="space-y-3">
-            {!episode ? (
-              <p className="rounded-xl border border-dashed border-border bg-background/60 px-4 py-8 text-center text-sm text-muted-foreground">
-                No active momentum episode for {displayTicker}
-              </p>
-            ) : (
-              <TooltipProvider delayDuration={200}>
-                <div className="mb-1 flex min-w-0 flex-wrap items-center gap-2">
-                  <span
-                    className={cn(
-                      'rounded-full px-2 py-0.5 text-[11px] font-semibold',
-                      episode.direction === 'UP'
-                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                        : 'bg-rose-500/15 text-rose-700 dark:text-rose-300',
-                    )}
-                  >
-                    {episode.direction}
-                  </span>
-                  <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
-                    Active · {formatEpisodeState(episode.state) || 'Live'}
-                  </span>
-                  {episode.episodeNo != null ? (
-                    <span className="font-mono text-[11px] font-semibold tabular-nums text-muted-foreground">
-                      {formatEpisodeNo(episode.episodeNo)}
-                    </span>
-                  ) : null}
-                  <span className="text-[11px] text-muted-foreground">
-                    {episode.detectedWindow || '—'}
-                    {' · '}
-                    {fmtPct(episode.currentMovePercent)} now · peak{' '}
-                    {fmtPct(episode.peakMovePercent)}
-                  </span>
+              {tickerUpdatingFromSupabase && !tickerEpisodeGroups.length ? (
+                <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-background/60 px-4 py-8 text-center">
+                  <UpdatingFromSupabaseNote show />
+                  <p className="text-[12px] text-muted-foreground">
+                    Loading episodes for {displayTicker}…
+                  </p>
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                  <Stat
-                    label="Direction"
-                    value={episode.direction}
-                    valueClass={
-                      episode.direction === 'UP'
-                        ? 'text-emerald-600'
-                        : 'text-rose-600'
-                    }
-                    detail={
-                      <div className="space-y-1.5 text-left">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-background/60">
-                          Direction
-                        </p>
-                        <p className="text-[14px] font-semibold">
-                          Episode is moving{' '}
-                          <span
-                            className={
-                              episode.direction === 'UP'
-                                ? 'text-emerald-300'
-                                : 'text-rose-300'
-                            }
-                          >
-                            {episode.direction}
-                          </span>
-                        </p>
-                        <p className="text-[12px] leading-snug text-background/75">
-                          Set when the episode started from the strongest
-                          threshold hit. Reversal (opposite threshold) ends this
-                          episode and can start a new one the other way.
-                        </p>
-                        <p className="text-[12px] text-background/70">
-                          Live price{' '}
-                          <span className="font-semibold text-background">
-                            {fmtPrice(
-                              episode.currentPrice,
-                              activeAssetClass,
-                              quoteCurrency,
-                            )}
-                          </span>
-                          {' · '}
-                          current move{' '}
-                          <span
-                            className={cn(
-                              'font-semibold tabular-nums',
-                              pctColor(episode.currentMovePercent),
-                            )}
-                          >
-                            {fmtPct(episode.currentMovePercent)}
-                          </span>
-                        </p>
-                      </div>
-                    }
-                  />
-                  <Stat
-                    label="Status"
-                    value={
-                      formatEpisodeState(episode.state) || episode.status || '—'
-                    }
-                    sub={
-                      (() => {
-                        const gb = fmtGivebackPct(
-                          computeEpisodeGivebackPercent(episode),
-                        )
-                        return gb ? `Giveback ${gb}` : null
-                      })()
-                    }
-                    detail={
-                      <div className="space-y-2 text-left">
-                        <div className="space-y-1">
-                          <p className="text-[11px] font-semibold uppercase tracking-wide text-background/60">
-                            Status
-                          </p>
-                          <p className="text-[14px] font-semibold">
-                            {formatEpisodeState(episode.state) || episode.status}
-                            {episode.status === 'ACTIVE' ? ' · ACTIVE' : ''}
-                          </p>
-                        </div>
-                        <GivebackCalcBody
-                          direction={episode.direction}
-                          givebackPercent={computeEpisodeGivebackPercent(
-                            episode,
-                          )}
-                          peakPrice={episode.peakPrice}
-                          troughPrice={episode.troughPrice}
-                          referencePrice={episode.referencePrice}
-                          currentPrice={episode.currentPrice}
-                          peakMovePercent={episode.peakMovePercent}
-                          currentMovePercent={episode.currentMovePercent}
-                          weakThreshold={
-                            status?.config?.episodePolicy
-                              ?.holdingToWeakeningGiveback ?? 0.25
-                          }
-                          holdThreshold={
-                            status?.config?.episodePolicy
-                              ?.weakeningToHoldingGiveback ?? 0.2
-                          }
-                          strongThreshold={
-                            status?.config?.episodePolicy
-                              ?.strongWeakeningGiveback ?? 0.6
-                          }
-                          assetClass={activeAssetClass}
-                          currency={quoteCurrency}
-                        />
-                        {episode.belowThresholdSince ? (
-                          <p className="text-[12px] text-background/70">
-                            Below threshold since{' '}
-                            {fmtDateTime(episode.belowThresholdSince) ||
-                              fmtTime(episode.belowThresholdSince)}
-                          </p>
-                        ) : null}
-                      </div>
-                    }
-                  />
-                  <Stat
-                    label="Window"
-                    value={episode.detectedWindow}
-                    detail={
-                      <div className="space-y-1.5 text-left">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-background/60">
-                          Detected window
-                        </p>
-                        <p className="text-[14px] font-semibold">
-                          {episode.detectedWindow}
-                        </p>
-                        <p className="text-[12px] leading-snug text-background/75">
-                          Rolling-return card that first crossed its |move %|
-                          threshold and opened this episode. Later accelerate
-                          alerts may use other windows, but this label is the
-                          origin trigger.
-                        </p>
-                        <p className="text-[12px] text-background/70">
-                          Initial move at start:{' '}
-                          <span
-                            className={cn(
-                              'font-semibold tabular-nums',
-                              pctColor(episode.initialMovePercent),
-                            )}
-                          >
-                            {fmtPct(episode.initialMovePercent)}
-                          </span>
-                        </p>
-                      </div>
-                    }
-                  />
-                  <Stat
-                    label="Started"
-                    value={fmtEpisodeWhen(
-                      episode.episodeStartedAt,
-                      episode.marketSession,
-                    )}
-                    detail={
-                      <div className="space-y-1.5 text-left">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-background/60">
-                          Episode started
-                        </p>
-                        <p className="text-[14px] font-semibold tabular-nums">
-                          {fmtDateTime(episode.episodeStartedAt) ||
-                            episode.episodeStartedAt}
-                          {sessionDateLabel(episode.marketSession) &&
-                          sessionDateLabel(episode.marketSession) !== 'regular'
-                            ? ` · ${sessionDateLabel(episode.marketSession)}`
-                            : ''}
-                        </p>
-                        <p className="text-[12px] leading-snug text-background/75">
-                          Wall-clock time when{' '}
-                          <span className="font-semibold">MOMENTUM_STARTED</span>{' '}
-                          fired for this ticker after a threshold cross.
-                        </p>
-                        <p className="text-[12px] text-background/70">
-                          Direction {episode.direction} · window{' '}
-                          {episode.exactLabel || episode.detectedWindow}
-                        </p>
-                      </div>
-                    }
-                  />
-                  <Stat
-                    label="Peak move"
-                    value={fmtPct(episode.peakMovePercent)}
-                    valueClass={pctColor(episode.peakMovePercent)}
-                    detail={
-                      <div className="space-y-2 text-left">
-                        <PeakMoveCalcBody
-                          direction={episode.direction}
-                          peakMovePercent={episode.peakMovePercent}
-                          peakPrice={episode.peakPrice}
-                          troughPrice={episode.troughPrice}
-                          referencePrice={episode.referencePrice}
-                          assetClass={activeAssetClass}
-                          currency={quoteCurrency}
-                        />
-                        <div className="space-y-1 border-t border-background/15 pt-2 text-[12px] text-background/70">
-                          <p>
-                            Initial:{' '}
-                            <span className="font-semibold tabular-nums text-background">
-                              {fmtPct(episode.initialMovePercent)}
-                            </span>
-                          </p>
-                          <p>
-                            Current:{' '}
-                            <span className="font-semibold tabular-nums text-background">
-                              {fmtPct(episode.currentMovePercent)}
-                            </span>
-                          </p>
-                          <p>
-                            Last alert:{' '}
-                            <span className="font-semibold tabular-nums text-background">
-                              {fmtPct(episode.lastAlertMovePercent)}
-                            </span>
-                          </p>
-                        </div>
-                      </div>
-                    }
-                  />
-                  <Stat
-                    label="Last alert move"
-                    value={fmtPct(episode.lastAlertMovePercent)}
-                    valueClass={pctColor(episode.lastAlertMovePercent)}
-                    detail={
-                      <div className="space-y-1.5 text-left">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-background/60">
-                          Last alert move
-                        </p>
-                        <p
+              ) : !tickerEpisodeGroups.length ? (
+                <p className="rounded-xl border border-dashed border-border bg-background/60 px-4 py-8 text-center text-sm text-muted-foreground">
+                  No episodes yet for {displayTicker}
+                </p>
+              ) : (
+                <TooltipProvider delayDuration={200}>
+                  <div className="space-y-3">
+                    {tickerEpisodeGroups.map((group) => {
+                      const matchesLive = Boolean(
+                        episodeRaw &&
+                          group.episodeId &&
+                          episodeRaw.episodeId === group.episodeId,
+                      )
+                      const isActive = group.status === 'ACTIVE'
+                      const isExpanded =
+                        episodeExpanded[group.id] ?? false
+                      const dirUp = group.direction !== 'DOWN'
+                      const no = formatEpisodeNo(group.episodeNo)
+                      const focusThisEpisode = () => {
+                        const row: ActiveEpisodeRow = {
+                          ticker: displayTicker,
+                          episodeId: group.episodeId || null,
+                          episodeNo: group.episodeNo ?? null,
+                          direction: group.direction === 'DOWN' ? 'DOWN' : 'UP',
+                          detectedWindow: group.window || null,
+                          peakMovePercent: group.peakMovePercent ?? null,
+                          currentMovePercent: matchesLive
+                            ? episodeRaw?.currentMovePercent ?? null
+                            : null,
+                          episodeStartedAt: group.startedAt || null,
+                          status: group.status,
+                          state: group.liveState || null,
+                          marketSession: group.marketSession || null,
+                        }
+                        setDeskEpisodeFocus(row)
+                        setRightRailMode('yahoo')
+                        setLogCollapsedPersist(false)
+                        setRailChartExpanded(false)
+                      }
+                      return (
+                        <div
+                          key={group.id}
                           className={cn(
-                            'text-[16px] font-semibold tabular-nums',
-                            episode.lastAlertMovePercent > 0
-                              ? 'text-emerald-300'
-                              : episode.lastAlertMovePercent < 0
-                                ? 'text-rose-300'
-                                : 'text-background',
+                            'overflow-hidden rounded-xl border bg-background',
+                            deskEpisodeFocus?.episodeId &&
+                              group.episodeId &&
+                              String(deskEpisodeFocus.episodeId) ===
+                                String(group.episodeId)
+                              ? 'border-foreground/30 ring-1 ring-foreground/15'
+                              : 'border-border',
                           )}
                         >
-                          {fmtPct(episode.lastAlertMovePercent)}
-                        </p>
-                        <p className="text-[12px] leading-snug text-background/75">
-                          Move % at the last start/accelerate alert. Next
-                          accelerate needs peak to beat this by the accel
-                          threshold (config).
-                        </p>
-                        <p className="text-[12px] text-background/70">
-                          Last alert at{' '}
-                          {fmtDateTime(episode.lastAlertAt) ||
-                            fmtTime(episode.lastAlertAt) ||
-                            '—'}
-                        </p>
-                      </div>
-                    }
-                  />
-                </div>
-
-                {/* How this move built — live episode story (same chain as right rail) */}
-                {(() => {
-                  const groups = buildEpisodeGroups(
-                    status?.episodes,
-                    status?.events,
-                    episode,
-                  ).map((g) => {
-                    const next = ensureGroupHasStartedEvent(g)
-                    if (
-                      next.status === 'ACTIVE' &&
-                      episode?.state &&
-                      (!next.episodeId ||
-                        next.episodeId === episode.episodeId)
-                    ) {
-                      return {
-                        ...next,
-                        liveState: episode.state,
-                        marketSession:
-                          next.marketSession ||
-                          status?.snapshot?.marketSession ||
-                          null,
-                        episodeNo:
-                          next.episodeNo ?? episode.episodeNo ?? null,
-                      }
-                    }
-                    return next
-                  })
-                  const activeGroup =
-                    groups.find(
-                      (g) =>
-                        g.status === 'ACTIVE' &&
-                        (!episode.episodeId ||
-                          g.episodeId === episode.episodeId),
-                    ) ||
-                    groups.find((g) => g.status === 'ACTIVE') ||
-                    null
-                  if (!activeGroup) {
-                    return (
-                      <p className="mt-2 text-[12px] text-muted-foreground">
-                        Episode is live — open the full rail for past history.
-                      </p>
-                    )
-                  }
-                  return (
-                    <div className="mt-3 rounded-xl border border-border bg-background px-3 py-2">
-                      <EpisodeExplainCollapse
-                        group={activeGroup}
-                        accelPoints={status?.config?.accelerationPoints}
-                        inactivityMinutes={
-                          status?.config?.inactivityMinutes
-                        }
-                      />
-                    </div>
-                  )
-                })()}
-              </TooltipProvider>
-            )}
+                          <button
+                            type="button"
+                            className="flex w-full items-center gap-2 px-3 py-2.5 text-left hover:bg-muted/40"
+                            onClick={focusThisEpisode}
+                          >
+                            <span
+                              className={cn(
+                                'rounded-full px-2 py-0.5 text-[11px] font-semibold',
+                                dirUp
+                                  ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                  : 'bg-rose-500/15 text-rose-700 dark:text-rose-300',
+                              )}
+                            >
+                              {group.direction}
+                            </span>
+                            {no ? (
+                              <span className="font-mono text-[11px] font-semibold tabular-nums">
+                                {no}
+                              </span>
+                            ) : null}
+                            <span className="truncate text-[12px] text-muted-foreground">
+                              {group.window || '—'}
+                            </span>
+                            <span
+                              className={cn(
+                                'ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                                isActive
+                                  ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                  : 'bg-muted text-muted-foreground',
+                              )}
+                            >
+                              {isActive
+                                ? formatEpisodeState(group.liveState) ||
+                                  'Active'
+                                : 'Ended'}
+                            </span>
+                            <span
+                              className={cn(
+                                'shrink-0 text-[12px] font-semibold tabular-nums',
+                                pctColor(group.peakMovePercent),
+                              )}
+                            >
+                              {fmtPct(group.peakMovePercent)}
+                            </span>
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              title={isExpanded ? 'Collapse' : 'Expand inline'}
+                              aria-label={
+                                isExpanded ? 'Collapse episode' : 'Expand episode'
+                              }
+                              className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                              onClick={(e) => {
+                                e.preventDefault()
+                                e.stopPropagation()
+                                setEpisodeExpanded((prev) => ({
+                                  ...prev,
+                                  [group.id]: !isExpanded,
+                                }))
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key !== 'Enter' && e.key !== ' ') return
+                                e.preventDefault()
+                                e.stopPropagation()
+                                setEpisodeExpanded((prev) => ({
+                                  ...prev,
+                                  [group.id]: !isExpanded,
+                                }))
+                              }}
+                            >
+                              {isExpanded ? (
+                                <ChevronUp className="size-3.5" />
+                              ) : (
+                                <ChevronDown className="size-3.5" />
+                              )}
+                            </span>
+                          </button>
+                          {isExpanded ? (
+                            <div className="border-t border-border px-3 py-2">
+                              <EpisodeHowBuiltBlock
+                                group={group}
+                                assetClass={activeAssetClass}
+                                currency={quoteCurrency}
+                                liveEpisode={matchesLive ? episodeRaw : null}
+                                matchesLive={matchesLive}
+                                defaultOpen={false}
+                              />
+                            </div>
+                          ) : null}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </TooltipProvider>
+              )}
             </div>
               </TabsContent>
             </Tabs>
@@ -11214,8 +13989,8 @@ export function EpisodeDashboard({
           )}
         </div>
 
-        {/* Column 3 — collapsible activity log / subscribers */}
-        {logCollapsed ? (
+        {/* Column 3/4 — detail rail: home desk always; asset tabs after ticker pick. */}
+        {showDetailRightRail ? (logCollapsed ? (
           <Button
             type="button"
             variant="ghost"
@@ -11253,7 +14028,7 @@ export function EpisodeDashboard({
               aria-label="Resize panel"
               title="Drag to resize"
               onMouseDown={onRightRailResizeStart}
-              className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize border-0 bg-transparent p-0 hover:bg-foreground/10 active:bg-foreground/15"
+              className="absolute inset-y-0 -left-1 z-20 w-2 cursor-col-resize border-0 bg-transparent p-0 hover:bg-foreground/15 active:bg-foreground/20"
             />
             <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border/60 px-3 py-2.5">
               <div className="flex min-w-0 items-center gap-2">
@@ -11285,60 +14060,95 @@ export function EpisodeDashboard({
                 ) : (
                   <Terminal className="size-3.5 shrink-0 text-muted-foreground" />
                 )}
-                <div className="min-w-0">
-                  <div className="flex min-w-0 items-center gap-0.5">
-                    <p className="truncate text-[13px] font-medium">
-                      {rightRailMode === 'subscribers'
-                        ? `Subscribers · ${displayTicker}`
-                        : rightRailMode === 'events'
-                          ? `Recent events · ${displayTicker}`
-                          : rightRailMode === 'settings'
-                            ? 'Rolling-return thresholds'
-                            : rightRailMode === 'activeEpisodes'
-                              ? `Active episodes · ${activeEpisodesList.length}`
-                              : rightRailMode === 'yahoo'
-                                ? deskUsersMode
-                                  ? deskUserFocus
-                                    ? `Profile · ${
-                                        deskUserFocus.device_model ||
-                                        deskUserFocus.platform ||
-                                        'Device'
-                                      }`
-                                    : 'User profile'
-                                  : deskEpisodeFocus
-                                    ? `Episode · ${displayTicker}${
-                                        formatEpisodeNo(
-                                          deskEpisodeFocus.episodeNo,
-                                        )
-                                          ? ` ${formatEpisodeNo(deskEpisodeFocus.episodeNo)}`
-                                          : ''
-                                      }`
-                                    : `Yahoo · ${displayTicker}`
-                              : `Activity log · ${displayTicker}`}
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <p className="flex min-w-0 items-center gap-1 truncate text-[13px] font-medium">
+                      {rightRailMode === 'settings' ? (
+                        <span className="truncate">Rolling-return thresholds</span>
+                      ) : rightRailMode === 'activeEpisodes' ? (
+                        <span className="truncate">
+                          Active episodes · {activeEpisodesList.length}
+                        </span>
+                      ) : rightRailMode === 'yahoo' && deskUsersMode ? (
+                        <span className="truncate">
+                          {deskUserFocus
+                            ? `Profile · ${
+                                deskUserFocus.device_model ||
+                                deskUserFocus.platform ||
+                                'Device'
+                              }`
+                            : 'User profile'}
+                        </span>
+                      ) : displayTicker ? (
+                        <>
+                          <span className="shrink-0 text-muted-foreground">
+                            {rightRailMode === 'subscribers'
+                              ? 'Subscribers ·'
+                              : rightRailMode === 'events'
+                                ? 'Recent events ·'
+                                : rightRailMode === 'yahoo' && deskEpisodeFocus
+                                  ? 'Episode ·'
+                                  : rightRailMode === 'yahoo'
+                                    ? 'Yahoo ·'
+                                    : 'Activity log ·'}
+                          </span>
+                          <button
+                            type="button"
+                            className="truncate font-semibold text-foreground underline-offset-2 hover:underline"
+                            title={`Open ${displayTicker} in ${
+                              ASSET_CLASS_TABS.find(
+                                (tab) =>
+                                  tab.id ===
+                                  tabAssetClass({
+                                    ticker: displayTicker,
+                                    assetClass: detectAssetClass(displayTicker),
+                                  }),
+                              )?.label || 'Markets'
+                            }`}
+                            onClick={() =>
+                              openTickerInMarketSection(displayTicker)
+                            }
+                          >
+                            {displayTicker}
+                          </button>
+                          {rightRailMode === 'yahoo' &&
+                          deskEpisodeFocus &&
+                          formatEpisodeNo(deskEpisodeFocus.episodeNo) ? (
+                            <span className="shrink-0 text-muted-foreground">
+                              {formatEpisodeNo(deskEpisodeFocus.episodeNo)}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        <span className="truncate text-muted-foreground">
+                          Detail
+                        </span>
+                      )}
                     </p>
                     {rightRailMode === 'events' ? (
                       <EpisodeStatusGuideButton
                         policy={status?.config?.episodePolicy}
                       />
                     ) : null}
+                    {rightRailMode === 'settings' ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="ml-auto h-7 shrink-0 gap-1.5 px-2.5 text-[11px]"
+                        disabled={thresholdSaving || policySaving}
+                        onClick={() => void saveSettingsNow()}
+                        title="Save threshold and episode-rule changes"
+                        aria-label="Save settings"
+                      >
+                        {thresholdSaving || policySaving ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Check className="size-3.5" strokeWidth={2.5} />
+                        )}
+                        Save
+                      </Button>
+                    ) : null}
                   </div>
-                  <p className="truncate text-[11px] text-muted-foreground">
-                    {rightRailMode === 'subscribers'
-                      ? `${tickerSubscribers.length} device${tickerSubscribers.length === 1 ? '' : 's'} · Trigger (push-ready)`
-                      : rightRailMode === 'events'
-                        ? '≤24h windows only'
-                        : rightRailMode === 'settings'
-                          ? `${ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)?.label || 'Stocks'} · blank/0 = off`
-                          : rightRailMode === 'activeEpisodes'
-                            ? 'All live episodes · click to expand'
-                            : rightRailMode === 'yahoo'
-                              ? deskUsersMode
-                                ? 'iOS · build · photo · device fields'
-                                : deskEpisodeFocus
-                                  ? 'Quote · mini chart · A→Z how it built'
-                                  : 'Yahoo Finance chart · quote · session'
-                            : 'API · Yahoo · momentum'}
-                  </p>
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1">
@@ -11420,6 +14230,7 @@ export function EpisodeDashboard({
                     deskUserFocus ? (
                       <DeskUserProfilePanel
                         device={deskUserFocus}
+                        onOpenTicker={openTickerInMarketSection}
                         onTickersChanged={async () => {
                           const focused = deskUserFocus
                           await loadDeskDevices()
@@ -11434,25 +14245,258 @@ export function EpisodeDashboard({
                         />
                         <p className="text-sm font-medium">Select a user</p>
                         <p className="max-w-[16rem] text-[12px] text-muted-foreground">
-                          Click a device on the left to see iOS / build / photo
+                          Click a device in All users to see iOS / build / photo
                           and profile fields here.
+                        </p>
+                      </div>
+                    )
+                  ) : deskBulletinsMode ? (
+                    deskBulletinFocus ? (
+                      <div className="space-y-3 px-3 py-3">
+                        <div className="rounded-xl border border-border bg-card p-3">
+                          <div className="flex flex-wrap items-start gap-2">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-sm font-semibold leading-snug">
+                                {deskBulletinFocus.title}
+                              </p>
+                              <p className="mt-1 text-[11px] text-muted-foreground">
+                                {String(deskBulletinFocus.market || '')
+                                  .toLowerCase() === 'india'
+                                  ? 'India'
+                                  : 'US'}{' '}
+                                · {String(deskBulletinFocus.slot || '').toUpperCase()}{' '}
+                                · {deskBulletinFocus.session_date || '—'}
+                                {deskBulletinFocus.yahoo_market_state
+                                  ? ` · Yahoo ${deskBulletinFocus.yahoo_market_state}`
+                                  : ''}
+                              </p>
+                            </div>
+                            <Badge variant="outline" className="shrink-0 text-[10px]">
+                              {deskBulletinFocus.body_source === 'perplexity'
+                                ? 'Perplexity'
+                                : deskBulletinFocus.body_source || 'body'}
+                            </Badge>
+                          </div>
+                          <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                            <div className="rounded-lg bg-muted/50 px-2 py-1.5">
+                              <p className="text-muted-foreground">Probe</p>
+                              <p className="font-medium tabular-nums">
+                                {deskBulletinFocus.probe_symbol || '—'}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-muted/50 px-2 py-1.5">
+                              <p className="text-muted-foreground">Day %</p>
+                              <p
+                                className={cn(
+                                  'font-medium tabular-nums',
+                                  Number(deskBulletinFocus.day_change_percent) >
+                                    0
+                                    ? 'text-emerald-600'
+                                    : Number(
+                                          deskBulletinFocus.day_change_percent,
+                                        ) < 0
+                                      ? 'text-rose-600'
+                                      : '',
+                                )}
+                              >
+                                {deskBulletinFocus.day_change_percent != null &&
+                                Number.isFinite(
+                                  Number(deskBulletinFocus.day_change_percent),
+                                )
+                                  ? `${Number(deskBulletinFocus.day_change_percent) > 0 ? '+' : ''}${Number(deskBulletinFocus.day_change_percent).toFixed(2)}%`
+                                  : '—'}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-muted/50 px-2 py-1.5">
+                              <p className="text-muted-foreground">Open</p>
+                              <p className="font-medium tabular-nums">
+                                {deskBulletinFocus.open_price != null
+                                  ? Number(
+                                      deskBulletinFocus.open_price,
+                                    ).toFixed(2)
+                                  : '—'}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-muted/50 px-2 py-1.5">
+                              <p className="text-muted-foreground">
+                                Close / last
+                              </p>
+                              <p className="font-medium tabular-nums">
+                                {deskBulletinFocus.close_or_last_price != null
+                                  ? Number(
+                                      deskBulletinFocus.close_or_last_price,
+                                    ).toFixed(2)
+                                  : '—'}
+                              </p>
+                            </div>
+                          </div>
+                          <p className="mt-2 text-[11px] text-muted-foreground">
+                            Push {Number(deskBulletinFocus.push_sent_ok) || 0}/
+                            {Number(deskBulletinFocus.recipient_count) || 0}
+                            {deskBulletinFocus.sent_at
+                              ? ` · sent ${
+                                  formatExchangeTime(
+                                    deskBulletinFocus.sent_at,
+                                    deskBulletinFocus.timezone || momentumDisplayTimeZone,
+                                    { date: true, year: true, withZone: true },
+                                  ) || '—'
+                                }`
+                              : ''}
+                          </p>
+                        </div>
+
+                        <div className="rounded-xl border border-border bg-card p-3">
+                          <div className="mb-2 flex items-center gap-2">
+                            <Newspaper
+                              className="size-3.5 text-muted-foreground"
+                              strokeWidth={1.75}
+                            />
+                            <p className="text-[12px] font-semibold">
+                              Lock-screen body
+                            </p>
+                          </div>
+                          <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground">
+                            {deskBulletinFocus.body || '—'}
+                          </p>
+                        </div>
+
+                        {deskBulletinFocus.perplexity_meta &&
+                        typeof deskBulletinFocus.perplexity_meta ===
+                          'object' ? (
+                          <div className="rounded-xl border border-border bg-card p-3">
+                            <p className="mb-2 text-[12px] font-semibold">
+                              Perplexity meta
+                            </p>
+                            <div className="space-y-1 text-[11px] text-muted-foreground">
+                              {deskBulletinFocus.perplexity_meta.model ? (
+                                <p>
+                                  Model:{' '}
+                                  <span className="text-foreground">
+                                    {String(
+                                      deskBulletinFocus.perplexity_meta.model,
+                                    )}
+                                  </span>
+                                </p>
+                              ) : null}
+                              {deskBulletinFocus.perplexity_meta
+                                .total_tokens != null ? (
+                                <p>
+                                  Tokens:{' '}
+                                  <span className="tabular-nums text-foreground">
+                                    {String(
+                                      deskBulletinFocus.perplexity_meta
+                                        .total_tokens,
+                                    )}
+                                  </span>
+                                </p>
+                              ) : null}
+                              {deskBulletinFocus.perplexity_meta.cost_usd !=
+                              null ? (
+                                <p>
+                                  Cost:{' '}
+                                  <span className="tabular-nums text-foreground">
+                                    $
+                                    {Number(
+                                      deskBulletinFocus.perplexity_meta
+                                        .cost_usd,
+                                    ).toFixed(4)}
+                                  </span>
+                                </p>
+                              ) : null}
+                              {deskBulletinFocus.perplexity_meta.reason ? (
+                                <p>
+                                  Note:{' '}
+                                  <span className="text-foreground">
+                                    {String(
+                                      deskBulletinFocus.perplexity_meta.reason,
+                                    )}
+                                  </span>
+                                </p>
+                              ) : null}
+                              {Array.isArray(
+                                deskBulletinFocus.perplexity_meta.citations,
+                              ) &&
+                              (
+                                deskBulletinFocus.perplexity_meta
+                                  .citations as unknown[]
+                              ).length > 0 ? (
+                                <div className="pt-1">
+                                  <p className="mb-1 font-medium text-foreground">
+                                    Citations
+                                  </p>
+                                  <ul className="list-disc space-y-0.5 pl-4">
+                                    {(
+                                      deskBulletinFocus.perplexity_meta
+                                        .citations as unknown[]
+                                    )
+                                      .slice(0, 8)
+                                      .map((c, i) => (
+                                        <li key={i} className="break-all">
+                                          {typeof c === 'string'
+                                            ? c
+                                            : JSON.stringify(c)}
+                                        </li>
+                                      ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 px-4 py-12 text-center">
+                        <Newspaper
+                          className="size-6 text-muted-foreground/70"
+                          strokeWidth={1.5}
+                        />
+                        <p className="text-sm font-medium">
+                          Select a market bulletin
+                        </p>
+                        <p className="max-w-[16rem] text-[12px] text-muted-foreground">
+                          Click a US / India OPEN or CLOSE row to see the
+                          Perplexity research body and Yahoo snapshot here.
                         </p>
                       </div>
                     )
                   ) : (
                   <div className="space-y-3 px-3 py-3">
                     {!deskEpisodeFocus ? (
-                      <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-4 py-12 text-center">
-                        <LineChart
-                          className="size-6 text-muted-foreground/70"
-                          strokeWidth={1.5}
-                        />
-                        <p className="text-sm font-medium">Select an episode</p>
-                        <p className="max-w-[16rem] text-[12px] text-muted-foreground">
-                          Click a row in All episodes (center) or a live episode
-                          on the left — the list stays put; detail opens here.
-                        </p>
-                      </div>
+                      showLegacyLeftRail && hasSelectedTicker ? (
+                        <div className="space-y-3">
+                          <div className="overflow-hidden rounded-xl border border-border bg-card">
+                            <YahooInteractiveChart
+                              key={`${displayTicker}-rail-idle`}
+                              ticker={displayTicker}
+                              title={`${displayTicker} · Yahoo`}
+                              height={220}
+                              defaultRange="1d"
+                              borderless
+                              timeZone={exchangeDisplayTz}
+                              showTimeZone
+                              disableCache
+                            />
+                          </div>
+                          <p className="px-1 text-center text-[11px] text-muted-foreground">
+                            Click any episode in the Episodes tab to open its
+                            detail here.
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-4 py-12 text-center">
+                          <LineChart
+                            className="size-6 text-muted-foreground/70"
+                            strokeWidth={1.5}
+                          />
+                          <p className="text-sm font-medium">
+                            Select an episode
+                          </p>
+                          <p className="max-w-[16rem] text-[12px] text-muted-foreground">
+                            Click a row in All episodes — the list stays put and
+                            its detail opens here.
+                          </p>
+                        </div>
+                      )
                     ) : null}
                     {deskEpisodeFocus ? (
                     <>
@@ -11461,14 +14505,30 @@ export function EpisodeDashboard({
                       <div className="flex items-start gap-2">
                         <div className="min-w-0 flex-1">
                           <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold tracking-tight">
+                            <button
+                              type="button"
+                              className="block max-w-full truncate text-left text-sm font-semibold tracking-tight underline-offset-2 hover:underline"
+                              title={`Open ${displayTicker} in markets`}
+                              onClick={() =>
+                                openTickerInMarketSection(displayTicker)
+                              }
+                            >
                               {activeTab?.label &&
                               activeTab.label !== displayTicker
                                 ? activeTab.label
                                 : displayTicker}
-                            </p>
+                            </button>
                             <p className="truncate text-[11px] text-muted-foreground">
-                              {displayTicker}
+                              <button
+                                type="button"
+                                className="font-medium text-foreground underline-offset-2 hover:underline"
+                                title={`Open ${displayTicker} in markets`}
+                                onClick={() =>
+                                  openTickerInMarketSection(displayTicker)
+                                }
+                              >
+                                {displayTicker}
+                              </button>
                               {formatEpisodeNo(deskEpisodeFocus.episodeNo)
                                 ? ` · ${formatEpisodeNo(deskEpisodeFocus.episodeNo)}`
                                 : ''}
@@ -11509,22 +14569,22 @@ export function EpisodeDashboard({
                                 : ''}
                             </p>
                           ) : null}
-                          {/* Session · Yahoo under share price (clickable → Yahoo) */}
-                          <a
-                            href={yahooFinanceQuoteUrl(displayTicker)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-1.5 inline-flex max-w-full flex-wrap items-center gap-x-1.5 text-[11px] font-medium text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
-                            title={`Open ${displayTicker} on Yahoo Finance`}
+                          {/* Session above Yahoo (clickable → Yahoo) */}
+                          <YahooFinanceWithMarketState
+                            marketState={tabQuote?.marketState}
+                            className="mt-1.5"
                           >
-                            <YahooMarketStateLabel
-                              marketState={tabQuote?.marketState}
-                              className="text-[11px]"
-                            />
-                            <span aria-hidden>·</span>
-                            <span>Yahoo Finance</span>
-                            <ExternalLink className="size-3 shrink-0 opacity-70" />
-                          </a>
+                            <a
+                              href={yahooFinanceQuoteUrl(displayTicker)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex max-w-full items-center gap-x-1 text-[11px] font-medium text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
+                              title={`Open ${displayTicker} on Yahoo Finance`}
+                            >
+                              <span>Yahoo Finance</span>
+                              <ArrowUpRight className="size-3 shrink-0 opacity-70" />
+                            </a>
+                          </YahooFinanceWithMarketState>
                         </div>
                         <button
                           type="button"
@@ -11605,40 +14665,26 @@ export function EpisodeDashboard({
                           />
                         </div>
                         <div className="border-t border-border px-3 py-2">
-                          <a
-                            href={yahooFinanceQuoteUrl(displayTicker)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                            title={`Open ${displayTicker} on Yahoo Finance`}
+                          <YahooFinanceWithMarketState
+                            marketState={tabQuote?.marketState}
                           >
-                            <YahooMarketStateLabel
-                              marketState={tabQuote?.marketState}
-                              className="text-[11px]"
-                            />
-                            <span aria-hidden>·</span>
-                            <span>Yahoo Finance</span>
-                            <ExternalLink className="size-3 shrink-0 opacity-70" />
-                          </a>
+                            <a
+                              href={yahooFinanceQuoteUrl(displayTicker)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                              title={`Open ${displayTicker} on Yahoo Finance`}
+                            >
+                              <span>Yahoo Finance</span>
+                              <ArrowUpRight className="size-3 shrink-0 opacity-70" />
+                            </a>
+                          </YahooFinanceWithMarketState>
                         </div>
                       </div>
                     ) : null}
 
-                    {/* Full A→Z how this episode built — popup content inline */}
-                      <div className="space-y-2 rounded-xl border border-border bg-card p-3">
-                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                          <Zap
-                            className="size-3.5 text-muted-foreground"
-                            strokeWidth={2}
-                          />
-                          <p className="text-[14px] font-semibold tracking-tight">
-                            How this episode built · A→Z
-                          </p>
-                        </div>
-                        <p className="text-[12px] text-muted-foreground">
-                          Full story plus every alert, Perplexity, and measure
-                          detail inline (same content as the popups).
-                        </p>
+                    {/* How this move built — summary + step timeline */}
+                      <div className="rounded-xl border border-border bg-card p-3">
                         {(() => {
                           const focusTicker = String(
                             deskEpisodeFocus.ticker || displayTicker || '',
@@ -11648,8 +14694,6 @@ export function EpisodeDashboard({
                           const statusTicker = String(status?.ticker || '')
                             .trim()
                             .toUpperCase()
-                          // Wait until this ticker’s status/events have hydrated —
-                          // otherwise a 1-step stub looks like the full story.
                           const timelineLoading =
                             loading ||
                             !status ||
@@ -11661,7 +14705,7 @@ export function EpisodeDashboard({
                             return (
                               <div className="flex items-center gap-2 rounded-xl border border-dashed border-border bg-muted/20 px-3 py-8 text-[12px] text-muted-foreground">
                                 <Loader2 className="size-4 shrink-0 animate-spin" />
-                                Loading full episode timeline…
+                                Loading episode timeline…
                               </div>
                             )
                           }
@@ -11689,7 +14733,6 @@ export function EpisodeDashboard({
                             ) ||
                             null
                           if (!group) {
-                            // Stub from the clicked row if status has no matching group
                             group = ensureGroupHasStartedEvent({
                               id:
                                 focusId ||
@@ -11737,26 +14780,15 @@ export function EpisodeDashboard({
                               episode.episodeId === group.episodeId,
                           )
                           return (
-                            <div className="space-y-3">
-                              <EpisodeExplainCollapse
-                                key={`explain-${group.id}`}
-                                group={group}
-                                accelPoints={
-                                  status?.config?.accelerationPoints
-                                }
-                                inactivityMinutes={
-                                  status?.config?.inactivityMinutes
-                                }
-                              />
-                              <EpisodeAzTimelineInline
-                                key={`az-${group.id}`}
-                                group={group}
-                                assetClass={activeAssetClass}
-                                currency={quoteCurrency}
-                                liveEpisode={episode}
-                                matchesLive={matchesLive}
-                              />
-                            </div>
+                            <EpisodeHowBuiltBlock
+                              key={`how-${group.id}`}
+                              group={group}
+                              assetClass={activeAssetClass}
+                              currency={quoteCurrency}
+                              liveEpisode={episode}
+                              matchesLive={matchesLive}
+                              defaultOpen
+                            />
                           )
                         })()}
                       </div>
@@ -12051,71 +15083,41 @@ export function EpisodeDashboard({
               <div className="flex min-h-0 flex-1 flex-col">
                 <ScrollArea className="min-h-0 flex-1">
                   <div className="space-y-3 px-3 py-3">
-                    {/* Test mode — push + Perplexity gate */}
-                    <div
-                      className={cn(
-                        'rounded-xl border px-3 py-2.5',
-                        testModeEnabled
-                          ? 'border-amber-500/40 bg-amber-500/10'
-                          : 'border-border bg-muted/30',
-                      )}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                            Test mode
-                          </p>
-                          <p className="mt-1 text-[11px] leading-snug text-foreground/90">
-                            {testModeEnabled
-                              ? 'ON — only the tester device gets notifications. Perplexity is dummy (no API).'
-                              : 'OFF — all ticker subscribers + always-notify tester. Real Perplexity API.'}
-                          </p>
-                          <p className="mt-1.5 text-[10px] font-medium text-muted-foreground">
-                            {testModeEnabled
-                              ? 'Pushes only to:'
-                              : 'Always included (plus subscribers):'}
-                          </p>
-                          <p className="mt-0.5 break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                            {status?.config?.testMode?.alwaysNotify?.device_id ||
-                              'ios-d003c3d5-2c11-4766-866e-8bf8e511929c'}
-                          </p>
-                          <p className="break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                            {status?.config?.testMode?.alwaysNotify
-                              ?.expo_push_token ||
-                              'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'}
-                          </p>
-                          {testModeSummary ? (
-                            <p className="mt-1 text-[10px] text-muted-foreground">
-                              {testModeSummary}
-                            </p>
-                          ) : null}
-                        </div>
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={testModeEnabled}
-                          disabled={testModeSaving}
-                          onClick={() => void toggleTestMode(!testModeEnabled)}
-                          className={cn(
-                            'relative mt-0.5 h-7 w-12 shrink-0 rounded-full transition-colors',
-                            testModeEnabled
-                              ? 'bg-amber-500'
-                              : 'bg-muted-foreground/30',
-                            testModeSaving && 'opacity-60',
-                          )}
-                          title={
-                            testModeEnabled
-                              ? 'Turn test mode off'
-                              : 'Turn test mode on'
-                          }
-                        >
-                          <span
-                            className={cn(
-                              'absolute top-0.5 size-6 rounded-full bg-background shadow transition-transform',
-                              testModeEnabled ? 'left-5' : 'left-0.5',
-                            )}
-                          />
-                        </button>
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        Asset class
+                      </p>
+                      <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                        Har class ke thresholds aur episode rules alag save
+                        hote hain. ETFs Stocks ke bands share karti hain.
+                      </p>
+                      <div
+                        className="mt-2 flex w-full flex-wrap gap-1 rounded-xl border border-border bg-muted/40 p-1"
+                        role="tablist"
+                        aria-label="Settings asset class"
+                      >
+                        {ASSET_CLASS_TABS.map((tab) => {
+                          const active = settingsAssetClass === tab.id
+                          const Icon = tab.Icon
+                          return (
+                            <button
+                              key={tab.id}
+                              type="button"
+                              role="tab"
+                              aria-selected={active}
+                              onClick={() => selectSettingsAssetClass(tab.id)}
+                              className={cn(
+                                'inline-flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-colors',
+                                active
+                                  ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+                                  : 'text-muted-foreground hover:text-foreground',
+                              )}
+                            >
+                              <Icon className="size-3.5 shrink-0" strokeWidth={1.75} />
+                              <span className="truncate">{tab.label}</span>
+                            </button>
+                          )
+                        })}
                       </div>
                     </div>
 
@@ -12125,12 +15127,12 @@ export function EpisodeDashboard({
                     <div>
                       <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                         1 · Rolling-return thresholds ·{' '}
-                        {ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
+                        {ASSET_CLASS_TABS.find((t) => t.id === settingsAssetClass)
                           ?.label || 'Stocks'}
                       </p>
                       <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
                         |move %| needed to start / keep an episode on each
-                        window. Auto-saves per asset class. Blank / 0 = off.
+                        window. Click Save to apply. Blank / 0 = off.
                       </p>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
@@ -12160,12 +15162,12 @@ export function EpisodeDashboard({
                     <div>
                       <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                         2 · Episode rules ·{' '}
-                        {ASSET_CLASS_TABS.find((t) => t.id === assetClassTab)
+                        {ASSET_CLASS_TABS.find((t) => t.id === settingsAssetClass)
                           ?.label || 'Stocks'}
                       </p>
                       <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
                         Acceleration, giveback (weakening), inactivity, re-arm.
-                        Auto-saves per asset class (stocks ≠ commodities ≠ crypto).
+                        Click Save to apply (stocks ≠ commodities ≠ crypto).
                       </p>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -12399,13 +15401,12 @@ export function EpisodeDashboard({
                           className="h-8 w-full justify-start gap-2 px-2"
                           onClick={() => {
                             closeThresholdSettings()
-                            onOpenInTrigger(
-                              displayTicker,
-                              activeTab?.label || displayTicker,
-                            )
+                            onOpenInTrigger(displayTicker, {
+                              label: activeTab?.label || displayTicker,
+                            })
                           }}
                         >
-                          <ExternalLink className="size-3.5" />
+                          <ArrowUpRight className="size-3.5" />
                           Open {displayTicker} in Trigger
                         </Button>
                       </>
@@ -12423,27 +15424,43 @@ export function EpisodeDashboard({
                           : 'text-muted-foreground',
                     )}
                   >
-                    {thresholdSaving || thresholdSaveState === 'saving' ? (
+                    {thresholdSaving ||
+                    policySaving ||
+                    thresholdSaveState === 'saving' ||
+                    policySaveState === 'saving' ? (
                       <>
                         <Loader2 className="size-3 animate-spin" />
                         Saving…
                       </>
-                    ) : thresholdSaveState === 'saved' ? (
+                    ) : thresholdSaveState === 'error' ||
+                      policySaveState === 'error' ? (
+                      'Save failed — try again'
+                    ) : thresholdSaveState === 'saved' ||
+                      policySaveState === 'saved' ? (
                       <>
                         <Check className="size-3" strokeWidth={2.5} />
                         Saved to Supabase
                       </>
-                    ) : thresholdSaveState === 'error' ? (
-                      'Save failed — try again'
                     ) : (
-                      'Changes save automatically'
+                      'Unsaved — click Save'
                     )}
                   </span>
                   <Button
                     type="button"
+                    size="sm"
+                    className="ml-auto gap-1.5"
+                    disabled={thresholdSaving || policySaving}
+                    onClick={() => void saveSettingsNow()}
+                  >
+                    {thresholdSaving || policySaving ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : null}
+                    Save
+                  </Button>
+                  <Button
+                    type="button"
                     variant="outline"
                     size="sm"
-                    className="ml-auto"
                     onClick={closeThresholdSettings}
                   >
                     Close
@@ -12565,8 +15582,16 @@ export function EpisodeDashboard({
                           // Active = expanded by default; past episodes collapsed.
                           const isExpanded =
                             episodeExpanded[group.id] ?? isActive
+                          const supabaseUrl = supabaseEpisodeRecordUrl(
+                            group.episodeId ||
+                              (matchesLive ? episode?.episodeId : null),
+                            {
+                              ticker: displayTicker,
+                              assetClass: activeAssetClass,
+                            },
+                          )
                           return (
-                            <div key={group.id} className="min-w-0">
+                            <div key={group.id} className="relative min-w-0">
                               {/* Episode parent pill — direction + live V1 state */}
                               <div
                                 role="button"
@@ -12587,13 +15612,39 @@ export function EpisodeDashboard({
                                   }
                                 }}
                                 className={cn(
-                                  'flex cursor-pointer items-start gap-2.5 rounded-xl px-2.5 py-2 transition-colors',
+                                  'relative flex cursor-pointer items-start gap-2.5 rounded-xl px-2.5 py-2 pr-9 transition-colors',
                                   isActive
                                     ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
                                     : 'text-foreground/90 hover:bg-muted/40',
                                   !isExpanded && !isActive && 'opacity-90',
                                 )}
                               >
+                                {supabaseUrl ? (
+                                  <button
+                                    type="button"
+                                    className="absolute right-1.5 top-1.5 inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                                    title="Open Supabase SQL: episode + events + research"
+                                    aria-label="Open episode bundle in Supabase SQL editor"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      e.preventDefault()
+                                      void openEpisodeInSupabaseDashboard({
+                                        episodeId:
+                                          group.episodeId ||
+                                          (matchesLive
+                                            ? episode?.episodeId
+                                            : null),
+                                        ticker: displayTicker,
+                                        assetClass: activeAssetClass,
+                                      })
+                                    }}
+                                  >
+                                    <ArrowUpRight
+                                      className="size-3.5"
+                                      strokeWidth={2}
+                                    />
+                                  </button>
+                                ) : null}
                                 <span
                                   className={cn(
                                     'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg',
@@ -12813,6 +15864,42 @@ export function EpisodeDashboard({
                                         ) : null}
                                       </span>
                                     )}
+                                    {canEndEpisode ? (
+                                      <button
+                                        type="button"
+                                        disabled={
+                                          endingEpisode || !!deletingEpisodeId
+                                        }
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          e.preventDefault()
+                                          void endActiveEpisode({
+                                            ticker: displayTicker,
+                                            direction: group.direction,
+                                            peakMovePercent:
+                                              group.peakMovePercent ??
+                                              (matchesLive
+                                                ? episode?.peakMovePercent
+                                                : null),
+                                          })
+                                        }}
+                                        onPointerDown={(e) =>
+                                          e.stopPropagation()
+                                        }
+                                        title="Manually end this episode (no push)"
+                                        aria-label="End episode"
+                                        className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-rose-700 transition-colors hover:bg-rose-500/10 hover:text-rose-800 disabled:opacity-50 dark:text-rose-400"
+                                      >
+                                        {endingEpisode ? (
+                                          <Loader2 className="size-3 animate-spin" />
+                                        ) : (
+                                          <X
+                                            className="size-3"
+                                            strokeWidth={2.25}
+                                          />
+                                        )}
+                                      </button>
+                                    ) : null}
                                     {groupPersist ? (
                                       <SupabasePersistBadge persist={groupPersist} />
                                     ) : null}
@@ -12843,44 +15930,6 @@ export function EpisodeDashboard({
                                             strokeWidth={2}
                                           />
                                           Edit
-                                        </Button>
-                                      ) : null}
-                                      {canEndEpisode ? (
-                                        <Button
-                                          type="button"
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={
-                                            endingEpisode || !!deletingEpisodeId
-                                          }
-                                          onClick={(e) => {
-                                            e.stopPropagation()
-                                            e.preventDefault()
-                                            void endActiveEpisode({
-                                              ticker: displayTicker,
-                                              direction: group.direction,
-                                              peakMovePercent:
-                                                group.peakMovePercent ??
-                                                (matchesLive
-                                                  ? episode?.peakMovePercent
-                                                  : null),
-                                            })
-                                          }}
-                                          onPointerDown={(e) =>
-                                            e.stopPropagation()
-                                          }
-                                          title="Manually end this episode (no push)"
-                                          className="h-6 shrink-0 gap-1 rounded-full px-2 text-[10px] font-semibold text-rose-700 hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-800 dark:text-rose-400"
-                                        >
-                                          {endingEpisode ? (
-                                            <Loader2 className="size-3 animate-spin" />
-                                          ) : (
-                                            <X
-                                              className="size-3"
-                                              strokeWidth={2}
-                                            />
-                                          )}
-                                          End
                                         </Button>
                                       ) : null}
                                       {group.episodeId ? (
@@ -12920,26 +15969,9 @@ export function EpisodeDashboard({
                                     </span>
                                   </div>
                                   <p className="mt-0.5 text-[11px] text-muted-foreground">
-                                    {episodeLabel ? `${episodeLabel} · ` : ''}
-                                    <span
-                                      className={cn(
-                                        'font-semibold',
-                                        isActive
-                                          ? 'text-emerald-700 dark:text-emerald-400'
-                                          : 'text-muted-foreground',
-                                      )}
-                                    >
-                                      {isActive ? 'Active' : 'Ended'}
+                                    <span className="font-medium">
+                                      {group.window || '—'}
                                     </span>
-                                    {isActive && liveStateLabel
-                                      ? ` · ${liveStateLabel}`
-                                      : !isActive &&
-                                          liveStateLabel &&
-                                          liveStateLabel !== 'Ended'
-                                        ? ` · ${liveStateLabel}`
-                                        : ''}
-                                    {' · '}
-                                    {group.window}
                                     {sessionDateLabel(group.marketSession) &&
                                     sessionDateLabel(group.marketSession) !==
                                       'regular'
@@ -12953,7 +15985,7 @@ export function EpisodeDashboard({
                                     {group.endedAt
                                       ? ` → ${fmtEpisodeWhen(group.endedAt, group.marketSession)}`
                                       : ''}
-                                    {' · peak '}
+                                    {' · Peak '}
                                     <Tooltip>
                                       <TooltipTrigger asChild>
                                         <span
@@ -12997,6 +16029,57 @@ export function EpisodeDashboard({
                                         />
                                       </CalcTooltipContent>
                                     </Tooltip>
+                                    {isLiveFocus &&
+                                    episode?.currentMovePercent != null ? (
+                                      <>
+                                        {' · Now '}
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <span
+                                              className={cn(
+                                                'cursor-help font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/50 underline-offset-2',
+                                                pctColor(
+                                                  episode.currentMovePercent,
+                                                ),
+                                              )}
+                                              onClick={(e) =>
+                                                e.stopPropagation()
+                                              }
+                                            >
+                                              {fmtPct(
+                                                episode.currentMovePercent,
+                                              )}
+                                            </span>
+                                          </TooltipTrigger>
+                                          <CalcTooltipContent side="bottom">
+                                            <EpisodeListMoveCalcBody
+                                              row={{
+                                                ticker: displayTicker,
+                                                direction: group.direction,
+                                                referencePrice:
+                                                  episode.referencePrice ??
+                                                  null,
+                                                peakPrice:
+                                                  episode.peakPrice ?? null,
+                                                troughPrice:
+                                                  episode.troughPrice ?? null,
+                                                currentPrice:
+                                                  episode.currentPrice ?? null,
+                                                peakMovePercent:
+                                                  episode.peakMovePercent ??
+                                                  group.peakMovePercent,
+                                                currentMovePercent:
+                                                  episode.currentMovePercent,
+                                              }}
+                                              shownMove={
+                                                episode.currentMovePercent
+                                              }
+                                              shownKind="current"
+                                            />
+                                          </CalcTooltipContent>
+                                        </Tooltip>
+                                      </>
+                                    ) : null}
                                     {(() => {
                                       // Only real pushes (accel auto / manual start alert) — not episode start stamp
                                       const fromEvents = [...group.events]
@@ -13036,17 +16119,6 @@ export function EpisodeDashboard({
                                       )
                                     })()}
                                   </p>
-                                  {isExpanded ? (
-                                    <EpisodeExplainCollapse
-                                      group={group}
-                                      accelPoints={
-                                        status?.config?.accelerationPoints
-                                      }
-                                      inactivityMinutes={
-                                        status?.config?.inactivityMinutes
-                                      }
-                                    />
-                                  ) : null}
                                 </div>
                                 <span className="mt-1.5 flex shrink-0 flex-col items-center gap-1">
                                   {isActive ? (
@@ -13060,323 +16132,25 @@ export function EpisodeDashboard({
                                 </span>
                               </div>
 
-                              {/* Story timeline oldest→newest — full step-by-step when expanded */}
                               {isExpanded && group.events.length > 0 ? (
-                                <ul className="relative ml-5 mt-0.5 border-l border-border/80">
-                                  {(() => {
-                                    const storySteps = buildTimelineSteps(
-                                      group.events,
-                                    )
-                                    return (
-                                      <>
-                                  <li className="relative py-0.5">
-                                    <span
-                                      className={cn(
-                                        'absolute -left-px top-[0.85rem] h-px w-3',
-                                        isActive
-                                          ? 'bg-emerald-500/50'
-                                          : 'bg-border/80',
-                                      )}
-                                      aria-hidden
-                                    />
-                                    <p
-                                      className={cn(
-                                        'ml-3 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide',
-                                        isActive
-                                          ? 'text-emerald-700 dark:text-emerald-400'
-                                          : 'text-muted-foreground',
-                                      )}
-                                    >
-                                      How this move built ·{' '}
-                                      {isActive ? 'Active' : 'Ended'} ·{' '}
-                                      {storySteps.length} steps
-                                    </p>
-                                  </li>
-                                  {storySteps.map((step) => {
-                                      if (step.kind === 'backend') {
-                                        const { ev, label, isStateOnly } = step
-                                        return (
-                                          <li
-                                            key={step.id}
-                                            className="relative py-0.5"
-                                          >
-                                            <span
-                                              className="absolute -left-px top-[1.05rem] h-px w-3 bg-border/80"
-                                              aria-hidden
-                                            />
-                                            <button
-                                              type="button"
-                                              onClick={() =>
-                                                setTimelineDetail({
-                                                  kind: 'event',
-                                                  at: ev.detectedAt,
-                                                  ev,
-                                                })
-                                              }
-                                              className="ml-3 w-[calc(100%-0.75rem)] min-w-0 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-background/80"
-                                              title="Event detail"
-                                            >
-                                              <div className="flex min-w-0 items-baseline gap-x-1.5 gap-y-0.5">
-                                                <span
-                                                  className={cn(
-                                                    'min-w-0 text-[12px] font-medium leading-snug',
-                                                    isStateOnly
-                                                      ? 'text-muted-foreground'
-                                                      : 'text-foreground/90',
-                                                  )}
-                                                >
-                                                  {label}
-                                                </span>
-                                                <SupabasePersistBadge
-                                                  persist={eventPersistStamp(ev)}
-                                                />
-                                                {!isStateOnly ||
-                                                Number.isFinite(
-                                                  ev.movePercent,
-                                                ) ? (
-                                                  <Tooltip>
-                                                    <TooltipTrigger asChild>
-                                                      <span
-                                                        className={cn(
-                                                          'ml-auto shrink-0 cursor-help text-[12px] font-semibold tabular-nums underline decoration-dotted decoration-muted-foreground/40 underline-offset-2',
-                                                          ev.direction === 'UP'
-                                                            ? 'text-emerald-600'
-                                                            : 'text-rose-600',
-                                                        )}
-                                                        onClick={(e) =>
-                                                          e.stopPropagation()
-                                                        }
-                                                      >
-                                                        {ev.direction}{' '}
-                                                        {fmtPct(ev.movePercent)}
-                                                      </span>
-                                                    </TooltipTrigger>
-                                                    <CalcTooltipContent side="left">
-                                                      <EventMoveCalcBody
-                                                        ev={ev}
-                                                        liveEpisode={
-                                                          matchesLive
-                                                            ? episode
-                                                            : null
-                                                        }
-                                                        assetClass={
-                                                          activeAssetClass
-                                                        }
-                                                        currency={quoteCurrency}
-                                                      />
-                                                    </CalcTooltipContent>
-                                                  </Tooltip>
-                                                ) : null}
-                                              </div>
-                                              <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                                {fmtEpisodeWhen(
-                                                  ev.detectedAt,
-                                                  ev.marketSession ||
-                                                    group.marketSession,
-                                                )}
-                                                {ev.price != null
-                                                  ? ` · ${fmtPrice(ev.price, activeAssetClass, quoteCurrency)}`
-                                                  : ''}
-                                              </p>
-                                            </button>
-                                          </li>
-                                        )
-                                      }
-
-                                      if (step.kind === 'perplexity') {
-                                        const running =
-                                          String(
-                                            step.research.status || '',
-                                          ).toLowerCase() === 'running'
-                                        const failed =
-                                          String(
-                                            step.research.status || '',
-                                          ).toLowerCase() === 'error' ||
-                                          Boolean(step.research.error)
-                                        const driver =
-                                          step.research.likely_driver ||
-                                          step.research.reason ||
-                                          ''
-                                        const preview = running
-                                          ? 'Researching likely driver…'
-                                          : String(driver).length > 72
-                                            ? `${String(driver).slice(0, 72)}…`
-                                            : driver
-                                        return (
-                                          <li
-                                            key={step.id}
-                                            className="relative py-0.5"
-                                          >
-                                            <span
-                                              className={cn(
-                                                'absolute -left-px top-[1.05rem] h-px w-3',
-                                                running
-                                                  ? 'bg-violet-500/70'
-                                                  : 'bg-violet-500/45',
-                                              )}
-                                              aria-hidden
-                                            />
-                                            <button
-                                              type="button"
-                                              onClick={() => {
-                                                if (running) return
-                                                setTimelineDetail({
-                                                  kind: 'perplexity',
-                                                  at: step.at,
-                                                  research: step.research,
-                                                  ev: step.ev,
-                                                })
-                                              }}
-                                              className={cn(
-                                                'ml-3 w-[calc(100%-0.75rem)] min-w-0 rounded-lg px-2 py-1.5 text-left transition-colors',
-                                                running
-                                                  ? 'sndk-research-running ring-1 ring-violet-500/40'
-                                                  : 'hover:bg-violet-500/10',
-                                              )}
-                                              title={
-                                                running
-                                                  ? 'Perplexity is running…'
-                                                  : 'View full Perplexity reason'
-                                              }
-                                              disabled={running}
-                                            >
-                                              <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
-                                                {running ? (
-                                                  <Loader2 className="size-3 shrink-0 animate-spin text-violet-700 dark:text-violet-300" />
-                                                ) : (
-                                                  <PerplexityLogo className="size-3 shrink-0" />
-                                                )}
-                                                <span className="text-[12px] font-medium leading-snug text-violet-800 dark:text-violet-300">
-                                                  {running
-                                                    ? 'Perplexity running'
-                                                    : failed
-                                                      ? 'Perplexity failed'
-                                                      : 'Perplexity done'}
-                                                </span>
-                                                <span
-                                                  className={cn(
-                                                    'rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide',
-                                                    running
-                                                      ? 'bg-violet-500/25 text-violet-900 dark:text-violet-200'
-                                                      : 'bg-violet-500/15 text-violet-800 dark:text-violet-300',
-                                                  )}
-                                                >
-                                                  {running
-                                                    ? 'live'
-                                                    : failed
-                                                      ? 'error'
-                                                      : 'research'}
-                                                </span>
-                                                <SupabasePersistBadge
-                                                  persist={eventPersistStamp(step.ev)}
-                                                />
-                                              </div>
-                                              <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                                <span className="tabular-nums">
-                                                  {fmtEpisodeWhen(
-                                                    step.at,
-                                                    step.ev?.marketSession ||
-                                                      group.marketSession,
-                                                  )}
-                                                </span>
-                                                {preview
-                                                  ? ` · ${preview}`
-                                                  : ''}
-                                              </p>
-                                            </button>
-                                          </li>
-                                        )
-                                      }
-
-                                      // alert
-                                      const title =
-                                        step.notification?.title ||
-                                        'Push notification'
-                                      const titlePreview =
-                                        title.length > 56
-                                          ? `${title.slice(0, 56)}…`
-                                          : title
-                                      return (
-                                        <li
-                                          key={step.id}
-                                          className="relative py-0.5"
-                                        >
-                                          <span
-                                            className="absolute -left-px top-[1.05rem] h-px w-3 bg-sky-500/45"
-                                            aria-hidden
-                                          />
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              setTimelineDetail({
-                                                kind: 'alert',
-                                                at: step.at,
-                                                notification:
-                                                  step.notification,
-                                                ev: step.ev,
-                                              })
-                                            }
-                                            className="ml-3 w-[calc(100%-0.75rem)] min-w-0 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-sky-500/10"
-                                            title="View exact alert that was sent"
-                                          >
-                                            <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
-                                              <span className="text-[12px] font-medium leading-snug text-sky-800 dark:text-sky-300">
-                                                Alert sent
-                                              </span>
-                                              <span className="rounded bg-sky-500/15 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-sky-800 dark:text-sky-300">
-                                                push
-                                              </span>
-                                              <SupabasePersistBadge
-                                                persist={eventPersistStamp(step.ev)}
-                                              />
-                                            </div>
-                                            <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                              <span className="tabular-nums">
-                                                {fmtEpisodeWhen(
-                                                  step.at,
-                                                  step.ev?.marketSession ||
-                                                    group.marketSession,
-                                                )}
-                                              </span>
-                                              {titlePreview
-                                                ? ` · ${titlePreview}`
-                                                : ' · click for copy'}
-                                            </p>
-                                          </button>
-                                        </li>
-                                      )
-                                    })}
-                                      </>
-                                    )
-                                  })()}
-                                </ul>
+                                <div className="mt-2 rounded-xl border border-border/70 bg-background/60 px-2.5 py-2">
+                                  <EpisodeHowBuiltBlock
+                                    group={group}
+                                    assetClass={activeAssetClass}
+                                    currency={quoteCurrency}
+                                    liveEpisode={matchesLive ? episode : null}
+                                    matchesLive={matchesLive}
+                                    defaultOpen
+                                  />
+                                </div>
                               ) : isActive ? (
-                                <ul className="relative ml-5 mt-0.5 border-l border-emerald-500/30">
-                                  <li className="relative py-0.5">
-                                    <span
-                                      className="absolute -left-px top-[1.05rem] h-px w-3 bg-emerald-500/50"
-                                      aria-hidden
-                                    />
-                                    <div className="ml-3 min-w-0 px-2 py-1.5">
-                                      <p className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-                                        Active
-                                        {liveStateLabel
-                                          ? ` · ${liveStateLabel}`
-                                          : ''}
-                                        {group.events.length
-                                          ? ` · ${buildTimelineSteps(group.events).length} steps`
-                                          : ''}
-                                      </p>
-                                      <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                        Expand for full “how this move built”
-                                        step-by-step
-                                        {group.startedAt
-                                          ? ` · started ${fmtEpisodeWhen(group.startedAt, group.marketSession)}`
-                                          : ''}
-                                      </p>
-                                    </div>
-                                  </li>
-                                </ul>
+                                <p className="mt-1.5 px-1 text-[11px] text-muted-foreground">
+                                  Expand for how this move built
+                                  {liveStateLabel ? ` · ${liveStateLabel}` : ''}
+                                  {group.events.length
+                                    ? ` · ${buildTimelineSteps(group.events).length} steps`
+                                    : ''}
+                                </p>
                               ) : null}
                             </div>
                           )
@@ -13582,7 +16356,7 @@ export function EpisodeDashboard({
               </ScrollArea>
             )}
           </aside>
-        )}
+        )) : null}
           </div>
           {/* end detail + log row */}
         </div>
@@ -13607,7 +16381,7 @@ export function EpisodeDashboard({
           </button>
         </div>
 
-        <div className="flex items-center justify-center gap-2">
+        <div className="order-3 hidden items-center justify-end gap-2">
           <TooltipProvider delayDuration={200}>
           {/* Asset-class navigator pill */}
           <div
@@ -13713,97 +16487,6 @@ export function EpisodeDashboard({
                   Settings
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuCheckboxItem
-                  className="items-start gap-2 py-2"
-                  checked={testModeEnabled}
-                  disabled={testModeSaving}
-                  onCheckedChange={(checked) => {
-                    void toggleTestMode(Boolean(checked))
-                  }}
-                  onSelect={(e) => {
-                    // Keep menu open so user can see the toggle flip
-                    e.preventDefault()
-                  }}
-                  title={
-                    testModeEnabled
-                      ? `TEST ON\nPushes only to:\n${status?.config?.testMode?.alwaysNotify?.device_id || 'ios-d003c3d5-2c11-4766-866e-8bf8e511929c'}\n${status?.config?.testMode?.alwaysNotify?.expo_push_token || 'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'}\nPerplexity: dummy`
-                      : `TEST OFF\nPushes to: all ticker subscribers\n+ always:\n${status?.config?.testMode?.alwaysNotify?.device_id || 'ios-d003c3d5-2c11-4766-866e-8bf8e511929c'}\n${status?.config?.testMode?.alwaysNotify?.expo_push_token || 'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'}\nPerplexity: real API`
-                  }
-                >
-                  <span className="flex min-w-0 flex-1 flex-col gap-1 pr-1">
-                    <span className="text-[13px] font-medium">
-                      Test mode{testModeSaving ? '…' : ''}{' '}
-                      <span
-                        className={
-                          testModeEnabled
-                            ? 'text-amber-600 dark:text-amber-400'
-                            : 'text-emerald-700 dark:text-emerald-400'
-                        }
-                      >
-                        {testModeEnabled ? 'ON' : 'OFF'}
-                      </span>
-                    </span>
-                    {testModeEnabled ? (
-                      <>
-                        <span className="text-[10px] font-normal leading-snug text-muted-foreground">
-                          Pushes only to tester · Perplexity dummy
-                        </span>
-                        <span className="break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                          {status?.config?.testMode?.alwaysNotify?.device_id ||
-                            'ios-d003c3d5-2c11-4766-866e-8bf8e511929c'}
-                        </span>
-                        <span className="break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                          {status?.config?.testMode?.alwaysNotify
-                            ?.expo_push_token ||
-                            'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'}
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <span className="text-[10px] font-normal leading-snug text-muted-foreground">
-                          Pushes to all subscribers + always-notify · real
-                          Perplexity
-                        </span>
-                        <span className="text-[9px] font-medium text-muted-foreground">
-                          Always included:
-                        </span>
-                        <span className="break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                          {status?.config?.testMode?.alwaysNotify?.device_id ||
-                            'ios-d003c3d5-2c11-4766-866e-8bf8e511929c'}
-                        </span>
-                        <span className="break-all font-mono text-[9px] leading-snug text-muted-foreground">
-                          {status?.config?.testMode?.alwaysNotify
-                            ?.expo_push_token ||
-                            'ExponentPushToken[FmqQg-OgjuWt8hLmcQDJCF]'}
-                        </span>
-                      </>
-                    )}
-                  </span>
-                </DropdownMenuCheckboxItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="gap-2"
-                  onSelect={() => {
-                    openActiveEpisodesRail()
-                  }}
-                >
-                  <Activity className="size-3.5" strokeWidth={1.75} />
-                  <span className="flex-1">Active episodes</span>
-                  {activeEpisodesList.length > 0 ? (
-                    <span className="text-[10px] font-semibold tabular-nums text-muted-foreground">
-                      {activeEpisodesList.length}
-                    </span>
-                  ) : null}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="gap-2"
-                  onSelect={() => {
-                    openActivityLogInLogColumn()
-                  }}
-                >
-                  <Terminal className="size-3.5" strokeWidth={1.75} />
-                  Activity log
-                </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2"
                   onSelect={() => {
@@ -13815,16 +16498,10 @@ export function EpisodeDashboard({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2"
-                  onSelect={() => {
-                    window.open(
-                      '/docs/Trigger_Weekly_Market_Session_Cheat_Sheet_A4_Landscape.pdf',
-                      '_blank',
-                      'noopener,noreferrer',
-                    )
-                  }}
+                  onSelect={() => setPerplexityPromptsOpen(true)}
                 >
-                  <Clock className="size-3.5" strokeWidth={1.75} />
-                  Market sessions
+                  <ScrollText className="size-3.5" strokeWidth={1.75} />
+                  Perplexity prompts
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2 text-rose-700 focus:text-rose-700 dark:text-rose-300 dark:focus:text-rose-300"
@@ -13836,35 +16513,19 @@ export function EpisodeDashboard({
                   Clear Cache
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="gap-2" asChild>
-                  <a href="/momentum-studio">
-                    <LayoutDashboard className="size-3.5" strokeWidth={1.75} />
-                    Studio
-                  </a>
-                </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2"
                   onSelect={() => {
                     if (onOpenTriggerApp) onOpenTriggerApp()
                     else if (onOpenInTrigger) {
-                      onOpenInTrigger(
-                        displayTicker,
-                        activeTab?.label || displayTicker,
-                      )
+                      onOpenInTrigger(displayTicker, {
+                        label: activeTab?.label || displayTicker,
+                      })
                     }
                   }}
                 >
                   <Zap className="size-3.5" strokeWidth={1.75} />
-                  Trigger
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="gap-2"
-                  onSelect={() => onOpenNineAmApp?.()}
-                >
-                  <span className="inline-flex size-3.5 items-center justify-center text-[11px] font-bold leading-none">
-                    9
-                  </span>
-                  9AM
+                  Trigger dashboard
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -13895,7 +16556,7 @@ export function EpisodeDashboard({
         <button
           type="button"
           className={cn(
-            'flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-0 rounded-md px-1.5 py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring',
+            'order-2 flex min-w-0 flex-wrap items-center justify-center gap-x-2 gap-y-0 rounded-md px-2 py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring',
             marketStatusOpen && 'bg-muted/50 ring-1 ring-border',
           )}
           aria-label="Market sessions — hover for global exchange sessions"
@@ -13906,14 +16567,6 @@ export function EpisodeDashboard({
           onBlur={scheduleMarketStatusHoverClose}
           onClick={() => openMarketStatusFromHover()}
         >
-          <MarketStatusBadge
-            nowMs={nowMs}
-            className="text-[12px] gap-1.5"
-            yahooMarketState={
-              marketStatusRows.find((r) => r.id === 'us-stocks')?.marketState ??
-              null
-            }
-          />
           <div
             className="flex min-w-0 items-center gap-x-1.5 whitespace-nowrap text-[12px] tabular-nums leading-none"
             aria-label={`UK ${formatZoneHm(nowMs, 'Europe/London')}, US ${formatZoneHm(nowMs, 'America/New_York')}`}
@@ -13930,44 +16583,68 @@ export function EpisodeDashboard({
               {formatZoneHm(nowMs, 'America/New_York')}
             </span>
           </div>
+          <span
+            className="h-4 w-px shrink-0 bg-border"
+            aria-hidden
+          />
+          <MarketStatusBadge
+            nowMs={nowMs}
+            className="gap-1.5 text-[12px]"
+            yahooMarketState={
+              marketStatusRows.find((r) => r.id === 'us-stocks')?.marketState ??
+              null
+            }
+          />
         </button>
 
-        {/*
-          Right-rail market sessions (20vw). Stay open while hovering panel so
-          cards are clickable → Yahoo Finance quote for that probe symbol.
-        */}
+        {/* Centered market sessions over a full-screen blurred backdrop. */}
         {marketStatusOpen ? (
           <div
-            className="pointer-events-none fixed inset-0 z-[200] flex justify-end"
+            className="pointer-events-none fixed inset-0 z-[200] flex items-center justify-center p-4 sm:p-6"
             role="presentation"
           >
+            <div
+              className="absolute inset-0 bg-background/35 backdrop-blur-md"
+              aria-hidden
+            />
             <div
               data-market-sessions-panel
               role="dialog"
               aria-modal="false"
               aria-label="Market sessions"
-              className="pointer-events-auto flex h-full min-w-[14rem] flex-col overflow-hidden border-l border-border bg-popover/97 text-popover-foreground shadow-2xl backdrop-blur-md"
-              style={{ width: '20vw', maxWidth: '100%' }}
+              className="pointer-events-auto relative flex max-h-[min(82svh,48rem)] w-[min(94vw,68rem)] flex-col overflow-hidden rounded-2xl border border-border bg-popover/95 text-popover-foreground shadow-2xl ring-1 ring-foreground/10"
               onPointerEnter={cancelMarketStatusHoverClose}
               onPointerLeave={scheduleMarketStatusHoverClose}
             >
               <div className="shrink-0 border-b border-border px-4 py-3">
-                <div className="flex flex-wrap items-end justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold tracking-tight">
+                    <p className="text-base font-semibold tracking-tight">
                       Market sessions
                     </p>
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      Click a card → Yahoo Finance · hover to keep open
+                      Global session status · click a card for Yahoo Finance
                     </p>
                   </div>
-                  <p className="text-[10px] tabular-nums text-muted-foreground">
-                    {marketStatusRows.length} markets
-                    {marketStatusLoading ? ' · refreshing…' : ''}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-[10px] tabular-nums text-muted-foreground">
+                      {marketStatusRows.length} markets
+                      {marketStatusLoading ? ' · refreshing…' : ''}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => setMarketStatusOpen(false)}
+                      title="Close market sessions"
+                      aria-label="Close market sessions"
+                    >
+                      <X className="size-4" />
+                    </Button>
+                  </div>
                 </div>
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+              <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4 sm:py-4">
                 {marketStatusLoading && !marketStatusRows.length ? (
                   <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
                     <Loader2 className="size-3.5 animate-spin" />
@@ -13979,7 +16656,7 @@ export function EpisodeDashboard({
                     {marketStatusError}
                   </p>
                 ) : null}
-                <div className="grid grid-cols-1 gap-2">
+                <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
                   {marketStatusRows.map((row) => {
                     // Exact Yahoo marketState only (PREPRE / POST / CLOSED / …).
                     const session = row.marketState
@@ -14024,7 +16701,7 @@ export function EpisodeDashboard({
                               </p>
                             ) : null}
                           </div>
-                          <ExternalLink
+                          <ArrowUpRight
                             className="mt-0.5 size-3 shrink-0 text-muted-foreground/70"
                             strokeWidth={1.75}
                           />
@@ -14144,6 +16821,11 @@ export function EpisodeDashboard({
           </div>
         </DialogContent>
       </Dialog>
+
+      <PerplexityPromptsDialog
+        open={perplexityPromptsOpen}
+        onOpenChange={setPerplexityPromptsOpen}
+      />
 
       {/* ── Push composer · 3 columns: findings/prompt · preview · devices ── */}
       <Dialog
@@ -14970,6 +17652,12 @@ export function EpisodeDashboard({
                             active ? 'bg-muted' : 'hover:bg-muted/70',
                           )}
                         >
+                          <CompanyLogo
+                            ticker={symbol}
+                            companyName={name}
+                            size="sm"
+                            className="mt-0.5 size-8 bg-background"
+                          />
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span className="font-mono text-[13px] font-semibold tracking-tight text-foreground">
@@ -15168,7 +17856,7 @@ export function EpisodeDashboard({
                     className="mt-1 inline-flex items-center gap-1 font-semibold text-sky-700 underline-offset-2 hover:underline"
                   >
                     Open Perplexity API billing
-                    <ExternalLink className="size-3.5 opacity-70" />
+                    <ArrowUpRight className="size-3.5 opacity-70" />
                   </a>
                 </div>
 
@@ -15712,6 +18400,44 @@ export function EpisodeDashboard({
         </DialogContent>
       </Dialog>
 
+      {/* Exact Perplexity prompt used by the selected market bulletin. */}
+      <Dialog
+        open={deskBulletinPromptOpen}
+        onOpenChange={setDeskBulletinPromptOpen}
+      >
+        <DialogContent
+          showCloseButton
+          data-momentum-dashboard
+          className="max-h-[min(90dvh,46rem)] w-[min(100vw-1.5rem,48rem)] gap-0 overflow-hidden p-0 sm:max-w-3xl"
+        >
+          <DialogHeader className="shrink-0 border-b border-border px-5 py-4 pr-12 text-left">
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Info className="size-4 text-violet-600 dark:text-violet-300" />
+              Perplexity market-research prompt
+            </DialogTitle>
+            <DialogDescription className="text-[12px] text-muted-foreground">
+              {(() => {
+                const row = deskBulletinFocus || deskBulletins[0]
+                if (!row) return 'Exact prompt used for market research'
+                const market =
+                  String(row.market || '').toLowerCase() === 'india'
+                    ? 'India'
+                    : 'US'
+                return `${market} · ${String(row.slot || '').toUpperCase()} · ${row.session_date || '—'}`
+              })()}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            <pre className="whitespace-pre-wrap break-words rounded-xl border border-border bg-muted/35 p-4 font-mono text-[12px] leading-relaxed text-foreground">
+              {String(
+                (deskBulletinFocus || deskBulletins[0])?.perplexity_meta
+                  ?.prompt || 'Prompt unavailable for this bulletin.',
+              )}
+            </pre>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Timeline detail — exact alert copy or Perplexity reason */}
       <Dialog
         open={timelineDetail != null}
@@ -15838,8 +18564,8 @@ export function EpisodeDashboard({
                       {timelineDetail.ev.pushResult.source
                         ? ` · ${timelineDetail.ev.pushResult.source}`
                         : ''}
-                      {timelineDetail.ev.pushResult.forced_allowlist
-                        ? ' · allowlist'
+                      {timelineDetail.ev.pushResult.always_notify_included
+                        ? ' · always recipient included'
                         : ''}
                     </p>
                     {(() => {
@@ -15847,7 +18573,7 @@ export function EpisodeDashboard({
                         device_id?: string | null
                         expo_push_token?: string
                         expo_push_token_masked?: string
-                        forced?: boolean
+                        always_notify?: boolean
                         status?: string
                         error?: string | null
                       }
@@ -15908,7 +18634,7 @@ export function EpisodeDashboard({
                                   )}
                                 >
                                   {statusLabel}
-                                  {r.forced ? ' · forced' : ''}
+                                  {r.always_notify ? ' · always' : ''}
                                 </span>
                                 {r.error ? (
                                   <span className="mt-0.5 block text-rose-700 dark:text-rose-300">
@@ -15956,15 +18682,6 @@ export function EpisodeDashboard({
                   Yahoo Finance
                 </a>
               </YahooFinanceWithMarketState>
-              <a
-                href={perplexityFinanceQuoteUrl(displayTicker)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-[12px] font-medium text-foreground underline-offset-2 hover:underline"
-                title={`Open ${displayTicker} on Perplexity Finance`}
-              >
-                Perplexity Finance
-              </a>
             </div>
             <Button
               type="button"

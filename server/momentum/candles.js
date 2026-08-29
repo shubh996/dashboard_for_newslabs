@@ -43,6 +43,87 @@ export function isYahooRegularMarketState(marketState) {
   return s === 'REGULAR' || s === 'OPEN'
 }
 
+/** Yahoo timestamps may arrive as Date/ISO, epoch seconds, or epoch ms. */
+function yahooTimestampMs(value) {
+  if (value == null) return null
+  if (value instanceof Date) {
+    const ms = value.getTime()
+    return Number.isFinite(ms) ? ms : null
+  }
+  const numeric = Number(value)
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 10_000_000_000 ? numeric * 1000 : numeric
+  }
+  const parsed = Date.parse(String(value))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function flattenRegularPeriods(value) {
+  if (!value) return []
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => flattenRegularPeriods(entry))
+  }
+  if (typeof value !== 'object') return []
+  const startMs = yahooTimestampMs(value.start)
+  const endMs = yahooTimestampMs(value.end)
+  return startMs != null ? [{ startMs, endMs }] : []
+}
+
+/**
+ * Resolve Yahoo's current exchange-specific regular-session boundary.
+ * No exchange clock is hard-coded: NYSE, NSE, LSE, etc. use chart metadata.
+ *
+ * @param {Record<string, unknown>|null|undefined} chartMeta
+ * @param {number} [asOfMs]
+ * @returns {{ startMs: number, endMs: number|null }|null}
+ */
+export function resolveYahooRegularSessionBounds(chartMeta, asOfMs = Date.now()) {
+  const meta = chartMeta && typeof chartMeta === 'object' ? chartMeta : {}
+  const candidates = [
+    ...flattenRegularPeriods(meta.currentTradingPeriod?.regular),
+    ...flattenRegularPeriods(meta.tradingPeriods?.regular),
+  ]
+    .filter((period) => period.startMs <= asOfMs + 5 * 60_000)
+    .sort((a, b) => b.startMs - a.startMs)
+
+  if (!candidates.length) return null
+  const containing = candidates.find(
+    (period) => period.endMs == null || asOfMs < period.endMs + 5 * 60_000,
+  )
+  return containing || candidates[0]
+}
+
+/**
+ * Keep only prints from the current uninterrupted Yahoo REGULAR session.
+ * This is the hard boundary for non-crypto momentum lookbacks.
+ *
+ * @param {Candle[]} candles
+ * @param {Record<string, unknown>|null|undefined} chartMeta
+ * @param {number} [asOfMs]
+ */
+export function candlesInCurrentYahooRegularSession(
+  candles,
+  chartMeta,
+  asOfMs = Date.now(),
+) {
+  const bounds = resolveYahooRegularSessionBounds(chartMeta, asOfMs)
+  if (!bounds) {
+    return { candles: [], bounds: null, resolved: false }
+  }
+  const endMs = bounds.endMs != null ? Math.min(asOfMs, bounds.endMs) : asOfMs
+  return {
+    candles: (candles || []).filter(
+      (candle) =>
+        candle &&
+        Number.isFinite(candle.t) &&
+        candle.t >= bounds.startMs &&
+        candle.t <= endMs,
+    ),
+    bounds,
+    resolved: true,
+  }
+}
+
 /**
  * Map Yahoo `marketState` (+ ET clock fallback) to a short session code.
  * @param {string|null|undefined} marketState

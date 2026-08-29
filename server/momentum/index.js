@@ -62,18 +62,15 @@ export {
   isMarketBulletinEnabled,
   buildMarketBulletinTitle,
   buildMarketBulletinBody,
+  buildMarketSessionResearchPrompt,
   formatStockBracketPct,
   dueMarketBulletinSlots,
 } from './marketSessionBulletin.js'
 export {
-  isTestModeEnabled,
-  isTestModeForcedByEnv,
-  setTestModeEnabled,
-  getTestModeSnapshot,
   ALWAYS_NOTIFY_DEVICE,
-  ALWAYS_NOTIFY_DEVICES,
-  getAlwaysNotifyRecipients,
-  getTestModeAllowlistRecipients,
-  ensureAlwaysNotifyRecipients,
+  FEATURED_DEVICES,
+  ensureAlwaysNotifyRecipient,
   resolvePushRecipients,
-} from './testMode.js'
+  findFeaturedDevice,
+  getNotificationRecipientPolicySnapshot,
+} from './recipientPolicy.js'

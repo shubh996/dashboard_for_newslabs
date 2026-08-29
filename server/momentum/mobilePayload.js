@@ -42,26 +42,94 @@ export function calcGivebackRatio(ep, livePrice) {
   const dir = String(ep?.direction || 'UP').toUpperCase()
   if (ref == null || live == null) return null
   if (dir === 'DOWN') {
-    const trough = num(ep?.troughPrice ?? ep?.trough_price ?? live)
+    // Prefer real trough; fall back to live only for in-progress calc (never persist as trough).
+    const trough = extremePriceOrNull(ep?.troughPrice ?? ep?.trough_price) ?? live
     const drop = ref - trough
     if (!(drop > 0)) return 0
     return Math.max(0, (live - trough) / drop)
   }
-  const peak = num(ep?.peakPrice ?? ep?.peak_price ?? live)
+  const peak = extremePriceOrNull(ep?.peakPrice ?? ep?.peak_price) ?? live
   const gain = peak - ref
   if (!(gain > 0)) return 0
   return Math.max(0, (peak - live) / gain)
 }
 
+/** Valid market price for extremes — never persist 0 as a fake peak/trough. */
+function extremePriceOrNull(v) {
+  const n = num(v)
+  if (n == null || !(n > 0)) return null
+  return n
+}
+
 /**
- * Human calc explanation for mobile.
+ * Canonical momentum state labels persisted in events_episodes.state.
+ * Never research prose / notification copy.
+ */
+export const CANONICAL_EPISODE_STATES = new Set([
+  'STARTED',
+  'ACCELERATING',
+  'HOLDING',
+  'WEAKENING',
+  'STRONGLY_WEAKENING',
+  'RE_ACCELERATING',
+  'REVERSAL',
+  'ENDED',
+  'EXPIRED',
+])
+
+/**
+ * Map event → short canonical state for DB (or null).
+ * Does NOT fall back to reason (that was polluting RESEARCH_DONE.state).
+ */
+export function canonicalEventState(ev, episode = null) {
+  if (!ev || typeof ev !== 'object') return null
+  const type = String(ev.eventType || ev.event_type || '')
+    .trim()
+    .toUpperCase()
+  const raw = str(ev.state)
+  if (raw) {
+    const up = raw.toUpperCase()
+    if (CANONICAL_EPISODE_STATES.has(up)) return up
+    // Non-canonical (research prose, "RESEARCH", etc.) — ignore
+  }
+  if (type === 'MOMENTUM_STARTED' || type.endsWith('_STARTED')) return 'STARTED'
+  if (type === 'MOMENTUM_ACCELERATING') return 'ACCELERATING'
+  if (type === 'MOMENTUM_RE_ACCELERATING') return 'RE_ACCELERATING'
+  if (type === 'MOMENTUM_ENDED' || type === 'MOMENTUM_EXPIRED') {
+    return type === 'MOMENTUM_EXPIRED' ? 'EXPIRED' : 'ENDED'
+  }
+  if (
+    type === 'MOMENTUM_RESEARCH_DONE' ||
+    type === 'MOMENTUM_RESEARCH_RUNNING' ||
+    type === 'MOMENTUM_ALERT_SENT' ||
+    type.endsWith('_ALERT_SENT')
+  ) {
+    const fromEp = str(episode?.state || ev.episodeState)
+    if (fromEp && CANONICAL_EPISODE_STATES.has(fromEp.toUpperCase())) {
+      return fromEp.toUpperCase()
+    }
+    return null
+  }
+  return null
+}
+
+/**
+ * Human calc explanation for mobile / API (runtime).
+ * formulaLines stay here for display — do NOT persist to Supabase (see measureForPersist).
  */
 export function buildMeasureExplain(ep, livePrice, movePercent) {
   const dir = String(ep?.direction || 'UP').toUpperCase()
   const ref = num(ep?.referencePrice ?? ep?.reference_price)
   const live = num(livePrice ?? ep?.currentPrice)
-  const peak = num(ep?.peakPrice)
-  const trough = num(ep?.troughPrice)
+  // Direction-aware extremes: never invent the unused extreme as 0/live.
+  const peak =
+    dir === 'UP'
+      ? extremePriceOrNull(ep?.peakPrice ?? ep?.peak_price)
+      : null
+  const trough =
+    dir === 'DOWN'
+      ? extremePriceOrNull(ep?.troughPrice ?? ep?.trough_price)
+      : null
   const move = num(movePercent ?? ep?.currentMovePercent)
   const gb = calcGivebackRatio(ep, live)
   const exactLabel = str(ep?.exactLabel || ep?.exact_label)
@@ -106,6 +174,50 @@ export function buildMeasureExplain(ep, livePrice, movePercent) {
     peakMovePercent: num(ep?.peakMovePercent),
     direction: dir,
   }
+}
+
+/**
+ * Slim measure JSON for Supabase events_episodes.measure.
+ * Queryable scalars live in columns — only keep extremes useful for debugging.
+ * Never persist formulaLines or duplicated price/move/reference fields.
+ *
+ * @param {Record<string, unknown>|null|undefined} measure
+ * @param {Record<string, unknown>|null|undefined} [ev]
+ * @returns {Record<string, number|null>|null}
+ */
+export function measureForPersist(measure, ev = null) {
+  const type = String(ev?.eventType || ev?.event_type || '')
+    .trim()
+    .toUpperCase()
+  // Research / alert history should not re-copy measurement snapshots.
+  if (
+    type === 'MOMENTUM_RESEARCH_DONE' ||
+    type === 'MOMENTUM_RESEARCH_RUNNING' ||
+    type === 'MOMENTUM_ALERT_SENT' ||
+    type.endsWith('_ALERT_SENT')
+  ) {
+    return null
+  }
+  const src =
+    measure && typeof measure === 'object'
+      ? measure
+      : ev && typeof ev === 'object'
+        ? ev
+        : null
+  if (!src) return null
+  const dir = String(src.direction || ev?.direction || 'UP').toUpperCase()
+  const peak = extremePriceOrNull(src.peakPrice ?? src.peak_price)
+  const trough = extremePriceOrNull(src.troughPrice ?? src.trough_price)
+  const peakMove = num(src.peakMovePercent ?? src.peak_move_percent)
+  const out = {
+    peakPrice: dir === 'UP' ? peak : null,
+    troughPrice: dir === 'DOWN' ? trough : null,
+    peakMovePercent: peakMove,
+  }
+  if (out.peakPrice == null && out.troughPrice == null && out.peakMovePercent == null) {
+    return null
+  }
+  return out
 }
 
 /**
@@ -191,7 +303,7 @@ export function buildMobileEpisodePayload(ep) {
 }
 
 /**
- * Full timeline event for mobile (stored in episodes_events.payload).
+ * Full timeline event for mobile (stored in events_episodes.payload).
  * @param {Record<string, unknown>} ev
  * @param {Record<string, unknown>|null} [episode]
  */
@@ -260,7 +372,8 @@ export function buildMobileEventPayload(ev, episode = null) {
     schemaVersion: 2,
     // Core event
     eventType: str(ev.eventType || ev.event_type),
-    state: str(ev.state || ev.reason),
+    // Canonical state only — never fall back to reason (research prose).
+    state: canonicalEventState(ev, ep),
     previousState: str(ev.previousState),
     reason: str(ev.reason),
     shouldNotify: Boolean(ev.shouldNotify),

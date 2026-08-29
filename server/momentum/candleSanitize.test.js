@@ -6,7 +6,9 @@ import assert from 'node:assert/strict'
 import {
   sanitizeMomentumCandles,
   candleAtOrBefore,
+  candlesInCurrentYahooRegularSession,
   isYahooRegularMarketState,
+  resolveYahooRegularSessionBounds,
 } from './candles.js'
 import { computeRollingReturns } from './returns.js'
 
@@ -76,5 +78,66 @@ describe('isYahooRegularMarketState', () => {
     assert.equal(isYahooRegularMarketState('PRE'), false)
     assert.equal(isYahooRegularMarketState('PREPRE'), false)
     assert.equal(isYahooRegularMarketState('CLOSED'), false)
+  })
+})
+
+describe('Yahoo regular-session rolling boundary', () => {
+  it('keeps only the current regular session and rejects pre-market lookbacks', () => {
+    const regularStart = Date.parse('2026-08-24T13:30:00.000Z') // 09:30 EDT
+    const asOf = Date.parse('2026-08-24T13:40:00.000Z')
+    const regularEnd = Date.parse('2026-08-24T20:00:00.000Z')
+    const candles = []
+
+    // Pre-market prints that must never become a regular-hours reference.
+    for (let i = 0; i < 10; i += 1) {
+      candles.push({
+        t: regularStart - (10 - i) * 60_000,
+        close: 95 + i * 0.1,
+      })
+    }
+    // 09:30 through 09:40 regular prints.
+    for (let i = 0; i <= 10; i += 1) {
+      candles.push({ t: regularStart + i * 60_000, close: 100 + i * 0.3 })
+    }
+
+    const meta = {
+      currentTradingPeriod: {
+        regular: {
+          start: regularStart / 1000,
+          end: regularEnd / 1000,
+        },
+      },
+    }
+    const bounds = resolveYahooRegularSessionBounds(meta, asOf)
+    assert.deepEqual(bounds, { startMs: regularStart, endMs: regularEnd })
+
+    const sliced = candlesInCurrentYahooRegularSession(candles, meta, asOf)
+    assert.equal(sliced.resolved, true)
+    assert.equal(sliced.candles.length, 11)
+    assert.equal(sliced.candles[0].t, regularStart)
+
+    const { returns, referenceTimes } = computeRollingReturns(
+      sliced.candles,
+      103,
+      asOf,
+      null,
+    )
+    assert.ok(returns['5m'] != null)
+    assert.ok(returns['10m'] != null)
+    assert.equal(returns['15m'], null)
+    assert.equal(returns['60m'], null)
+    assert.equal(returns['16h'], null)
+    assert.equal(returns.day, null)
+    assert.equal(referenceTimes['10m'], new Date(regularStart).toISOString())
+  })
+
+  it('fails closed when Yahoo regular-session metadata is missing', () => {
+    const sliced = candlesInCurrentYahooRegularSession(
+      [{ t: Date.now(), close: 100 }],
+      {},
+      Date.now(),
+    )
+    assert.equal(sliced.resolved, false)
+    assert.deepEqual(sliced.candles, [])
   })
 })

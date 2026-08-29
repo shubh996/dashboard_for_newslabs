@@ -13,7 +13,10 @@
  * Legacy SNDK paths still work: /sndk, /sndk/tick, …
  */
 import express from 'express'
-import { listWatchlistSubscribers } from '../notifications.js'
+import {
+  fetchDeviceMonitorRows,
+  listWatchlistSubscribers,
+} from '../notifications.js'
 import {
   MOMENTUM_POLL_MS,
   MOMENTUM_THRESHOLDS,
@@ -45,16 +48,17 @@ import {
   deleteEpisodeEvent,
   loadResearchById,
   loadResearchByEpisodeId,
+  episodeTableFor,
 } from './persist.js'
 import * as store from './store.js'
 import {
   EPISODE_REARM_BUFFER_PP,
   getThresholdForKey,
-  isMomentumDummyResearchMode,
 } from './config.js'
-import { getTestModeSnapshot, setTestModeEnabled } from './testMode.js'
+import { getNotificationRecipientPolicySnapshot } from './recipientPolicy.js'
 import { createClient } from '@supabase/supabase-js'
 import { buildMarketStatusPopup } from './marketStatusPopup.js'
+import { rerunResearchForEpisode } from './autoStartAlert.js'
 import { evaluateSymbolGate } from './engineGate.js'
 
 function getSupabaseForMonitoredTickers() {
@@ -93,8 +97,7 @@ function configPayload(statusLike = null) {
     pollIntervalMs: MOMENTUM_POLL_MS,
     showBridgeWindows: shouldShowBridgeWindows(asOf, session),
     visibleReturnKeys: getVisibleReturnKeys(asOf, session),
-    testMode: getTestModeSnapshot(),
-    dummyResearch: isMomentumDummyResearchMode(),
+    notificationRecipients: getNotificationRecipientPolicySnapshot(),
   }
 }
 
@@ -215,6 +218,39 @@ export function createMomentumRouter() {
     next()
   })
 
+  /** Latest recorded push audience for an episode while delivery detail is in memory. */
+  function episodeNotificationRecipientCount(ep, ticker) {
+    const direct =
+      ep?.notificationRecipientCount ??
+      ep?.notification_recipient_count ??
+      ep?.recipientCount ??
+      ep?.recipient_count
+    if (direct != null && Number.isFinite(Number(direct))) {
+      return Math.max(0, Math.floor(Number(direct)))
+    }
+    const episodeId = String(ep?.episodeId || ep?.episode_id || '').trim()
+    if (!episodeId) return null
+    const events = store
+      .listEvents(ticker, 400)
+      .filter(
+        (event) =>
+          String(event?.episodeId || event?.episode_id || '').trim() ===
+          episodeId,
+      )
+      .sort(
+        (a, b) =>
+          (Date.parse(String(b?.notifiedAt || b?.detectedAt || '')) || 0) -
+          (Date.parse(String(a?.notifiedAt || a?.detectedAt || '')) || 0),
+      )
+    for (const event of events) {
+      const count = event?.pushResult?.recipient_count
+      if (count != null && Number.isFinite(Number(count))) {
+        return Math.max(0, Math.floor(Number(count)))
+      }
+    }
+    return null
+  }
+
   /** Compact ACTIVE episode payload for overview / Active Episodes rail */
   function activeEpisodeSummary(ep, ticker) {
     if (!ep || String(ep.status || '').toUpperCase() !== 'ACTIVE') return null
@@ -250,6 +286,10 @@ export function createMomentumRouter() {
       peakPrice: ep.peakPrice != null ? Number(ep.peakPrice) : null,
       troughPrice: ep.troughPrice != null ? Number(ep.troughPrice) : null,
       episodeStartedAt: ep.episodeStartedAt || ep.triggerTime || null,
+      notificationRecipientCount: episodeNotificationRecipientCount(
+        ep,
+        ticker || ep.ticker,
+      ),
       exactMinutes: ep.exactMinutes ?? null,
       exactLabel: ep.exactLabel || null,
       marketSession: ep.marketSession || null,
@@ -350,10 +390,18 @@ export function createMomentumRouter() {
     if (!ep) return null
     const status = String(ep.status || '').toUpperCase() || 'UNKNOWN'
     const persist = ep.supabasePersist || null
+    const sourceTable =
+      ep.sourceTable ||
+      ep.source_table ||
+      episodeTableFor(ticker || ep.ticker, ep.assetClass || ep.asset_class)
+    const sourceRowId =
+      ep.sourceRowId || ep.source_row_id || ep.episodeId || ep.episode_id || null
     return {
       ticker: String(ticker || ep.ticker || '').toUpperCase(),
       episodeId: ep.episodeId || ep.episode_id || null,
       episodeNo: ep.episodeNo ?? ep.episode_no ?? null,
+      sourceTable,
+      sourceRowId,
       direction: ep.direction === 'DOWN' ? 'DOWN' : 'UP',
       status,
       state: ep.state || null,
@@ -376,6 +424,10 @@ export function createMomentumRouter() {
       peakPrice: ep.peakPrice != null ? Number(ep.peakPrice) : null,
       troughPrice: ep.troughPrice != null ? Number(ep.troughPrice) : null,
       episodeStartedAt: ep.episodeStartedAt || ep.triggerTime || null,
+      notificationRecipientCount: episodeNotificationRecipientCount(
+        ep,
+        ticker || ep.ticker,
+      ),
       endedAt: ep.endedAt || ep.ended_at || null,
       exactLabel: ep.exactLabel || null,
       marketSession: ep.marketSession || null,
@@ -496,7 +548,8 @@ export function createMomentumRouter() {
 
   /**
    * Watchlist source of truth: tickers users consciously monitor in the Trigger app.
-   * From device_monitor where subscribers[] has enabled entries.
+   * From device monitor tables (assets_monitor_based_on_device + legacy fallbacks)
+   * where subscribers[] has enabled entries.
    * Categorized by asset class for Stocks / ETFs / Indices / Forex / Crypto / Commodities tabs.
    *
    * GET /api/momentum/monitored-tickers?assetClass=equity|etf|index|forex|crypto|commodity
@@ -505,6 +558,7 @@ export function createMomentumRouter() {
    * (`research` is history only — not watchlist.)
    */
   router.get('/monitored-tickers', async (request, response) => {
+    let resolvedTable = 'assets_monitor_based_on_device'
     try {
       const assetClassFilter = String(
         request.query.assetClass ||
@@ -522,27 +576,35 @@ export function createMomentumRouter() {
         response.status(503).json({
           ok: false,
           error: 'Supabase not configured',
-          table: 'device_monitor',
+          table: resolvedTable,
           items: [],
         })
         return
       }
-      const { data, error } = await supabase
-        .from('device_monitor')
-        .select(
-          'ticker, company_name, subscribers, updated_at, created_at, notable_price_movements',
-        )
-        .order('updated_at', { ascending: false })
-        .limit(500)
-      if (error) {
+      let data
+      try {
+        ;({ table: resolvedTable, data } = await fetchDeviceMonitorRows(
+          supabase,
+          'ticker, company_name, subscribers, updated_at, created_at, notable_price_movements, asset_class',
+        ))
+      } catch (error) {
         response.status(500).json({
           ok: false,
-          error: error.message,
-          table: 'device_monitor',
+          error: error instanceof Error ? error.message : String(error),
+          table: resolvedTable,
           items: [],
         })
         return
       }
+
+      // Preserve previous .order(updated_at desc).limit(500) behavior in-memory.
+      const rows = [...(data || [])]
+        .sort((a, b) => {
+          const aAt = String(a?.updated_at || a?.created_at || '')
+          const bAt = String(b?.updated_at || b?.created_at || '')
+          return bAt.localeCompare(aAt)
+        })
+        .slice(0, 500)
 
       const KNOWN_ETFS = new Set([
         'SPY',
@@ -613,11 +675,11 @@ export function createMomentumRouter() {
       const items = []
       // Unique push-ready devices (valid Expo token + enabled + app match).
       // Untagged legacy rows count as 9AM — not Trigger (matches delivery).
-      // Does NOT apply PUSH_ALLOWLIST so dashboard shows true audience size.
+      // Does not inject the always-notify device; dashboard shows true audience size.
       const countAppKey =
         !appKey || appKey === 'all' ? 'all' : appKey === 'nineam' ? 'nineam' : 'trigger'
 
-      for (const row of data || []) {
+      for (const row of rows) {
         const ticker = String(row.ticker || '')
           .trim()
           .toUpperCase()
@@ -670,8 +732,8 @@ export function createMomentumRouter() {
             expo_push_token: r.expo_push_token || null,
           })),
           updatedAt: row.updated_at || row.created_at || null,
-          source: 'device_monitor',
-          table: 'device_monitor',
+          source: resolvedTable,
+          table: resolvedTable,
         })
       }
 
@@ -690,7 +752,7 @@ export function createMomentumRouter() {
 
       response.json({
         ok: true,
-        table: 'device_monitor',
+        table: resolvedTable,
         app: appKey,
         assetClass: assetClassFilter || 'all',
         count: items.length,
@@ -704,24 +766,12 @@ export function createMomentumRouter() {
           error instanceof Error
             ? error.message
             : 'Failed to load monitored tickers',
-        table: 'device_monitor',
+        table: resolvedTable,
         items: [],
       })
     }
   })
 
-  /**
-   * GET /api/momentum/test-mode
-   * POST /api/momentum/test-mode
-   *   body: {
-   *     enabled: true|false,
-   *     selectedDeviceIds?: string[],
-   *     selectedTokens?: string[],
-   *   }
-   *
-   * ON  → only picker-selected devices get Expo pushes; Perplexity dummy
-   * OFF → real subscribers + both always-notify testers; real Perplexity
-   */
   router.get('/market-status', async (_request, response) => {
     try {
       const body = await buildMarketStatusPopup()
@@ -734,60 +784,91 @@ export function createMomentumRouter() {
     }
   })
 
+  /**
+   * GET /api/momentum/market-bulletins?limit=&market=us|india
+   * Recent OPEN/CLOSE bulletins (title + Perplexity body + Yahoo snapshot).
+   */
+  router.get('/market-bulletins', async (request, response) => {
+    try {
+      const { listMarketSessionBulletins } = await import(
+        './marketSessionBulletin.js'
+      )
+      const limit = Number(request.query?.limit) || 40
+      const market = String(request.query?.market || '').trim() || null
+      const result = await listMarketSessionBulletins({ limit, market })
+      if (!result.ok) {
+        response.status(500).json(result)
+        return
+      }
+      response.json(result)
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Market bulletins list failed',
+        bulletins: [],
+      })
+    }
+  })
+
+  /**
+   * POST /api/momentum/market-bulletin/run
+   * Manual / test: { market: 'us'|'india', slot: 'OPEN'|'CLOSE', sessionDate?, force?: true }
+   */
+  router.post('/market-bulletin/run', async (request, response) => {
+    try {
+      const market =
+        String(request.body?.market || request.query?.market || 'us')
+          .trim()
+          .toLowerCase() === 'india'
+          ? 'india'
+          : 'us'
+      const slot =
+        String(request.body?.slot || request.query?.slot || 'CLOSE')
+          .trim()
+          .toUpperCase() === 'OPEN'
+          ? 'OPEN'
+          : 'CLOSE'
+      const tz = market === 'india' ? 'Asia/Kolkata' : 'America/New_York'
+      const sessionDate =
+        String(request.body?.sessionDate || request.query?.sessionDate || '')
+          .trim() ||
+        new Intl.DateTimeFormat('en-CA', {
+          timeZone: tz,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        }).format(new Date())
+      const force = request.body?.force !== false
+      const { runMarketSessionBulletin } = await import(
+        './marketSessionBulletin.js'
+      )
+      const result = await runMarketSessionBulletin(
+        market,
+        slot,
+        sessionDate,
+        { force },
+      )
+      response.json({ ok: true, ...result })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Market bulletin run failed',
+      })
+    }
+  })
+
   router.get('/market-status/:ticker', (request, response) => {
     const ticker = String(request.params.ticker || '').toUpperCase()
     response.json({
       ok: true,
       ...evaluateSymbolGate({ symbol: ticker, nowUtc: Date.now() }),
     })
-  })
-
-  router.get('/test-mode', (_request, response) => {
-    response.json({ ok: true, ...getTestModeSnapshot() })
-  })
-  router.post('/test-mode', (request, response) => {
-    try {
-      const body =
-        request.body && typeof request.body === 'object' ? request.body : {}
-      const raw = body.enabled ?? body.testMode ?? body.on
-      if (raw === undefined) {
-        response.status(400).json({
-          ok: false,
-          error: 'Body must include enabled: true|false',
-          ...getTestModeSnapshot(),
-        })
-        return
-      }
-      const enabled =
-        raw === true ||
-        raw === 1 ||
-        raw === '1' ||
-        String(raw).toLowerCase() === 'true' ||
-        String(raw).toLowerCase() === 'on'
-      const allowlist = {
-        selectedDeviceIds: Array.isArray(body.selectedDeviceIds)
-          ? body.selectedDeviceIds
-          : undefined,
-        selectedTokens: Array.isArray(body.selectedTokens)
-          ? body.selectedTokens
-          : undefined,
-      }
-      const snap = setTestModeEnabled(enabled, allowlist)
-      const logOn = store.listWatchedTickers()[0] || MOMENTUM_TICKER
-      store.pushLog(
-        logOn,
-        'info',
-        `Test mode ${snap.enabled ? 'ON' : 'OFF'} · ${snap.summary}`,
-        'api',
-        snap,
-      )
-      response.json({ ok: true, ...snap })
-    } catch (error) {
-      response.status(500).json({
-        ok: false,
-        error: error instanceof Error ? error.message : 'Failed to set test mode',
-      })
-    }
   })
 
   /** Threshold overrides per asset class (equity / commodity / forex / crypto / index) */
@@ -980,6 +1061,74 @@ export function createMomentumRouter() {
   })
 
   /**
+   * GET  /api/momentum/perplexity-prompts
+   * POST /api/momentum/perplexity-prompts  body: { prompts: { id: body, … } }
+   * Editable Perplexity templates (momentum research + market bulletins).
+   */
+  router.get('/perplexity-prompts', async (_request, response) => {
+    try {
+      const { ensurePerplexityPromptsFromSupabase } = await import(
+        './perplexityPrompts.js'
+      )
+      // Always pull from Supabase into memory before answering the UI.
+      const pulled = await ensurePerplexityPromptsFromSupabase({ force: true })
+      response.json({
+        ok: true,
+        source: pulled.source,
+        supabaseOk: pulled.ok,
+        prompts: pulled.prompts,
+        at: new Date().toISOString(),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to load Perplexity prompts',
+      })
+    }
+  })
+
+  router.post('/perplexity-prompts', async (request, response) => {
+    try {
+      const body =
+        request.body && typeof request.body === 'object' ? request.body : {}
+      const prompts =
+        body.prompts && typeof body.prompts === 'object'
+          ? body.prompts
+          : body
+      const { persistPerplexityPrompts, listPerplexityPrompts } = await import(
+        './perplexityPrompts.js'
+      )
+      const result = await persistPerplexityPrompts(prompts)
+      const logOn = store.listWatchedTickers()[0] || MOMENTUM_TICKER
+      store.pushLog(
+        logOn,
+        'info',
+        `Perplexity prompts updated · ${result.changed || 0} change(s)`,
+        'api',
+        { changed: result.changed, supabase: result.supabase },
+      )
+      response.json({
+        ok: true,
+        changed: result.changed,
+        prompts: listPerplexityPrompts(),
+        supabase: result.supabase || null,
+        at: new Date().toISOString(),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to save Perplexity prompts',
+      })
+    }
+  })
+
+  /**
    * POST /api/momentum/clear-cache
    * Wipe server RAM (episodes/events/logs) for all watched tickers, then
    * force-hydrate fresh history from Supabase.
@@ -1053,6 +1202,55 @@ export function createMomentumRouter() {
   })
 
   /**
+   * Re-run real Perplexity research for an existing episode and link research_id
+   * onto the MOMENTUM_RESEARCH_DONE event + public.research row.
+   *
+   * POST /api/momentum/:ticker/research-rerun
+   * Body: { episodeId: string }
+   */
+  router.post('/:ticker/research-rerun', async (request, response) => {
+    try {
+      const ticker = decodeURIComponent(request.params.ticker || '')
+      if (
+        !ticker ||
+        ticker === 'watch' ||
+        ticker === 'thresholds' ||
+        ticker === 'episode-policy' ||
+        ticker === 'perplexity-prompts' ||
+        ticker === 'clear-cache' ||
+        ticker === 'monitored-tickers'
+      ) {
+        response.status(404).json({ ok: false, error: 'Not found' })
+        return
+      }
+      const episodeId = String(
+        request.body?.episodeId || request.body?.episode_id || '',
+      ).trim()
+      if (!episodeId) {
+        response.status(400).json({ ok: false, error: 'episodeId required' })
+        return
+      }
+      const out = await rerunResearchForEpisode({ ticker, episodeId })
+      if (!out?.ok) {
+        response.status(400).json(out)
+        return
+      }
+      response.json({
+        ...out,
+        status: statusWithConfig(ticker),
+      })
+    } catch (error) {
+      response.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to re-run research',
+      })
+    }
+  })
+
+  /**
    * Lightweight live poll — memory snapshot only (no Supabase history download).
    */
   router.get('/:ticker/live', (request, response) => {
@@ -1103,8 +1301,8 @@ export function createMomentumRouter() {
         !ticker ||
         ticker === 'watch' ||
         ticker === 'thresholds' ||
-        ticker === 'test-mode' ||
         ticker === 'episode-policy' ||
+        ticker === 'perplexity-prompts' ||
         ticker === 'research-tickers' ||
         ticker === 'monitored-tickers'
       ) {
@@ -1300,8 +1498,8 @@ export function createMomentumRouter() {
         !ticker ||
         ticker === 'watch' ||
         ticker === 'thresholds' ||
-        ticker === 'test-mode' ||
         ticker === 'episode-policy' ||
+        ticker === 'perplexity-prompts' ||
         ticker === 'monitored-tickers'
       ) {
         response.status(404).json({ error: 'Not found' })
@@ -1357,8 +1555,8 @@ export function createMomentumRouter() {
         !ticker ||
         ticker === 'watch' ||
         ticker === 'thresholds' ||
-        ticker === 'test-mode' ||
         ticker === 'episode-policy' ||
+        ticker === 'perplexity-prompts' ||
         ticker === 'monitored-tickers'
       ) {
         response.status(404).json({ error: 'Not found' })
@@ -1411,8 +1609,8 @@ export function createMomentumRouter() {
         !ticker ||
         ticker === 'watch' ||
         ticker === 'thresholds' ||
-        ticker === 'test-mode' ||
         ticker === 'episode-policy' ||
+        ticker === 'perplexity-prompts' ||
         ticker === 'monitored-tickers'
       ) {
         response.status(404).json({ error: 'Not found' })
@@ -1471,7 +1669,7 @@ export function createMomentumRouter() {
   router.post('/:ticker/end-episode', async (request, response) => {
     try {
       const ticker = decodeURIComponent(request.params.ticker || '')
-      if (!ticker || ticker === 'watch' || ticker === 'thresholds' || ticker === 'test-mode' || ticker === 'episode-policy') {
+      if (!ticker || ticker === 'watch' || ticker === 'thresholds' || ticker === 'episode-policy' || ticker === 'perplexity-prompts') {
         response.status(404).json({ error: 'Not found' })
         return
       }
@@ -1599,7 +1797,7 @@ export function createMomentumRouter() {
   router.post('/:ticker/timeline-event', (request, response) => {
     try {
       const ticker = decodeURIComponent(request.params.ticker || '')
-      if (!ticker || ticker === 'watch' || ticker === 'thresholds' || ticker === 'test-mode' || ticker === 'episode-policy') {
+      if (!ticker || ticker === 'watch' || ticker === 'thresholds' || ticker === 'episode-policy' || ticker === 'perplexity-prompts') {
         response.status(404).json({ error: 'Not found' })
         return
       }
@@ -1659,9 +1857,12 @@ export function createMomentumRouter() {
           detectedWindow,
           detectedAt: nowIso,
           marketSession: body.marketSession || ep?.marketSession || null,
+          state: null,
           reason: reasonText,
+          shortReason: research.likely_driver || body.likely_driver || null,
           shouldNotify: false,
           notification: null,
+          researchId: body.researchId || research.id || research.researchId || null,
           research: {
             ...research,
             reason: reasonText,
@@ -1708,12 +1909,18 @@ export function createMomentumRouter() {
         detectedAt: nowIso,
         notifiedAt: nowIso,
         marketSession: body.marketSession || ep?.marketSession || null,
-        reason: body.reason || null,
+        state: ep?.state || null,
+        reason:
+          body.reason === 'RESEARCH' || body.reason === 'RESEARCH_FALLBACK'
+            ? null
+            : body.reason || null,
+        shortReason: research?.likely_driver || body.likely_driver || null,
         shouldNotify: true,
         notification: {
           title: notification.title || body.title || null,
           body: notification.body || body.body || null,
         },
+        researchId: body.researchId || research?.id || research?.researchId || null,
         research: research || null,
         pushResult:
           body.pushResult && typeof body.pushResult === 'object'

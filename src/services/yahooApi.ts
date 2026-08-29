@@ -287,7 +287,9 @@ export type YahooExtremeMover = {
   exchange?: string | null
   marketState?: string | null
   quoteType?: string | null
+  assetClass?: string | null
   direction?: 'up' | 'down' | 'flat'
+  screener?: string | null
 }
 
 export type YahooExtremeMoversResponse = {

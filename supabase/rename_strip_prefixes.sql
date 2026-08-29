@@ -4,8 +4,8 @@
 do $$
 begin
   if to_regclass('public.momentum_episode_events') is not null
-     and to_regclass('public.episodes_events') is null then
-    alter table public.momentum_episode_events rename to episodes_events;
+     and to_regclass('public.events_episodes') is null then
+    alter table public.momentum_episode_events rename to events_episodes;
   end if;
 
   if to_regclass('public.momentum_episodes') is not null

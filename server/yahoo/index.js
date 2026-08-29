@@ -464,13 +464,27 @@ async function fetchYahooPercentChangeScreener({
  *   minMarketCap — optional USD floor (default 0 = show full Yahoo top lists)
  *   count        — per screener (default 100, max 250)
  */
+function assetClassFromQuoteType(quoteType, symbol) {
+  const qt = String(quoteType || '').toUpperCase()
+  const sym = String(symbol || '').toUpperCase()
+  if (qt === 'CRYPTOCURRENCY' || qt === 'CRYPTO' || sym.endsWith('-USD') || sym.endsWith('-USDT')) {
+    return 'crypto'
+  }
+  if (qt === 'FUTURE' || qt === 'FUTURES' || sym.endsWith('=F')) return 'commodity'
+  if (qt === 'CURRENCY' || sym.endsWith('=X')) return 'forex'
+  if (qt === 'INDEX' || sym.startsWith('^')) return 'index'
+  if (qt === 'ETF' || qt === 'MUTUALFUND') return 'etf'
+  if (qt === 'EQUITY') return 'equity'
+  if (sym.includes('-')) return 'crypto'
+  return 'equity'
+}
+
 router.get('/extreme-movers', async (request, response) => {
   try {
     const minPercent = Math.max(
       0,
-      Number.parseFloat(String(request.query.minPercent ?? '10')) || 10,
+      Number.parseFloat(String(request.query.minPercent ?? '5')) || 5,
     )
-    // Default 0: user wants real Yahoo top gainers/losers ≥10%, not only mega-caps.
     const minMarketCapRaw = request.query.minMarketCap
     const minMarketCap =
       minMarketCapRaw == null || minMarketCapRaw === ''
@@ -478,12 +492,10 @@ router.get('/extreme-movers', async (request, response) => {
         : Math.max(0, Number.parseFloat(String(minMarketCapRaw)) || 0)
     const count = Math.min(
       250,
-      Math.max(5, Number.parseInt(String(request.query.count ?? '100'), 10) || 100),
+      Math.max(5, Number.parseInt(String(request.query.count ?? '150'), 10) || 150),
     )
 
     const fetchScreener = async (scrIds, direction) => {
-      // 1) yahoo-finance2 first (handles cookies/crumb). day_gainers often
-      //    throws FailedYahooValidationError but still attaches full result.quotes.
       try {
         const result = await yahooFinance.screener(
           { scrIds, count },
@@ -504,7 +516,6 @@ router.get('/extreme-movers', async (request, response) => {
         )
       }
 
-      // 2) Raw predefined Day Gainers / Day Losers HTTP
       try {
         return await fetchYahooPredefinedScreener(scrIds, count)
       } catch (error) {
@@ -514,63 +525,76 @@ router.get('/extreme-movers', async (request, response) => {
         )
       }
 
-      // 3) Custom percent-change screener (needs crumb; may 401)
-      try {
-        return await fetchYahooPercentChangeScreener({
-          direction,
-          minPercent,
-          count,
-        })
-      } catch (error) {
-        console.warn(
-          `[yahoo] custom ${direction} screener failed:`,
-          errorMessage(error, 'screener failed'),
-        )
-        return []
+      if (direction === 'up' || direction === 'down') {
+        try {
+          return await fetchYahooPercentChangeScreener({
+            direction,
+            minPercent,
+            count,
+          })
+        } catch (error) {
+          console.warn(
+            `[yahoo] custom ${direction} screener failed:`,
+            errorMessage(error, 'screener failed'),
+          )
+        }
       }
+      return []
     }
 
-    // Sequential — parallel Yahoo calls often 429 one of the two lists.
-    const gainers = await fetchScreener('day_gainers', 'up')
-    await sleepMs(200)
-    const losers = await fetchScreener('day_losers', 'down')
-
     const bySymbol = new Map()
-    const ingest = (quotes, expectedDirection) => {
-      for (const quote of quotes) {
+    const allowedQuoteTypes = new Set([
+      'EQUITY',
+      'ETF',
+      'MUTUALFUND',
+      'INDEX',
+      'CRYPTOCURRENCY',
+      'CRYPTO',
+      'FUTURE',
+      'FUTURES',
+      'CURRENCY',
+      'ECNQUOTE',
+    ])
+
+    const ingest = (quotes, opts = {}) => {
+      const expectedDirection = opts.expectedDirection || null
+      const forcedClass = opts.assetClass || null
+      const screener = opts.screener || null
+      for (const quote of quotes || []) {
         const symbol = String(quote?.symbol || '')
           .trim()
           .toUpperCase()
         if (!symbol) continue
         const quoteType = String(quote?.quoteType || '').toUpperCase()
-        // Equities + ETFs from Yahoo top lists; skip options/crypto.
-        if (
-          quoteType &&
-          quoteType !== 'EQUITY' &&
-          quoteType !== 'ETF' &&
-          quoteType !== 'MUTUALFUND'
-        ) {
-          continue
-        }
+        if (quoteType && !allowedQuoteTypes.has(quoteType) && !forcedClass) continue
+        if (quoteType === 'OPTION' || quoteType === 'OPTIONS') continue
+
         const exchange = String(
           quote?.fullExchangeName || quote?.exchange || quote?.market || '',
         ).toLowerCase()
-        if (exchange.includes('otc') || exchange.includes('pink')) continue
+        if (!forcedClass && (exchange.includes('otc') || exchange.includes('pink'))) continue
 
         const percent = yahooScreenerNumeric(quote?.regularMarketChangePercent)
         const marketCap = yahooScreenerNumeric(quote?.marketCap)
         const price = yahooScreenerNumeric(quote?.regularMarketPrice)
         const change = yahooScreenerNumeric(quote?.regularMarketChange)
         if (!Number.isFinite(percent) || Math.abs(percent) < minPercent) continue
-        if (minMarketCap > 0 && Number.isFinite(marketCap) && marketCap > 0 && marketCap < minMarketCap) {
+        if (
+          minMarketCap > 0 &&
+          Number.isFinite(marketCap) &&
+          marketCap > 0 &&
+          marketCap < minMarketCap
+        ) {
           continue
         }
-        // Direction guard so gainers list never pollutes Negative tab.
         if (expectedDirection === 'up' && percent <= 0) continue
         if (expectedDirection === 'down' && percent >= 0) continue
 
         const prev = bySymbol.get(symbol)
         if (prev && Math.abs(prev.regularMarketChangePercent) >= Math.abs(percent)) continue
+
+        const assetClass =
+          forcedClass || assetClassFromQuoteType(quoteType, symbol)
 
         bySymbol.set(symbol, {
           ticker: symbol,
@@ -585,15 +609,58 @@ router.get('/extreme-movers', async (request, response) => {
           currency: quote?.currency || 'USD',
           exchange: quote?.fullExchangeName || quote?.exchange || null,
           marketState: quote?.marketState || null,
-          quoteType: quoteType || 'EQUITY',
+          quoteType: quoteType || null,
+          assetClass,
           direction: percent < 0 ? 'down' : percent > 0 ? 'up' : 'flat',
-          screener: expectedDirection === 'up' ? 'day_gainers' : 'day_losers',
+          screener,
         })
       }
     }
 
-    ingest(gainers, 'up')
-    ingest(losers, 'down')
+    // Equities / ETFs — Yahoo day gainers + losers
+    const gainers = await fetchScreener('day_gainers', 'up')
+    await sleepMs(200)
+    const losers = await fetchScreener('day_losers', 'down')
+    ingest(gainers, { expectedDirection: 'up', screener: 'day_gainers' })
+    ingest(losers, { expectedDirection: 'down', screener: 'day_losers' })
+
+    // Crypto screener
+    await sleepMs(200)
+    const cryptoQuotes = await fetchScreener('all_cryptocurrencies_us', null)
+    ingest(
+      (cryptoQuotes || []).filter(
+        (q) => !CRYPTO_STABLES?.has?.(String(q?.symbol || '').toUpperCase()),
+      ),
+      { assetClass: 'crypto', screener: 'all_cryptocurrencies_us' },
+    )
+
+    // Commodity / forex / index universes (quoted live)
+    for (const assetClass of ['commodity', 'forex', 'index', 'crypto']) {
+      try {
+        await sleepMs(120)
+        const rows = await quoteMostActiveUniverse(assetClass)
+        ingest(
+          (rows || []).map((row) => ({
+            symbol: row.ticker,
+            shortName: row.label,
+            longName: row.longName,
+            regularMarketPrice: row.regularMarketPrice,
+            regularMarketChange: row.regularMarketChange,
+            regularMarketChangePercent: row.regularMarketChangePercent,
+            currency: row.currency,
+            exchange: row.exchange,
+            marketState: row.marketState,
+            quoteType: row.quoteType,
+          })),
+          { assetClass, screener: `universe:${assetClass}` },
+        )
+      } catch (error) {
+        console.warn(
+          `[yahoo] extreme universe ${assetClass} failed:`,
+          errorMessage(error, 'universe failed'),
+        )
+      }
+    }
 
     const movers = [...bySymbol.values()].sort(
       (a, b) =>
@@ -607,7 +674,15 @@ router.get('/extreme-movers', async (request, response) => {
     response.json({
       ok: true,
       source: 'yahoo-finance',
-      screener: ['day_gainers', 'day_losers'],
+      screener: [
+        'day_gainers',
+        'day_losers',
+        'all_cryptocurrencies_us',
+        'universe:commodity',
+        'universe:forex',
+        'universe:index',
+        'universe:crypto',
+      ],
       minPercent,
       minMarketCap,
       gainerCount: gainers.length,
@@ -1462,9 +1537,13 @@ router.get('/search', async (request, response) => {
           ticker: row.ticker,
           label: row.ticker,
           companyName: row.data?.companyName || null,
+          shortName: row.data?.shortName || null,
+          longName: row.data?.longName || row.data?.companyName || null,
           savedAt: row.updated_at || row.created_at,
-          exchange: null,
-          quoteType: null,
+          exchange: row.data?.exchange || null,
+          quoteType: row.data?.quoteType || null,
+          sector: row.data?.profile?.sector || null,
+          industry: row.data?.profile?.industry || null,
           source: 'yahoo-finance',
         }))
       }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Loader2 } from 'lucide-react'
-import { SectionCard, SectionEmpty, formatDecimal } from '@/components/tickerDashboard/shared'
+import { SectionCard, SectionEmpty, formatDecimal } from '@/components/yahoo/section-ui'
 import {
   CHART_INTERVAL_BY_RANGE,
   fetchYahooChart,

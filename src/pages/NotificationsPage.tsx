@@ -9,29 +9,25 @@ import {
   type ReactNode,
 } from 'react'
 import {
-  ArrowUpDown,
   AlertTriangle,
   Bell,
   BellRing,
-  Bookmark,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Crown,
-  ExternalLink,
+  ArrowUpRight,
   Copy,
   Download,
   LayoutGrid,
   Loader2,
   Moon,
-  Newspaper,
   PenLine,
   Plus,
   RefreshCw,
   Save,
   Search,
-  Settings,
   Maximize2,
   Minimize2,
   Share2,
@@ -43,11 +39,16 @@ import {
   X,
   Zap,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useTheme } from '@/hooks/useTheme'
 import { useBottomToast } from '@/components/ui/bottom-toast'
-import { EpisodeDashboard } from '@/components/hub/EpisodeDashboard'
 import { isDeskOnlyMode } from '@/lib/deskOnly'
 import { readPref, writePref } from '@/lib/prefs'
+import {
+  readTriggerSharePayload,
+  type TriggerSharePayload,
+} from '@/lib/triggerShare'
+import { SofarResearchShareDialog } from '@/components/trigger/SofarResearchShareDialog'
 import {
   fetchYahooQuote,
   fetchYahooQuotes,
@@ -80,17 +81,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { SubscriberHoverCard } from '@/components/hub/subscriber-hover-card'
+import { CompanyLogo } from '@/components/hub/company-logo'
+import {
+  formatLocalDateTimeWithZone,
+  formatLocalTimeWithZone,
+  timeZoneSuffix,
+} from '@/lib/localTimeZone'
 import { cn } from '@/lib/utils'
 
 function tickerExchangeTimeZone(
@@ -485,13 +487,15 @@ function formatMarketTimestamp(value: string | null | undefined, timeZone: strin
   if (!value) return null
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return null
-  return new Intl.DateTimeFormat('en-GB', {
+  const clock = new Intl.DateTimeFormat('en-GB', {
     timeZone,
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
     hour12: false,
   }).format(date)
+  const zone = timeZoneSuffix(date, timeZone)
+  return zone ? `${clock} ${zone}` : clock
 }
 
 /**
@@ -1426,7 +1430,7 @@ async function loadShareRegularSessionSeries(
   ticker: string,
   eventDate?: string | null,
   opts?: {
-    /** Session heading stamp, e.g. “Today · 3:33 PM” */
+    /** Session heading stamp, e.g. “Today · 3:33 PM ET” */
     stampText?: string | null
     timeLabel?: string | null
     /** Trading days to include (1, 2, 3, or 5). Default 2. */
@@ -1806,18 +1810,45 @@ function loadImageFromUrl(url: string): Promise<HTMLImageElement | null> {
   })
 }
 
-/** Prefer custom pasted logo, else multi-source proxy. */
+/**
+ * Prefer custom pasted logo, else same-origin proxy, else public CDN chain
+ * (TradingView / IEX / Parqet) — same sources the desk CompanyLogo uses.
+ */
 async function loadShareLogo(
   symbol: string,
   customDataUrl?: string | null,
+  companyName?: string | null,
 ): Promise<HTMLImageElement | null> {
   if (customDataUrl) {
     const custom = await loadImageFromUrl(customDataUrl)
     if (custom) return custom
   }
-  const url = tickerLogoProxyUrl(symbol)
-  if (!url) return null
-  return loadImageFromUrl(`${url}?v=2`)
+  const clean = String(symbol || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9.-]/g, '')
+  const candidates: string[] = []
+  const proxy = tickerLogoProxyUrl(clean)
+  if (proxy) candidates.push(`${proxy}?v=2`)
+  // Public CDNs (work even when /api/yahoo/.../logo is blocked)
+  try {
+    const { companyLogoCandidates } = await import(
+      '@/components/hub/company-logo'
+    )
+    candidates.push(...companyLogoCandidates(clean, companyName))
+  } catch {
+    if (clean) {
+      candidates.push(`https://storage.googleapis.com/iex/api/logos/${clean}.png`)
+      candidates.push(`https://assets.parqet.com/logos/symbol/${clean}`)
+    }
+  }
+  const seen = new Set<string>()
+  for (const url of candidates) {
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    const img = await loadImageFromUrl(url)
+    if (img) return img
+  }
+  return null
 }
 
 /** Resize pasted image → compact data URL for localStorage / share card. */
@@ -2940,13 +2971,13 @@ function inferShareChartSession(
 /** Labels evenly spaced under the chart axis. */
 function shareChartTimeLabels(session: ShareChartSession): string[] {
   if (session === 'premarket') {
-    return ['4 AM', '5 AM', '6 AM', '7 AM', '8 AM', '9 AM']
+    return ['4 AM ET', '5 AM ET', '6 AM ET', '7 AM ET', '8 AM ET', '9 AM ET']
   }
   if (session === 'after-hours') {
-    return ['4 PM', '5 PM', '6 PM', '7 PM', '8 PM']
+    return ['4 PM ET', '5 PM ET', '6 PM ET', '7 PM ET', '8 PM ET']
   }
   // Regular session 9:30 → 4:00
-  return ['9:30', '11 AM', '12:30', '2 PM', '4 PM']
+  return ['9:30 AM ET', '11 AM ET', '12:30 PM ET', '2 PM ET', '4 PM ET']
 }
 
 /**
@@ -2971,7 +3002,7 @@ function drawMiniChart(
     axisTextColor?: string
     /** Real regular-session closes from Yahoo (preferred). */
     series?: ShareChartBar[] | null
-    /** elapsed = 0m / 15m · timestamp = 9:30 AM wall clock */
+    /** elapsed = 0m / 15m · timestamp = 9:30 AM ET wall clock */
     axisMode?: 'elapsed' | 'timestamp'
     /** IANA zone for timestamp mode (listing exchange; not browser local) */
     axisTimezone?: string
@@ -3980,7 +4011,7 @@ type ShareCardStyle = {
    * 0 = full selected session range · 50 = start halfway through · …
    */
   chartVisibleStartPct: number
-  /** Show time ticks under the chart (0m / 9:30 AM…). */
+  /** Show time ticks under the chart (0m / 9:30 AM ET…). */
   showChartTimeAxis: boolean
   /**
    * Show calendar day labels under the chart (Today · 5 Aug).
@@ -3999,7 +4030,7 @@ type ShareCardStyle = {
   /**
    * Chart x-axis labels:
    * - elapsed = “0m · 15m · 1h …” from session open
-   * - timestamp = wall clock “9:30 AM · 10:00 AM …”
+   * - timestamp = zoned wall clock “9:30 AM ET · 10:00 AM ET …”
    */
   chartAxisMode: 'elapsed' | 'timestamp'
   /** Timezone for timestamp-mode axis (and stamp display when absolute). */
@@ -5884,9 +5915,13 @@ async function renderMomentumTweetImage(
   const preferSquare = style.preferSquare !== false
   const chartSession = inferShareChartSession(event, sessionLine)
 
-  // Custom pasted logos win over CDN/proxy
+  // Custom pasted logos win over CDN/proxy (desk CompanyLogo CDN chain as fallback)
   const customMap = loadCustomLogoMap()
-  const logoImg = await loadShareLogo(symbol, customMap[symbol] || null)
+  const logoImg = await loadShareLogo(
+    symbol,
+    customMap[symbol] || null,
+    companyName || companyLabel || null,
+  )
   const sideImg =
     sideImageDataUrl && String(sideImageDataUrl).trim()
       ? await loadImageFromUrl(String(sideImageDataUrl).trim())
@@ -6772,7 +6807,7 @@ function roundRect(
 function formatLogTime(iso: string) {
   const t = Date.parse(iso)
   if (!Number.isFinite(t)) return iso
-  return new Date(t).toLocaleTimeString(undefined, {
+  return formatLocalTimeWithZone(t, {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
@@ -6858,6 +6893,17 @@ function formatGeminiModelLabel(model?: string | null) {
 
 /** e.g. "8 May 2026" (+ optional time label) */
 function formatEventHeading(event: PriceMovementEvent) {
+  const rawTime = String(event.time_label || '').trim()
+  const eventInstant = eventEasternWallTimeToUtcMs(event)
+  const zonedTime = rawTime
+    ? withTimezoneSuffix(
+        rawTime,
+        shareTimezoneAbbrev(
+          EXCHANGE_TZ_FALLBACK,
+          eventInstant ?? Date.parse(`${event.event_date}T12:00:00Z`),
+        ),
+      )
+    : ''
   try {
     const d = new Date(`${event.event_date}T12:00:00Z`)
     if (!Number.isNaN(d.getTime())) {
@@ -6867,13 +6913,13 @@ function formatEventHeading(event: PriceMovementEvent) {
         year: 'numeric',
         timeZone: 'UTC',
       })
-      return event.time_label ? `${base} · ${event.time_label}` : base
+      return zonedTime ? `${base} · ${zonedTime}` : base
     }
   } catch {
     /* fall through */
   }
   if (event.display_date) {
-    return event.time_label ? `${event.display_date} · ${event.time_label}` : event.display_date
+    return zonedTime ? `${event.display_date} · ${zonedTime}` : event.display_date
   }
   return event.event_date
 }
@@ -9501,7 +9547,7 @@ function ShareCardLayoutControls({
           </Button>
         </div>
         <p className="text-[10px] text-muted-foreground">
-          Time = 0m / 9:30 AM ticks. Dates = day labels under multi-day charts.
+          Time = 0m / 9:30 AM ET ticks. Dates = day labels under multi-day charts.
         </p>
 
         {style.showChartDayLabels === true ? (
@@ -9608,7 +9654,7 @@ function ShareCardLayoutControls({
             className="h-7 text-[11px]"
             onClick={() => set({ chartAxisMode: 'timestamp' })}
           >
-            Absolute time (9:30 AM…)
+            Absolute time (9:30 AM ET…)
           </Button>
         </div>
         <div className="space-y-1">
@@ -10275,23 +10321,52 @@ function deviceKey(device: EnabledDevice) {
   return device.device_id || device.expo_push_token
 }
 
+const EXTREME_MIN_PERCENT = 5
+
+function pickBestShareEvent(events: PriceMovementEvent[]): PriceMovementEvent | null {
+  if (!Array.isArray(events) || !events.length) return null
+  const pending = events.filter(
+    (event) => event.save_status === 'new' || event.save_status === 'changed',
+  )
+  const pool = pending.length ? pending : events
+  const ranked = pool.map((event) => {
+    const closeAbs = absPercentFromChange(event.price_change || event.momentum) || 0
+    const pmAbs = absPercentFromChange(getPremarketChange(event)) || 0
+    return { event, abs: Math.max(closeAbs, pmAbs) }
+  })
+  ranked.sort(
+    (a, b) =>
+      b.abs - a.abs ||
+      String(b.event.event_date || '').localeCompare(String(a.event.event_date || '')),
+  )
+  const notable = ranked.find((row) => row.abs >= EXTREME_MIN_PERCENT)
+  return (notable || ranked[0]).event
+}
+
 export default function NotificationsPage() {
+  const navigate = useNavigate()
   const { theme, toggleTheme } = useTheme()
   const { toast } = useBottomToast()
-  /** Header tabs: Home first (default) · Trigger · 9AM */
-  const [appTab, setAppTab] = useState<AppSwitcherTab>(() => {
-    try {
-      const app = new URLSearchParams(window.location.search).get('app')
-      if (app === 'nineam' || app === 'trigger') return app
-    } catch {
-      /* ignore */
-    }
-    return 'hub'
-  })
-  /** Active push product when not on Home hub */
-  const notificationApp: NotificationApp =
-    appTab === 'nineam' || appTab === 'trigger' ? appTab : 'trigger'
-  const [section, setSection] = useState<DashboardSection>('tickers')
+  /** Trigger desk only — Episode lives at `/`. */
+  const appTab = 'trigger' as AppSwitcherTab
+  /** Active push product — Trigger only (typed wide so legacy nineam branches typecheck). */
+  const notificationApp = 'trigger' as NotificationApp
+  const setAppTab = useCallback((tab: AppSwitcherTab) => {
+    if (tab === 'hub') navigate('/')
+    // nineam removed — stay on Trigger
+  }, [navigate])
+  /** Lean Trigger desk — Extreme watchlist only (no Audience / Settings / 9AM). */
+  const [section] = useState<DashboardSection>('tickers')
+  const setSection = useCallback(
+    (
+      _next:
+        | DashboardSection
+        | ((current: DashboardSection) => DashboardSection),
+    ) => {
+      /* locked to tickers */
+    },
+    [],
+  )
   const [tickers, setTickers] = useState<MonitoredTicker[]>([])
   const [liveQuotes, setLiveQuotes] = useState<Record<string, YahooLiveQuote>>({})
   const [liveQuotesLastCheckedAt, setLiveQuotesLastCheckedAt] = useState<number | null>(null)
@@ -10324,14 +10399,25 @@ export default function NotificationsPage() {
   const [tickerSearchLoading, setTickerSearchLoading] = useState(false)
   const [tickerAddBusy, setTickerAddBusy] = useState<string | null>(null)
   const tickerSearchRef = useRef<HTMLDivElement | null>(null)
-  /** Stocks sidebar: Users | Extreme (view-only) | Pinned (time-labeled, never Users) */
-  const [stocksListTab, setStocksListTab] = useState<StocksListTab>('users')
+  /** Lean Trigger desk — Extreme movers only (Users / Pinned list tabs removed). */
+  const [stocksListTab] = useState<StocksListTab>('extreme')
+  const setStocksListTab = useCallback((_next: StocksListTab) => {
+    /* locked to extreme */
+  }, [])
   const stocksListTabRef = useRef<StocksListTab>(stocksListTab)
   stocksListTabRef.current = stocksListTab
   const [extremeMovers, setExtremeMovers] = useState<YahooExtremeMover[]>([])
   const [extremeMoversLoading, setExtremeMoversLoading] = useState(false)
+  const [, setExtremeMoversRefreshing] = useState(false)
   const [extremeMoversError, setExtremeMoversError] = useState('')
   const [extremeMoversFetchedAt, setExtremeMoversFetchedAt] = useState<string | null>(null)
+  const [extremeShareBusy, setExtremeShareBusy] = useState(false)
+  const extremeShareUrlHandledRef = useRef(false)
+  const [sofarResearchOpen, setSofarResearchOpen] = useState(false)
+  const [sofarResearchPayload, setSofarResearchPayload] =
+    useState<TriggerSharePayload | null>(null)
+  /** Peak/So Far composer parked while share-card Edit is open — restore on Edit close. */
+  const parkedSofarComposerRef = useRef<TriggerSharePayload | null>(null)
   const [extremeDirectionTab, setExtremeDirectionTab] =
     useState<ExtremeDirectionTab>('positive')
   const [companyProfile, setCompanyProfile] = useState<YahooCompanyProfile | null>(null)
@@ -10353,7 +10439,7 @@ export default function NotificationsPage() {
   const [allTickersLoading, setAllTickersLoading] = useState(false)
   const [allTickersProgress, setAllTickersProgress] = useState({ completed: 0, total: 0 })
   const [fetchErrorPopup, setFetchErrorPopup] = useState<FetchErrorPopup | null>(null)
-  /** After Fetch & save all / 9 PM alert: live per-company progress + hits. */
+  /** After Fetch & save all / 9 PM ET alert: live per-company progress + hits. */
   const [fetchAllHitsOpen, setFetchAllHitsOpen] = useState(false)
   /** fetch_all = ≥4% filter; nine_pm = all new/changed + digest at the end */
   const [fetchAllMode, setFetchAllMode] = useState<'fetch_all' | 'nine_pm'>('fetch_all')
@@ -11638,8 +11724,8 @@ export default function NotificationsPage() {
         hitCount ? 'success' : 'info',
         mode === 'nine_pm'
           ? hitCount
-            ? `9 PM alert fetch done · ${hitCount} new/updated date(s) · Gemini running`
-            : '9 PM alert fetch done · no new/updated dates'
+            ? `9 PM ET alert fetch done · ${hitCount} new/updated date(s) · Gemini running`
+            : '9 PM ET alert fetch done · no new/updated dates'
           : hitCount
             ? `Fetch & save all done · ${hitCount} date(s) with ≥4% move`
             : 'Fetch & save all done · no new dates with ≥4% move',
@@ -11717,7 +11803,7 @@ export default function NotificationsPage() {
     if (fetchAllMode === 'nine_pm') {
       setFetchAllAlertAllBusy(true)
       setFetchAllDigestMsg('')
-      appendLocalLog('ALL', 'info', '9 PM alert: sending Today’s digest to all Trigger users')
+      appendLocalLog('ALL', 'info', '9 PM ET alert: sending Today’s digest to all Trigger users')
       try {
         const response = await fetch('/api/notifications/alert-trigger-digest', {
           method: 'POST',
@@ -13272,6 +13358,205 @@ export default function NotificationsPage() {
     }
   }
 
+  /**
+   * Extremes row → scrape (+ optional Gemini) → full-screen Share dialog.
+   * Uses auto_save=0 so missing monitor rows do not block share.
+   */
+  async function handleExtremeRowShare(
+    item: Pick<YahooExtremeMover, 'ticker' | 'company_name'> &
+      Partial<YahooExtremeMover>,
+  ) {
+    const symbol = String(item.ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!symbol || extremeShareBusy) return
+
+    setExtremeShareBusy(true)
+    setStocksListTab('extreme')
+    selectTickerByUser(symbol)
+    setLiveQuotes((prev) => ({
+      ...prev,
+      [symbol]: {
+        ...(prev[symbol] || {}),
+        symbol,
+        shortName: item.company_name || symbol,
+        regularMarketPrice: item.regularMarketPrice ?? prev[symbol]?.regularMarketPrice ?? null,
+        regularMarketChange: item.regularMarketChange ?? prev[symbol]?.regularMarketChange ?? null,
+        regularMarketChangePercent:
+          item.regularMarketChangePercent ??
+          prev[symbol]?.regularMarketChangePercent ??
+          null,
+        regularMarketPreviousClose: prev[symbol]?.regularMarketPreviousClose ?? null,
+        currency: item.currency || prev[symbol]?.currency || 'USD',
+        marketState: item.marketState || prev[symbol]?.marketState || null,
+        exchange: item.exchange || prev[symbol]?.exchange || null,
+      },
+    }))
+
+    toast({
+      title: `Preparing ${symbol}`,
+      description: 'Scraping notable moves, then opening Share…',
+      durationMs: 4000,
+    })
+
+    const pct = Number(item.regularMarketChangePercent)
+    const pctLabel = Number.isFinite(pct)
+      ? `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`
+      : ''
+    const todayEt = new Date().toLocaleDateString('en-CA', {
+      timeZone: 'America/New_York',
+    })
+    const yahooFallbackEvent = (): PriceMovementEvent => ({
+      event_date: todayEt,
+      display_date: todayEt,
+      time_label: null,
+      price:
+        item.regularMarketPrice != null && Number.isFinite(Number(item.regularMarketPrice))
+          ? String(item.regularMarketPrice)
+          : null,
+      price_change: pctLabel || null,
+      momentum: pctLabel || null,
+      direction: pct < 0 ? 'down' : 'up',
+      summary:
+        `${item.company_name || symbol} (${symbol}) moved ${pctLabel || 'sharply'} in the regular session.`
+          .replace(/\s+/g, ' ')
+          .trim(),
+      sources: [],
+      save_status: 'new',
+    })
+
+    try {
+      patchTab(symbol, { loading: true, error: '', saveMessage: '', saveIsNoop: false })
+      let event: PriceMovementEvent | null = null
+      let scrapeOk = false
+
+      try {
+        const response = await fetch(
+          `/api/notifications/scrape/${encodeURIComponent(symbol)}?auto_save=0&monitor_scope=pinned`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              monitor_scope: 'pinned',
+              create_if_missing: false,
+              company_name: item.company_name || symbol,
+            }),
+          },
+        )
+        const body = await response.json().catch(() => ({}))
+        if (response.ok) {
+          scrapeOk = true
+          const result = body as ScrapeResult
+          setTabState((current) => {
+            const prev = current[symbol] || emptyTabState()
+            return {
+              ...current,
+              [symbol]: {
+                ...prev,
+                loading: false,
+                result,
+                error: '',
+                saveMessage: '',
+                saveIsNoop: true,
+                logs: result.logs?.length ? result.logs : prev.logs,
+              },
+            }
+          })
+          if (body.credits?.after?.remaining_credits != null) {
+            const used = body.credits.used
+            setCreditHint(
+              used != null
+                ? `Firecrawl balance: ${body.credits.after.remaining_credits} remaining · last scrape used ${used}`
+                : `Firecrawl balance: ${body.credits.after.remaining_credits} remaining`,
+            )
+            setFirecrawlCredits((prev) => ({
+              remaining: Number(body.credits.after.remaining_credits),
+              plan:
+                body.credits.after.plan_credits != null
+                  ? Number(body.credits.after.plan_credits)
+                  : prev?.plan ?? null,
+            }))
+          }
+          event = pickBestShareEvent(result.events || [])
+        } else {
+          console.warn('[extreme-share] scrape failed', body.error || response.status)
+        }
+      } catch (scrapeErr) {
+        console.warn('[extreme-share] scrape error', scrapeErr)
+      }
+
+      if (!event) {
+        event = yahooFallbackEvent()
+        if (!scrapeOk) {
+          toast({
+            title: `Share · ${symbol}`,
+            description: 'Using Yahoo extreme move — scrape unavailable right now.',
+            durationMs: 4000,
+          })
+        }
+      }
+
+      // Best-effort Gemini structure before share (same quality as Share button cards).
+      if (!hasGeminiFormating(event)) {
+        const sourceText =
+          String(event.original_summary || '').trim() ||
+          reasonTextForGemini(event) ||
+          String(event.summary || '').trim()
+        if (sourceText) {
+          try {
+            toast({
+              title: `Gemini · ${symbol}`,
+              description: 'Structuring reason for share card…',
+              durationMs: 3500,
+            })
+            const geminiRes = await fetch('/api/notifications/gemini-summarize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: sourceText,
+                ticker: symbol,
+                company_name: item.company_name || symbol,
+                event_date: event.event_date,
+                price: event.price,
+                price_change: event.price_change || event.momentum,
+                event,
+                auto_save: false,
+                monitor_scope: 'pinned',
+              }),
+            })
+            const geminiBody = await geminiRes.json().catch(() => ({}))
+            if (geminiRes.ok && String(geminiBody.summary || '').trim()) {
+              event = {
+                ...event,
+                original_summary: event.original_summary || event.summary,
+                summary: String(geminiBody.summary).trim(),
+                gemini_formating: true,
+                gemini_classified_at: new Date().toISOString(),
+                gemini_model: geminiBody.model || event.gemini_model || null,
+              }
+            }
+          } catch {
+            /* share with scrape/Yahoo text */
+          }
+        }
+      }
+
+      patchTab(symbol, { loading: false })
+      await openSocialShare(symbol, event, item.company_name || symbol)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Share prep failed'
+      patchTab(symbol, { loading: false, error: message })
+      toast({
+        title: `Could not share ${symbol}`,
+        description: message,
+        variant: 'destructive',
+        durationMs: 5000,
+      })
+    } finally {
+      setExtremeShareBusy(false)
+    }
+  }
+
   function downloadShareImage(
     blob: Blob | null,
     ticker?: string,
@@ -14797,14 +15082,14 @@ export default function NotificationsPage() {
   )
 
   const loadExtremeMovers = useCallback(async (opts?: { silent?: boolean }) => {
-    if (!opts?.silent) setExtremeMoversLoading(true)
+    if (opts?.silent) setExtremeMoversRefreshing(true)
+    else setExtremeMoversLoading(true)
     setExtremeMoversError('')
     try {
-      // Yahoo Day Gainers + Day Losers, abs ≥10% (no $1B filter — full top lists).
       const body = await fetchYahooExtremeMovers({
-        minPercent: 10,
+        minPercent: EXTREME_MIN_PERCENT,
         minMarketCap: 0,
-        count: 100,
+        count: 200,
       })
       setExtremeMovers(Array.isArray(body.movers) ? body.movers : [])
       setExtremeMoversFetchedAt(body.fetchedAt || new Date().toISOString())
@@ -14813,7 +15098,8 @@ export default function NotificationsPage() {
         error instanceof Error ? error.message : 'Failed to load extreme movers',
       )
     } finally {
-      if (!opts?.silent) setExtremeMoversLoading(false)
+      setExtremeMoversLoading(false)
+      setExtremeMoversRefreshing(false)
     }
   }, [])
 
@@ -14833,27 +15119,237 @@ export default function NotificationsPage() {
     return list
   }, [extremeMovers, extremeDirectionTab])
 
-  const extremePositiveCount = useMemo(
-    () =>
-      extremeMovers.filter((item) => Number(item.regularMarketChangePercent) > 0).length,
-    [extremeMovers],
-  )
-  const extremeNegativeCount = useMemo(
-    () =>
-      extremeMovers.filter((item) => Number(item.regularMarketChangePercent) < 0).length,
-    [extremeMovers],
-  )
+  const extremePositiveMovers = useMemo(() => {
+    const list = extremeMovers.filter(
+      (item) => Number(item.regularMarketChangePercent) >= EXTREME_MIN_PERCENT,
+    )
+    list.sort(
+      (a, b) =>
+        Math.abs(Number(b.regularMarketChangePercent) || 0) -
+          Math.abs(Number(a.regularMarketChangePercent) || 0) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    return list
+  }, [extremeMovers])
 
-  // Load Extreme tab from Yahoo when opened (and refresh while it stays open).
+  const extremeNegativeMovers = useMemo(() => {
+    const list = extremeMovers.filter(
+      (item) => Number(item.regularMarketChangePercent) <= -EXTREME_MIN_PERCENT,
+    )
+    list.sort(
+      (a, b) =>
+        Math.abs(Number(b.regularMarketChangePercent) || 0) -
+          Math.abs(Number(a.regularMarketChangePercent) || 0) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    return list
+  }, [extremeMovers])
+
+  const extremePositiveCount = extremePositiveMovers.length
+  const extremeNegativeCount = extremeNegativeMovers.length
+
+  // Trigger desk: always load Yahoo extremes (≥5%, all asset classes).
   useEffect(() => {
-    if (isDeskOnlyMode()) return
-    if (stocksListTab !== 'extreme' || section !== 'tickers') return
     void loadExtremeMovers()
     const timer = window.setInterval(() => {
       void loadExtremeMovers({ silent: true })
     }, 60_000)
     return () => window.clearInterval(timer)
-  }, [stocksListTab, section, loadExtremeMovers])
+  }, [loadExtremeMovers])
+
+  /** Peak/Now deep-link: open share immediately with stored alert heading + likely driver. */
+  async function handleDirectShareFromEpisode(payload: TriggerSharePayload) {
+    const symbol = String(payload.ticker || '')
+      .trim()
+      .toUpperCase()
+    if (!symbol || extremeShareBusy) return
+    setExtremeShareBusy(true)
+    selectTickerByUser(symbol)
+    const move = Number(payload.move)
+    const pctLabel = Number.isFinite(move)
+      ? `${move > 0 ? '+' : ''}${move.toFixed(2)}%`
+      : ''
+    const todayEt = new Date().toLocaleDateString('en-CA', {
+      timeZone: 'America/New_York',
+    })
+    const headline = String(payload.headline || '').trim()
+    const likely = String(payload.likelyDriver || '').trim()
+    const summaryParts = [
+      headline ||
+        (pctLabel
+          ? `${payload.label || symbol} moved ${pctLabel}${payload.window ? ` (${payload.window})` : ''}`
+          : ''),
+      likely ? `Likely driver: ${likely}` : '',
+    ].filter(Boolean)
+    const event: PriceMovementEvent = {
+      event_date: todayEt,
+      display_date: todayEt,
+      time_label: payload.window || null,
+      price: null,
+      price_change: pctLabel || null,
+      momentum: pctLabel || null,
+      direction:
+        payload.direction === 'DOWN' || (Number.isFinite(move) && move < 0)
+          ? 'down'
+          : 'up',
+      summary: summaryParts.join('\n\n') || `${symbol} momentum move`,
+      sources: [],
+      save_status: 'new',
+    }
+    try {
+      toast({
+        title: `Share · ${symbol}`,
+        description: 'Opening share with stored research (no new scrape)…',
+        durationMs: 3000,
+      })
+      await openSocialShare(symbol, event, payload.label || symbol)
+    } catch (error) {
+      toast({
+        title: `Could not share ${symbol}`,
+        description: error instanceof Error ? error.message : 'Share failed',
+        variant: 'destructive',
+        durationMs: 5000,
+      })
+    } finally {
+      setExtremeShareBusy(false)
+    }
+  }
+
+  // Deep link: /trigger?ticker=X&share=1&mode=scrape|direct|research
+  useEffect(() => {
+    if (extremeShareUrlHandledRef.current) return
+    let params: URLSearchParams
+    try {
+      params = new URLSearchParams(window.location.search)
+    } catch {
+      return
+    }
+    const share = params.get('share')
+    const ticker = String(params.get('ticker') || '')
+      .trim()
+      .toUpperCase()
+    if (!ticker || (share !== '1' && share !== 'true')) return
+
+    let payload = readTriggerSharePayload(ticker)
+    if (!payload || String(payload.ticker || '').toUpperCase() !== ticker) {
+      const modeParam = String(params.get('mode') || '').toLowerCase()
+      const kindParam = String(params.get('kind') || '').toLowerCase()
+      const mode: TriggerSharePayload['mode'] =
+        modeParam === 'direct'
+          ? 'direct'
+          : modeParam === 'research' ||
+              kindParam === 'sofar' ||
+              kindParam === 'peak'
+            ? 'research'
+            : 'scrape'
+      const priceParam = params.get('price')
+      const priceFromParam = params.get('priceFrom')
+      const exactMinutesParam = params.get('exactMinutes')
+      payload = {
+        ticker,
+        mode,
+        label: params.get('label') || undefined,
+        move: params.get('move') != null ? Number(params.get('move')) : null,
+        price:
+          priceParam != null && priceParam !== ''
+            ? Number(priceParam)
+            : null,
+        priceFrom:
+          priceFromParam != null && priceFromParam !== ''
+            ? Number(priceFromParam)
+            : null,
+        exactLabel: params.get('exactLabel') || undefined,
+        exactMinutes:
+          exactMinutesParam != null && exactMinutesParam !== ''
+            ? Number(exactMinutesParam)
+            : null,
+        direction: params.get('direction') || undefined,
+        kind: params.get('kind') || undefined,
+      }
+    }
+
+    const kindLower = String(payload.kind || '').toLowerCase()
+    const isResearch =
+      payload.mode === 'research' ||
+      kindLower === 'sofar' ||
+      kindLower === 'peak'
+
+    // Scrape mode can wait until extremes list has a chance to load for company name
+    if (
+      !isResearch &&
+      payload.mode !== 'direct' &&
+      !extremeMovers.length &&
+      extremeMoversLoading
+    ) {
+      return
+    }
+
+    extremeShareUrlHandledRef.current = true
+
+    try {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('share')
+      url.searchParams.delete('mode')
+      url.searchParams.delete('kind')
+      url.searchParams.delete('move')
+      url.searchParams.delete('price')
+      url.searchParams.delete('priceFrom')
+      url.searchParams.delete('exactLabel')
+      url.searchParams.delete('exactMinutes')
+      url.searchParams.delete('label')
+      url.searchParams.delete('direction')
+      window.history.replaceState({}, '', url.pathname + url.search + url.hash)
+    } catch {
+      /* ignore */
+    }
+
+    selectTickerByUser(ticker)
+    const pct = Number(payload.move)
+    const sharePrice = Number(payload.price)
+    if (
+      Number.isFinite(pct) ||
+      payload.label ||
+      Number.isFinite(sharePrice)
+    ) {
+      setLiveQuotes((prev) => ({
+        ...prev,
+        [ticker]: {
+          ...(prev[ticker] || {}),
+          symbol: ticker,
+          shortName: payload.label || prev[ticker]?.shortName || ticker,
+          regularMarketChangePercent: Number.isFinite(pct)
+            ? pct
+            : prev[ticker]?.regularMarketChangePercent ?? null,
+          regularMarketPrice: Number.isFinite(sharePrice)
+            ? sharePrice
+            : prev[ticker]?.regularMarketPrice ?? null,
+        },
+      }))
+    }
+
+    if (isResearch) {
+      setSofarResearchPayload(payload)
+      setSofarResearchOpen(true)
+      // No bottom toast — composer UI is enough
+      return
+    }
+
+    if (payload.mode === 'direct') {
+      void handleDirectShareFromEpisode(payload)
+      return
+    }
+
+    const mover = extremeMovers.find((row) => row.ticker.toUpperCase() === ticker)
+    void handleExtremeRowShare(
+      mover || {
+        ticker,
+        company_name: payload.label || ticker,
+        regularMarketChangePercent: Number.isFinite(pct) ? pct : undefined,
+      },
+    )
+    // one-shot deep link
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extremeMovers, extremeMoversLoading])
 
   const loadPinnedTickers = useCallback(async () => {
     try {
@@ -15021,7 +15517,9 @@ export default function NotificationsPage() {
   const previewBodyEmpty = !customBody.trim()
   const isHub = appTab === 'hub'
   const isTrigger = appTab === 'trigger'
-  const isNineAm = appTab === 'nineam'
+  // Retained for dormant Fetch & save / Users-sort paths still in this megafile.
+  void updateTickerSort
+  void handleRefreshAll
 
   return (
     <div
@@ -15031,32 +15529,6 @@ export default function NotificationsPage() {
         isHub ? 'bg-background' : isTrigger ? 'desk-shell' : 'bg-background',
       )}
     >
-      {/* Home: ticker tabs (line) + app switcher · Episode Dashboard */}
-      {isHub ? (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <EpisodeDashboard
-            onOpenInTrigger={(ticker, label) => {
-              const symbol = String(ticker || '')
-                .trim()
-                .toUpperCase()
-              if (!symbol) return
-              // Switch into Trigger, then select/add this stock in the sidebar
-              setAppTab('trigger')
-              setStocksListTab('users')
-              if (monitoredTickerSet.has(symbol)) {
-                selectTickerByUser(symbol)
-              } else {
-                void addMonitoredTicker(symbol, label || symbol)
-              }
-            }}
-            onOpenTriggerApp={() => setAppTab('trigger')}
-            onOpenNineAmApp={() => setAppTab('nineam')}
-            theme={theme}
-            onToggleTheme={toggleTheme}
-          />
-        </div>
-      ) : null}
-
       <header
         className={cn(
           'relative z-20 shrink-0',
@@ -15102,18 +15574,8 @@ export default function NotificationsPage() {
                 <p className="text-[11px] font-semibold tracking-tight text-foreground">
                   Trigger
                 </p>
-                <p className="text-[10px] text-muted-foreground">Episode Dashboard</p>
+                <p className="text-[10px] text-muted-foreground">Extreme · share desk</p>
               </div>
-              <span className="desk-stat" title="Monitored instruments">
-                Instruments <strong>{tickers.length}</strong>
-              </span>
-              <span
-                className="desk-stat"
-                title={`${devices.filter((d) => d.enabled).length} notifications on · ${devices.filter((d) => !d.enabled).length} stopped`}
-              >
-                Devices{' '}
-                <strong>{devices.filter((d) => d.enabled).length}</strong>
-              </span>
               <button
                 type="button"
                 onClick={() => void openUsagePopup('gemini')}
@@ -15175,14 +15637,9 @@ export default function NotificationsPage() {
                 </strong>
               </button>
             </div>
-          ) : (
-            <div className="min-w-0 shrink">
-              <p className="truncate text-sm font-semibold tracking-tight">9AM</p>
-              <p className="truncate text-xs text-muted-foreground">Notification dashboard</p>
-            </div>
-          )}
+          ) : null}
 
-          {/* App switcher — Home · Trigger · 9AM (Home default) */}
+          {/* App switcher — Home · Trigger (9AM removed) */}
           <div
             className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5"
             role="tablist"
@@ -15226,118 +15683,9 @@ export default function NotificationsPage() {
             >
               <Zap className="size-4" />
             </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={isNineAm}
-              aria-label="9AM"
-              title="9AM"
-              onClick={() => setAppTab('nineam')}
-              className={cn(
-                isTrigger
-                  ? 'desk-icon-btn text-sm font-bold'
-                  : cn(
-                      'inline-flex size-10 items-center justify-center rounded-full border text-sm font-bold transition-colors',
-                      isNineAm
-                        ? 'border-foreground/15 bg-foreground text-background shadow-sm'
-                        : 'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
-                    ),
-              )}
-            >
-              9
-            </button>
           </div>
 
           <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
-            {isHub ? null : section === 'tickers' ? (
-              <>
-                {isTrigger ? (
-                  <>
-                    <button
-                      type="button"
-                      disabled={
-                        listLoading ||
-                        allTickersLoading ||
-                        !filteredTickers.some((item) => (item.subscriber_count ?? 0) > 0) ||
-                        filteredTickers.some((item) => tabState[item.ticker]?.loading)
-                      }
-                      onClick={() =>
-                        void handleRefreshAll(
-                          filteredTickers.filter((item) => (item.subscriber_count ?? 0) > 0),
-                          'fetch_all',
-                        )
-                      }
-                      title="Fetch & auto-save only tickers with at least 1 subscriber (≥4% Gemini)"
-                      className="desk-action"
-                    >
-                      {allTickersLoading && fetchAllMode === 'fetch_all' ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="size-3.5" />
-                      )}
-                      {allTickersLoading && fetchAllMode === 'fetch_all'
-                        ? `${allTickersProgress.completed}/${allTickersProgress.total}`
-                        : 'Fetch & save all'}
-                      {!(allTickersLoading && fetchAllMode === 'fetch_all') ? (
-                        <span className="rounded-full bg-muted/80 px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
-                          {
-                            filteredTickers.filter((item) => (item.subscriber_count ?? 0) > 0)
-                              .length
-                          }
-                        </span>
-                      ) : null}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={
-                        listLoading ||
-                        allTickersLoading ||
-                        !filteredTickers.some((item) => (item.subscriber_count ?? 0) > 0) ||
-                        filteredTickers.some((item) => tabState[item.ticker]?.loading)
-                      }
-                      onClick={() =>
-                        void handleRefreshAll(
-                          filteredTickers.filter((item) => (item.subscriber_count ?? 0) > 0),
-                          'nine_pm',
-                        )
-                      }
-                      title="9 PM alert: fetch all → Gemini on every new/updated date → review → send Today’s digest"
-                      className="desk-action desk-action--warn"
-                    >
-                      {allTickersLoading && fetchAllMode === 'nine_pm' ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <BellRing className="size-3.5" />
-                      )}
-                      {allTickersLoading && fetchAllMode === 'nine_pm'
-                        ? `${allTickersProgress.completed}/${allTickersProgress.total}`
-                        : '9 PM alert'}
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={listLoading || allTickersLoading}
-                    onClick={() => void loadTickers()}
-                    className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-sm font-medium transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-                  >
-                    {listLoading ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCw className="size-3.5" />
-                    )}
-                    Reload
-                  </button>
-                )}
-              </>
-            ) : null}
-            {section === 'news' || section === 'custom' || section === 'users' ? (
-              <p className="hidden text-xs text-muted-foreground md:block">
-                {devicesLoading
-                  ? 'Loading devices…'
-                  : `${devices.length} device${devices.length === 1 ? '' : 's'} with notifications on`}
-              </p>
-            ) : null}
             <button
               type="button"
               onClick={toggleTheme}
@@ -15394,8 +15742,8 @@ export default function NotificationsPage() {
                 type="button"
                 role="tab"
                 aria-selected={section === 'tickers'}
-                aria-label={isTrigger ? 'Episode Dashboard' : 'Tickers'}
-                title={isTrigger ? 'Episode Dashboard' : 'Tickers'}
+                aria-label="Extreme watchlist"
+                title="Extreme watchlist"
                 onClick={() => setSection('tickers')}
                 className={cn(
                   'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
@@ -15407,78 +15755,6 @@ export default function NotificationsPage() {
                 )}
               >
                 <TrendingUp className="size-4" />
-              </button>
-              {notificationApp === 'nineam' ? (
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={section === 'news'}
-                  aria-label="News"
-                  title="News"
-                  onClick={() => setSection('news')}
-                  className={cn(
-                    'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
-                    section === 'news'
-                      ? 'bg-foreground text-background shadow-sm'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                  )}
-                >
-                  <Newspaper className="size-4" />
-                </button>
-              ) : null}
-              {notificationApp === 'nineam' ? (
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={section === 'custom'}
-                  aria-label="Custom"
-                  title="Custom"
-                  onClick={() => setSection('custom')}
-                  className={cn(
-                    'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
-                    section === 'custom'
-                      ? 'bg-foreground text-background shadow-sm'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                  )}
-                >
-                  <PenLine className="size-4" />
-                </button>
-              ) : null}
-              <button
-                type="button"
-                role="tab"
-                aria-selected={section === 'users'}
-                aria-label={isTrigger ? 'Audience' : 'All users'}
-                title={isTrigger ? 'Audience' : 'All users'}
-                onClick={() => setSection('users')}
-                className={cn(
-                  'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
-                  section === 'users'
-                    ? isTrigger
-                      ? 'bg-primary text-primary-foreground shadow-sm'
-                      : 'bg-foreground text-background shadow-sm'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                )}
-              >
-                <Users className="size-4" />
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={section === 'settings'}
-                aria-label="Settings"
-                title="Settings"
-                onClick={() => setSection('settings')}
-                className={cn(
-                  'inline-flex size-9 items-center justify-center rounded-xl transition-colors',
-                  section === 'settings'
-                    ? isTrigger
-                      ? 'bg-primary text-primary-foreground shadow-sm'
-                      : 'bg-foreground text-background shadow-sm'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                )}
-              >
-                <Settings className="size-4" />
               </button>
             </div>
           ) : (
@@ -15523,109 +15799,13 @@ export default function NotificationsPage() {
                 >
                   <TrendingUp className="size-4 shrink-0" />
                   <span className="leading-tight">
-                    {isTrigger ? 'Episode Dashboard' : 'Tickers'}
+                    Extreme
                     <span
                       className={cn(
                         isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
                       )}
                     >
-                      {isTrigger ? 'notable moves' : 'alert'}
-                    </span>
-                  </span>
-                </button>
-                {notificationApp === 'nineam' ? (
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={section === 'news'}
-                    onClick={() => setSection('news')}
-                    className={cn(
-                      'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
-                      section === 'news'
-                        ? 'border-foreground bg-foreground text-background'
-                        : 'border-transparent bg-transparent text-foreground hover:bg-muted',
-                    )}
-                  >
-                    <Newspaper className="size-4 shrink-0" />
-                    <span className="leading-tight">
-                      News
-                      <span className="block text-[11px] font-normal opacity-80">alert</span>
-                    </span>
-                  </button>
-                ) : null}
-                {notificationApp === 'nineam' ? (
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={section === 'custom'}
-                    onClick={() => setSection('custom')}
-                    className={cn(
-                      'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
-                      section === 'custom'
-                        ? 'border-foreground bg-foreground text-background'
-                        : 'border-transparent bg-transparent text-foreground hover:bg-muted',
-                    )}
-                  >
-                    <PenLine className="size-4 shrink-0" />
-                    <span className="leading-tight">
-                      Custom
-                      <span className="block text-[11px] font-normal opacity-80">alert</span>
-                    </span>
-                  </button>
-                ) : null}
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={section === 'users'}
-                  onClick={() => setSection('users')}
-                  className={cn(
-                    isTrigger
-                      ? 'desk-nav-item'
-                      : cn(
-                          'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
-                          section === 'users'
-                            ? 'border-foreground bg-foreground text-background'
-                            : 'border-transparent bg-transparent text-foreground hover:bg-muted',
-                        ),
-                  )}
-                >
-                  <Users className="size-4 shrink-0" />
-                  <span className="leading-tight">
-                    {isTrigger ? 'Audience' : 'All users'}
-                    <span
-                      className={cn(
-                        isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
-                      )}
-                    >
-                      {isTrigger ? 'devices' : 'alertable devices'}
-                    </span>
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={section === 'settings'}
-                  onClick={() => setSection('settings')}
-                  className={cn(
-                    isTrigger
-                      ? 'desk-nav-item'
-                      : cn(
-                          'flex items-center gap-2 rounded-xl border px-3 py-3 text-left text-sm font-medium transition-colors',
-                          section === 'settings'
-                            ? 'border-foreground bg-foreground text-background'
-                            : 'border-transparent bg-transparent text-foreground hover:bg-muted',
-                        ),
-                  )}
-                >
-                  <Settings className="size-4 shrink-0" />
-                  <span className="leading-tight">
-                    Settings
-                    <span
-                      className={cn(
-                        isTrigger ? 'desk-nav-sub' : 'block text-[11px] font-normal opacity-80',
-                      )}
-                    >
-                      version · build
+                      ≥5% Yahoo movers
                     </span>
                   </span>
                 </button>
@@ -15633,111 +15813,34 @@ export default function NotificationsPage() {
                 {isTrigger ? (
                   <div className="mt-auto space-y-3 pt-6">
                     <div className="desk-panel p-3.5">
-                      <p className="desk-section-label">Snapshot</p>
+                      <p className="desk-section-label">AI usage</p>
                       <div className="mt-3 space-y-2 text-sm">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-muted-foreground">Instruments</span>
-                          <span className="font-semibold tabular-nums">{tickers.length}</span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-muted-foreground">Devices on</span>
-                          <span className="font-semibold tabular-nums">
-                            {devices.filter((d) => d.enabled).length}
+                        <button
+                          type="button"
+                          onClick={() => void openUsagePopup('gemini')}
+                          className="flex w-full items-center justify-between gap-2 text-left transition hover:opacity-90"
+                          title="Open Gemini daily spend"
+                        >
+                          <span className="text-muted-foreground">Gemini</span>
+                          <span className="font-semibold tabular-nums text-primary">
+                            {geminiTotals?.cost_usd_display ||
+                              formatUsdCompact(geminiTotals?.cost_usd) ||
+                              '$0.000000'}
                           </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-muted-foreground">Universe</span>
-                          <span className="font-semibold">Stocks</span>
-                        </div>
-                        <div className="border-t border-border/50 pt-2 space-y-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                            Gemini usage
-                          </p>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Spend</span>
-                            <span className="font-semibold tabular-nums text-primary">
-                              {geminiTotals?.cost_usd_display ||
-                                formatUsdCompact(geminiTotals?.cost_usd) ||
-                                '$0.000000'}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Tokens</span>
-                            <span className="font-semibold tabular-nums">
-                              {(geminiTotals?.total_tokens || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">In / out</span>
-                            <span className="text-xs font-semibold tabular-nums">
-                              {(geminiTotals?.prompt_tokens || 0).toLocaleString()} /{' '}
-                              {(geminiTotals?.output_tokens || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Dates tagged</span>
-                            <span className="font-semibold tabular-nums">
-                              {geminiTotals?.dates_with_gemini || 0}
-                            </span>
-                          </div>
-                        </div>
+                        </button>
                         <button
                           type="button"
                           onClick={() => void openUsagePopup('perplexity')}
-                          className="w-full border-t border-border/50 pt-2 space-y-2 text-left transition hover:opacity-90"
+                          className="flex w-full items-center justify-between gap-2 border-t border-border/50 pt-2 text-left transition hover:opacity-90"
                           title="Open Perplexity daily spend"
                         >
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                            Perplexity usage
-                          </p>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Spend</span>
-                            <span className="font-semibold tabular-nums text-sky-700 dark:text-sky-300">
-                              {perplexityTotals?.total_cost_usd_display ||
-                                formatUsdCompact(perplexityTotals?.total_cost_usd) ||
-                                '$0.000000'}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Token credits</span>
-                            <span className="font-semibold tabular-nums">
-                              {(perplexityTotals?.total_credits || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Calls</span>
-                            <span className="font-semibold tabular-nums">
-                              {(perplexityTotals?.total_calls || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <p className="text-[10px] leading-snug text-muted-foreground">
-                            Click for day-by-day breakdown
-                          </p>
+                          <span className="text-muted-foreground">Perplexity</span>
+                          <span className="font-semibold tabular-nums text-primary">
+                            {perplexityTotals?.total_cost_usd_display ||
+                              formatUsdCompact(perplexityTotals?.total_cost_usd) ||
+                              '$0.000000'}
+                          </span>
                         </button>
-                        <div className="border-t border-border/50 pt-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-muted-foreground">Firecrawl</span>
-                            <span
-                              className="max-w-[7.5rem] truncate text-right text-xs font-semibold tabular-nums"
-                              title={creditHint || undefined}
-                            >
-                              {firecrawlCredits?.remaining != null
-                                ? firecrawlCredits.plan != null
-                                  ? `${firecrawlCredits.remaining} / ${firecrawlCredits.plan}`
-                                  : String(firecrawlCredits.remaining)
-                                : creditHint
-                                  ? creditHint
-                                      .replace(/^Firecrawl balance:\s*/i, '')
-                                      .replace(/^Firecrawl remaining:\s*/i, '')
-                                      .replace(/\s*credits\.?$/i, '')
-                                      .trim() || '—'
-                                  : '—'}
-                            </span>
-                          </div>
-                          <p className="mt-1 text-[10px] leading-snug text-muted-foreground">
-                            Remaining credits
-                          </p>
-                        </div>
                       </div>
                     </div>
                   </div>
@@ -15766,9 +15869,9 @@ export default function NotificationsPage() {
                   ),
             )}
           >
-            {section === 'settings' ? (
+            {false && section === 'settings' ? (
               <>
-                {/* Settings form → public.app_releases (ios | android | all) */}
+                {/* Settings form → public.app_releases (ios | android | all) — removed from lean Trigger */}
                 <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
                   <div className="space-y-1.5">
                     {isTrigger ? <p className="desk-section-label">Release</p> : null}
@@ -16074,7 +16177,7 @@ export default function NotificationsPage() {
                   <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-4">
                     <p className="text-xs text-muted-foreground">
                       {appSettingsUpdatedAt
-                        ? `Last saved ${new Date(appSettingsUpdatedAt).toLocaleString()}`
+                        ? `Last saved ${formatLocalDateTimeWithZone(String(appSettingsUpdatedAt))}`
                         : appReleases.some((r) => r.id === appReleasePlatform)
                           ? 'Loaded · not edited yet'
                           : 'No row yet — Save will create it'}
@@ -16094,7 +16197,7 @@ export default function NotificationsPage() {
                   </div>
                 </div>
               </>
-            ) : section === 'users' ? (
+            ) : false && section === 'users' ? (
               <>
                 <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
                   <div className="space-y-1.5">
@@ -16425,7 +16528,7 @@ export default function NotificationsPage() {
                   </div>
                 ) : null}
               </>
-            ) : section === 'custom' ? (
+            ) : false && section === 'custom' ? (
               <>
                 <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
                   <div className="space-y-1">
@@ -16678,7 +16781,7 @@ export default function NotificationsPage() {
                   </section>
                 </div>
               </>
-            ) : section === 'news' ? (
+            ) : false && section === 'news' ? (
               <>
                 <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
                   <div className="space-y-1">
@@ -16847,7 +16950,7 @@ export default function NotificationsPage() {
                                 ) : null}
                                 {article.published_at ? (
                                   <span>
-                                    {new Date(article.published_at).toLocaleString()}
+                                    {formatLocalDateTimeWithZone(article.published_at)}
                                   </span>
                                 ) : null}
                               </div>
@@ -17016,127 +17119,31 @@ export default function NotificationsPage() {
                         Watchlist
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {stocksListTab === 'extreme'
-                          ? extremeMoversLoading && !extremeMovers.length
-                            ? 'Loading Yahoo…'
-                            : `${filteredExtremeMovers.length} ${extremeDirectionTab}`
-                          : stocksListTab === 'pinned'
-                            ? `${extremePinned.length} pinned`
-                            : listLoading && !filteredTickers.length
-                              ? 'Loading…'
-                              : `${filteredTickers.length} ticker${filteredTickers.length === 1 ? '' : 's'}`}
+                        {extremeMoversLoading && !extremeMovers.length
+                          ? 'Loading Yahoo…'
+                          : `${filteredExtremeMovers.length} ${extremeDirectionTab}`}
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
-                      {stocksListTab === 'extreme' ? (
-                        <button
-                          type="button"
-                          title="Refresh extreme movers from Yahoo"
-                          aria-label="Refresh extreme movers"
-                          disabled={extremeMoversLoading}
-                          onClick={() => void loadExtremeMovers()}
-                          className="inline-flex size-8 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-                        >
-                          {extremeMoversLoading ? (
-                            <Loader2 className="size-3.5 animate-spin" />
-                          ) : (
-                            <RefreshCw className="size-3.5" />
-                          )}
-                        </button>
-                      ) : stocksListTab === 'users' ? (
-                        <>
-                          <button
-                            type="button"
-                            title="Sort by largest live percentage movement"
-                            aria-label="Sort by percentage movement"
-                            aria-pressed={
-                              tickerSort === 'movement' ||
-                              tickerSort === 'movement_pos_to_neg' ||
-                              tickerSort === 'movement_neg_to_pos'
-                            }
-                            onClick={() => updateTickerSort('movement')}
-                            className={cn(
-                              'inline-flex size-8 items-center justify-center rounded-lg border transition-colors',
-                              tickerSort === 'movement' ||
-                                tickerSort === 'movement_pos_to_neg' ||
-                                tickerSort === 'movement_neg_to_pos'
-                                ? isTrigger
-                                  ? 'border-primary/30 bg-primary text-primary-foreground'
-                                  : 'border-foreground bg-foreground text-background'
-                                : 'border-border/70 bg-background text-muted-foreground hover:bg-muted hover:text-foreground',
-                            )}
-                          >
-                            <TrendingUp className="size-3.5" />
-                          </button>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                            <button
-                              type="button"
-                              title={`Sort: ${TICKER_SORT_OPTIONS.find((o) => o.id === tickerSort)?.label || 'Sort'}`}
-                              aria-label="Sort tickers"
-                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                            >
-                              <ArrowUpDown className="size-3.5" />
-                            </button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="w-52">
-                            {TICKER_SORT_OPTIONS.map((option) => (
-                              <DropdownMenuItem
-                                key={option.id}
-                                onClick={() => updateTickerSort(option.id)}
-                                className={cn(tickerSort === option.id && 'bg-muted font-medium')}
-                              >
-                                {option.label}
-                              </DropdownMenuItem>
-                            ))}
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </>
-                      ) : null}
+                      <button
+                        type="button"
+                        title="Refresh extreme movers from Yahoo"
+                        aria-label="Refresh extreme movers"
+                        disabled={extremeMoversLoading}
+                        onClick={() => void loadExtremeMovers()}
+                        className="inline-flex size-8 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        {extremeMoversLoading ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <RefreshCw className="size-3.5" />
+                        )}
+                      </button>
                     </div>
                   </div>
 
-                  {/* Users · Extreme · Pinned — Extreme never writes to Users */}
-                  <div
-                    className={cn(
-                      'mt-2.5',
-                      isTrigger
-                        ? 'desk-segment'
-                        : 'grid grid-cols-3 gap-1 rounded-lg border border-border/60 bg-background/70 p-0.5',
-                    )}
-                    role="tablist"
-                    aria-label="Stocks list mode"
-                  >
-                    {(
-                      [
-                        { id: 'users' as const, label: 'Users' },
-                        { id: 'extreme' as const, label: 'Extreme' },
-                        { id: 'pinned' as const, label: 'Pinned' },
-                      ] as const
-                    ).map((tab) => (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={stocksListTab === tab.id}
-                        onClick={() => setStocksListTab(tab.id)}
-                        className={
-                          isTrigger
-                            ? undefined
-                            : cn(
-                                'rounded-md px-1.5 py-1.5 text-[10px] font-semibold transition-colors sm:text-[11px]',
-                                stocksListTab === tab.id
-                                  ? 'bg-foreground text-background shadow-sm'
-                                  : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground',
-                              )
-                        }
-                      >
-                        {tab.label}
-                      </button>
-                    ))}
-                  </div>
-                  {stocksListTab === 'extreme' ? (
-                    <div className="mt-1.5 space-y-1.5">
+                  {/* Extreme only — Positive / Negative movers */}
+                  <div className="mt-2.5 space-y-1.5">
                       <div
                         className="grid grid-cols-2 gap-1 rounded-lg border border-border/60 bg-background/70 p-0.5"
                         role="tablist"
@@ -17183,18 +17190,12 @@ export default function NotificationsPage() {
                       </div>
                       <p className="text-[10px] leading-snug text-muted-foreground">
                         Yahoo top {extremeDirectionTab === 'positive' ? 'gainers' : 'losers'} ·
-                        ≥10%
+                        ≥{EXTREME_MIN_PERCENT}% · click a row to Share
                         {extremeMoversFetchedAt
-                          ? ` · ${new Date(extremeMoversFetchedAt).toLocaleTimeString()}`
+                          ? ` · ${formatLocalTimeWithZone(extremeMoversFetchedAt)}`
                           : ''}
                       </p>
-                    </div>
-                  ) : null}
-                  {stocksListTab === 'pinned' ? (
-                    <p className="mt-1.5 text-[10px] leading-snug text-muted-foreground">
-                      From Extreme · not Users
-                    </p>
-                  ) : null}
+                  </div>
                 </div>
                 <div
                   className={cn(
@@ -17202,13 +17203,7 @@ export default function NotificationsPage() {
                     isTrigger ? 'space-y-0.5 p-2' : 'space-y-0.5 p-1.5',
                   )}
                   role="tablist"
-                  aria-label={
-                    stocksListTab === 'extreme'
-                      ? `Extreme ${extremeDirectionTab} movers`
-                      : stocksListTab === 'pinned'
-                        ? 'Pinned extreme'
-                        : 'Stock tickers'
-                  }
+                  aria-label={`Extreme ${extremeDirectionTab} movers`}
                   aria-orientation="vertical"
                 >
                   {stocksListTab === 'extreme' ? (
@@ -17239,19 +17234,18 @@ export default function NotificationsPage() {
                       !filteredExtremeMovers.length ? (
                         <p className="px-2 py-6 text-xs text-muted-foreground">
                           No Yahoo top {extremeDirectionTab === 'positive' ? 'gainers' : 'losers'}{' '}
-                          with ≥10% right now.
+                          with ≥{EXTREME_MIN_PERCENT}% right now.
                         </p>
                       ) : null}
                       {!extremeMoversLoading && !extremeMoversError && !extremeMovers.length ? (
                         <p className="px-2 py-6 text-xs text-muted-foreground">
-                          No Yahoo Day Gainers / Day Losers with ≥10% right now. Retry later in
-                          the session.
+                          No Yahoo Day Gainers / Day Losers with ≥{EXTREME_MIN_PERCENT}% right now.
+                          Retry later in the session.
                         </p>
                       ) : null}
                       {filteredExtremeMovers.map((item) => {
                         const symbol = item.ticker
                         const selected = symbol === activeTicker
-                        const isPinned = extremePinnedSet.has(symbol)
                         const livePercent = formatLivePercent(item.regularMarketChangePercent)
                         const livePrice = formatProviderPrice(
                           item.regularMarketPrice,
@@ -17278,27 +17272,12 @@ export default function NotificationsPage() {
                               type="button"
                               role="tab"
                               aria-selected={selected}
+                              disabled={extremeShareBusy}
                               onClick={() => {
-                                selectTickerByUser(symbol)
-                                // Seed quote from Yahoo screener so detail shows immediately (no Users add).
-                                setLiveQuotes((prev) => ({
-                                  ...prev,
-                                  [symbol]: {
-                                    ...(prev[symbol] || {}),
-                                    symbol,
-                                    shortName: item.company_name || symbol,
-                                    regularMarketPrice: item.regularMarketPrice,
-                                    regularMarketChange: item.regularMarketChange,
-                                    regularMarketChangePercent: item.regularMarketChangePercent,
-                                    regularMarketPreviousClose: null,
-                                    currency: item.currency || 'USD',
-                                    marketState: item.marketState || null,
-                                    exchange: item.exchange || null,
-                                  },
-                                }))
+                                void handleExtremeRowShare(item)
                               }}
-                              title={`${symbol} · ${livePercent || ''} · ${item.company_name} · view only`}
-                              className="flex min-w-0 flex-1 items-start gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm"
+                              title={`${symbol} · ${livePercent || ''} · ${item.company_name} · click to Share`}
+                              className="flex min-w-0 flex-1 items-start gap-2 rounded-lg px-1.5 py-1.5 text-left text-sm disabled:opacity-60"
                             >
                               <TickerLogoMark
                                 symbol={symbol}
@@ -17366,31 +17345,6 @@ export default function NotificationsPage() {
                                   {item.company_name}
                                 </p>
                               </div>
-                            </button>
-                            <button
-                              type="button"
-                              title={isPinned ? 'Unpin' : 'Pin (goes to Pinned · not Users)'}
-                              aria-label={isPinned ? `Unpin ${symbol}` : `Pin ${symbol}`}
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                togglePinExtreme(item)
-                              }}
-                              className={cn(
-                                'mt-1.5 mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors',
-                                isTrigger
-                                  ? isPinned
-                                    ? 'text-primary hover:bg-primary/10'
-                                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                                  : selected
-                                    ? 'text-background/80 hover:bg-background/15 hover:text-background'
-                                    : isPinned
-                                      ? 'text-amber-700 hover:bg-amber-500/10 dark:text-amber-300'
-                                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                              )}
-                            >
-                              <Bookmark
-                                className={cn('size-3.5', isPinned && 'fill-current')}
-                              />
                             </button>
                           </div>
                         )
@@ -17650,21 +17604,28 @@ export default function NotificationsPage() {
                             </p>
                           ) : null}
                         </div>
-                        <span
-                          className={cn(
-                            isTrigger
-                              ? 'desk-count'
-                              : cn(
-                                  'mt-0.5 shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
-                                  selected
-                                    ? 'bg-background/15 text-background'
-                                    : 'bg-muted text-muted-foreground',
-                                ),
-                          )}
-                          title={`${watchers} user(s) monitoring`}
+                        <SubscriberHoverCard
+                          ticker={item.ticker}
+                          count={watchers}
+                          app={notificationApp}
                         >
-                          {watchers}
-                        </span>
+                          <span
+                            className={cn(
+                              'cursor-help',
+                              isTrigger
+                                ? 'desk-count'
+                                : cn(
+                                    'mt-0.5 shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
+                                    selected
+                                      ? 'bg-background/15 text-background'
+                                      : 'bg-muted text-muted-foreground',
+                                  ),
+                            )}
+                            aria-label={`${watchers} subscribers for ${item.ticker}`}
+                          >
+                            {watchers}
+                          </span>
+                        </SubscriberHoverCard>
                       </button>
                     )
                   })}
@@ -17705,6 +17666,17 @@ export default function NotificationsPage() {
                             key={`${symbol}-${row.exchange || ''}-${row.companyName || ''}`}
                             className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 hover:bg-muted/70"
                           >
+                            <CompanyLogo
+                              ticker={symbol}
+                              companyName={
+                                row.companyName ||
+                                row.longName ||
+                                row.shortName ||
+                                symbol
+                              }
+                              size="sm"
+                              className="size-7 bg-background"
+                            />
                             <button
                               type="button"
                               className="min-w-0 flex-1 rounded-md px-1 py-1 text-left"
@@ -17890,7 +17862,7 @@ export default function NotificationsPage() {
                               title={`Open ${activeTicker} on Yahoo Finance`}
                             >
                               Yahoo Finance
-                              <ExternalLink className="size-3 opacity-60" />
+                              <ArrowUpRight className="size-3 opacity-60" />
                             </a>
                             <a
                               href={perplexityFinanceUrl(activeTicker)}
@@ -17900,7 +17872,7 @@ export default function NotificationsPage() {
                               title={`Open ${activeTicker} on Perplexity Finance`}
                             >
                               Perplexity Finance
-                              <ExternalLink className="size-3 opacity-60" />
+                              <ArrowUpRight className="size-3 opacity-60" />
                             </a>
                           </div>
                         </div>
@@ -18065,7 +18037,7 @@ export default function NotificationsPage() {
                                 className="inline-flex min-w-0 items-center gap-0.5 font-semibold text-sky-700 hover:underline dark:text-sky-300"
                               >
                                 <span className="truncate">Open</span>
-                                <ExternalLink className="size-2.5 shrink-0 opacity-70" />
+                                <ArrowUpRight className="size-2.5 shrink-0 opacity-70" />
                               </a>
                             ),
                           })
@@ -18115,7 +18087,7 @@ export default function NotificationsPage() {
                           {activeMeta?.last_saved_at ? (
                             <span
                               className="hidden text-muted-foreground/70 sm:inline"
-                              title={new Date(activeMeta.last_saved_at).toLocaleString()}
+                              title={formatLocalDateTimeWithZone(activeMeta.last_saved_at)}
                             >
                               · {new Date(activeMeta.last_saved_at).toLocaleDateString()}
                             </span>
@@ -18139,7 +18111,7 @@ export default function NotificationsPage() {
                                 rel="noreferrer"
                               >
                                 <span className="truncate">{source.short}</span>
-                                <ExternalLink className="size-2.5 shrink-0 opacity-60" />
+                                <ArrowUpRight className="size-2.5 shrink-0 opacity-60" />
                               </a>
                             )
                           })()}
@@ -18165,33 +18137,19 @@ export default function NotificationsPage() {
                               ) : null}
                             </span>
                           )
-                          if (!devices.length) return chip
                           return (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button type="button" className="max-w-full text-left">
-                                  {chip}
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent
-                                side="bottom"
-                                align="start"
-                                className="max-w-sm p-2.5 text-left text-xs"
+                            <SubscriberHoverCard
+                              ticker={activeTicker}
+                              count={count}
+                              app={notificationApp}
+                            >
+                              <span
+                                className="inline-flex max-w-full cursor-help"
+                                aria-label={`${count} subscribers for ${activeTicker}`}
                               >
-                                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide opacity-70">
-                                  {notificationApp === 'trigger'
-                                    ? 'Trigger devices'
-                                    : 'Subscribed devices'}
-                                </p>
-                                <ul className="max-h-48 space-y-1 overflow-y-auto font-mono text-[11px] leading-snug">
-                                  {devices.map((id) => (
-                                    <li key={id} className="break-all">
-                                      {id}
-                                    </li>
-                                  ))}
-                                </ul>
-                              </TooltipContent>
-                            </Tooltip>
+                                {chip}
+                              </span>
+                            </SubscriberHoverCard>
                           )
                         })()}
                         <span className="text-border">·</span>
@@ -19116,7 +19074,7 @@ export default function NotificationsPage() {
                       Perplexity Finance
                     </a>
                     {activeMeta.last_saved_at
-                      ? ` · last save ${new Date(activeMeta.last_saved_at).toLocaleString()}`
+                      ? ` · last save ${formatLocalDateTimeWithZone(activeMeta.last_saved_at)}`
                       : ''}
                   </div>
                 ) : null}
@@ -19569,6 +19527,119 @@ export default function NotificationsPage() {
         </DialogContent>
       </Dialog>
 
+      <SofarResearchShareDialog
+        open={sofarResearchOpen}
+        onOpenChange={(open) => {
+          setSofarResearchOpen(open)
+          // Only clear payload when truly leaving (not parking for Edit)
+          if (!open && !parkedSofarComposerRef.current) {
+            setSofarResearchPayload(null)
+          }
+        }}
+        payload={sofarResearchPayload}
+        onRenderPreview={async ({ ticker, companyName, event }) => {
+          try {
+            const style = loadShareCardStyle()
+            const ev = event as PriceMovementEvent
+            const resolvedCompany = await resolveShareCompanyName(
+              ticker,
+              companyName,
+            )
+            const exchangeTz = tickerExchangeTimeZone(
+              ticker,
+              liveQuotes[String(ticker || '').toUpperCase()] || null,
+            )
+            const cardText = buildShareCardTextContent(
+              ticker,
+              ev,
+              resolvedCompany,
+              style,
+              exchangeTz,
+            )
+            const image = await renderMomentumTweetImage(
+              ticker,
+              ev,
+              resolvedCompany,
+              style,
+              cardText,
+              shareSideImageDataUrl,
+              exchangeTz,
+            )
+            return { imageUrl: image?.objectUrl || null }
+          } catch {
+            return { imageUrl: null }
+          }
+        }}
+        onEditShare={async ({ ticker, companyName, event }) => {
+          // Composer already hid itself (suppressLeaveTab). Park payload so
+          // closing the share-card editor restores Peak Research.
+          parkedSofarComposerRef.current =
+            sofarResearchPayload || parkedSofarComposerRef.current
+          setSocialSharePreviewFullscreen(false)
+          // Let Peak Research dialog unmount before opening the editor on top
+          await new Promise<void>((resolve) => {
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => resolve())
+            })
+          })
+          await openSocialShare(
+            ticker,
+            event as PriceMovementEvent,
+            companyName,
+          )
+        }}
+        onShareSocial={async ({ ticker, companyName, event }) => {
+          parkedSofarComposerRef.current =
+            sofarResearchPayload || parkedSofarComposerRef.current
+          setSocialSharePreviewFullscreen(false)
+          await new Promise<void>((resolve) => {
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => resolve())
+            })
+          })
+          await openSocialShare(
+            ticker,
+            event as PriceMovementEvent,
+            companyName,
+          )
+        }}
+        onNotify={async ({ ticker, companyName, title, body, event }) => {
+          selectTickerByUser(ticker)
+          const normalizedTicker = ticker.toUpperCase()
+          const eligible = alertableDevices.filter((device) =>
+            (device.tickers || []).some(
+              (item) => item.toUpperCase() === normalizedTicker,
+            ),
+          )
+          const pool =
+            eligible.length > 0
+              ? eligible
+              : alertableDevices.filter((d) => isDeviceAlertable(d))
+          const allRecipients = eligible.length === 0
+          setMovementAlertTarget({
+            ticker: normalizedTicker,
+            event: event as PriceMovementEvent,
+            allRecipients,
+          })
+          setMovementAlertDeviceKeys(
+            allRecipients ? [] : pool.map(deviceKey),
+          )
+          setMovementPreviewTitle(title)
+          setMovementPreviewBody(body)
+          setMovementPreviewError('')
+          setMovementPreviewLoading(false)
+          setMovementAlertOpen(true)
+          void companyName
+          toast({
+            title: `Notify · ${normalizedTicker}`,
+            description: allRecipients
+              ? 'Pick recipients, then send. Title/body are prefilled from research.'
+              : `Preselected ${pool.length} subscriber(s). Review title/body, then send.`,
+            durationMs: 4000,
+          })
+        }}
+      />
+
       <Dialog
         open={socialShareOpen}
         onOpenChange={(open) => {
@@ -19586,6 +19657,13 @@ export default function NotificationsPage() {
               return null
             })
             setSocialShareBusy(false)
+            // Return to parked Peak / So Far research composer
+            const parked = parkedSofarComposerRef.current
+            if (parked) {
+              parkedSofarComposerRef.current = null
+              setSofarResearchPayload(parked)
+              setSofarResearchOpen(true)
+            }
             setSocialSharePlatformBusy(null)
           }
         }}
@@ -20459,7 +20537,7 @@ export default function NotificationsPage() {
                   className="mt-1 inline-flex items-center gap-1 font-semibold text-sky-700 underline-offset-2 hover:underline dark:text-sky-300"
                 >
                   Open Perplexity API billing
-                  <ExternalLink className="size-3.5 opacity-70" />
+                  <ArrowUpRight className="size-3.5 opacity-70" />
                 </a>
               </div>
 
@@ -20581,9 +20659,9 @@ export default function NotificationsPage() {
       </Dialog>
 
       <Dialog
-        open={fetchAllHitsOpen}
+        open={false && fetchAllHitsOpen}
         onOpenChange={(open) => {
-          // Don't dismiss mid-run by accident — only allow close when idle.
+          // Lean Trigger: Fetch & save all / 9 PM dialog removed from UI.
           if (allTickersLoading) return
           setFetchAllHitsOpen(open)
         }}
@@ -20592,7 +20670,7 @@ export default function NotificationsPage() {
           <div className="flex shrink-0 items-start justify-between gap-3 pr-6">
             <DialogHeader className="min-w-0 flex-1 space-y-1.5 pr-0">
               <DialogTitle className="flex flex-wrap items-center gap-2">
-                {fetchAllMode === 'nine_pm' ? '9 PM alert' : 'Fetch & save all'}
+                {fetchAllMode === 'nine_pm' ? '9 PM ET alert' : 'Fetch & save all'}
                 {allTickersLoading ? (
                   <Badge variant="secondary" className="gap-1.5 tabular-nums">
                     <Loader2 className="size-3 animate-spin" />
@@ -21277,8 +21355,9 @@ export default function NotificationsPage() {
       </Dialog>
 
       <Dialog
-        open={digestOpen}
+        open={false && digestOpen}
         onOpenChange={(open) => {
+          // Lean Trigger: digest dialog removed from UI.
           setDigestOpen(open)
           if (!open) {
             setDigestScopeDeviceKeys([])
