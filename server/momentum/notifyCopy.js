@@ -427,7 +427,7 @@ export function sessionTitlePhrase(marketSession, windowKey, exactLabel) {
 
 /**
  * Human lookback for titles — never telegraph codes like "1H31M".
- * Examples: "in last 42 minutes" · "in last 1 hour 31 mins" · "in last 3 hours"
+ * Examples: "in last 42 mins" · "in last 1 hour 31 mins" · "in last 3 hours"
  *
  * @param {number} minutes
  * @param {{ useTradingWording?: boolean }} [opts]
@@ -442,7 +442,7 @@ export function formatHumanLookbackDuration(minutes, opts = {}) {
   const daysWord = trading ? 'trading days' : 'days'
 
   if (m < 60) {
-    return m === 1 ? 'in last 1 minute' : `in last ${m} minutes`
+    return m === 1 ? 'in last 1 min' : `in last ${m} mins`
   }
   if (m < 120) {
     const rem = m - 60
@@ -498,7 +498,7 @@ export function moveIntensityWord(direction, movePercent) {
  * Lookback phrase for alert titles.
  *
  * Day + PRE/POST/overnight:  "in pre-market so far" / … (no clock duration)
- * Rolling window (5m/60m/…): "in last 60 minutes" even if wall clock is still PRE
+ * Rolling window (5m/60m/…): "in last 1 hour" even if wall clock is still PRE
  * Gap (weekend):             "in last 3 trading hours"
  *
  * @param {number|null|undefined} minutes  minutes to name in the phrase
@@ -644,7 +644,7 @@ export function resolveTitleLookbackMinutes(opts = {}) {
 }
 
 /**
- * Alert title: 🟢 SNDK +7.6% surge in last 42 minutes
+ * Alert title: 🟢 SNDK +7.6% surge in last 42 mins
  *              🔴 Natural Gas -3.2% drop in last 1 hour 30 mins
  *              🟢 Crude Oil +4.1% surge in last 3 hours
  *              🟢 SNDK +8.0% surge in last 24 trading hours  (only when wall ≠ window)
@@ -684,6 +684,7 @@ export function buildMomentumAlertTitle(opts = {}) {
     windowKey: opts.windowKey,
     exactLabel: opts.exactLabel,
   })
+
   return [emoji, heading, pct, intensity, when]
     .filter(Boolean)
     .join(' ')
@@ -695,7 +696,7 @@ export function buildMomentumAlertTitle(opts = {}) {
  * Human duration between two ISO timestamps or ms.
  * @param {string|number|null|undefined} from
  * @param {string|number|null|undefined} to
- * @returns {string} e.g. "10 minutes", "8 mins", "1 hour"
+ * @returns {string} e.g. "10 mins", "1 min", "1 hour"
  */
 export function formatElapsed(from, to) {
   const a = typeof from === 'number' ? from : Date.parse(String(from || ''))
@@ -703,7 +704,7 @@ export function formatElapsed(from, to) {
   if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return null
   const mins = Math.max(1, Math.round((b - a) / 60_000))
   if (mins < 60) {
-    return mins === 1 ? '1 minute' : `${mins} minutes`
+    return mins === 1 ? '1 min' : `${mins} mins`
   }
   if (mins < 120) {
     const m = mins - 60
@@ -719,7 +720,7 @@ export function formatElapsed(from, to) {
   return `${h}h ${m}m`
 }
 
-/** Shorter form for titles: "10 minutes" → "10 minutes", "8 minutes" → "8 mins" */
+/** Short duration for notification titles: "1 min", "8 mins", "1 hour". */
 export function formatElapsedShort(from, to) {
   const a = typeof from === 'number' ? from : Date.parse(String(from || ''))
   const b = typeof to === 'number' ? to : Date.parse(String(to || ''))
@@ -873,13 +874,13 @@ export function buildNotificationCopy(ev) {
       }
       return {
         title: withDirectionCircle(
-          `${name} is accelerating again`,
+          `${name} is dropping again`,
           dir,
           move,
         ),
         body: fromMove
-          ? `The decline has extended from ${fromMove} to ${totalMove} after the earlier fade.`
-          : `The decline is building again after the earlier fade; it now stands at ${totalMove}.`,
+          ? `The decline has deepened from ${fromMove} to ${totalMove} after the earlier rebound.`
+          : `The decline is building again after the earlier rebound; it now stands at ${totalMove}.`,
       }
     }
 
@@ -930,21 +931,23 @@ export function buildNotificationCopy(ev) {
       // UP episode reversing → market going lower → red
       return {
         title: withDirectionCircle(
-          `${name} reverses lower`,
+          `${name} erases its gains and reverses lower`,
           'DOWN',
           -1,
         ),
-        body: 'Earlier gains have been erased as downside momentum builds.',
+        body:
+          'The earlier gains have been fully erased, and downside momentum has crossed the reversal threshold.',
       }
     }
     // DOWN episode rebounding → green
     return {
       title: withDirectionCircle(
-        `${name} rebounds sharply`,
+        `${name} erases its losses and reverses higher`,
         'UP',
         1,
       ),
-      body: 'Earlier losses are being recovered as upward momentum builds.',
+      body:
+        'The earlier losses have been fully recovered, and upward momentum has crossed the reversal threshold.',
     }
   }
 
@@ -1006,7 +1009,7 @@ export function buildNotificationCopy(ev) {
           fadeDir,
           null,
         ),
-        body: `The earlier ${peakDisp} move has faded sharply, with about ${remDisp} remaining.`,
+        body: `The move now stands at ${remDisp}, after reaching ${peakDisp} earlier.`,
       }
     }
     return {
@@ -1015,7 +1018,7 @@ export function buildNotificationCopy(ev) {
         fadeDir,
         null,
       ),
-      body: `The earlier ${peakDisp} move has faded sharply, with about ${remDisp} remaining.`,
+      body: `The decline now stands at ${remDisp}, after reaching ${peakDisp} earlier.`,
     }
   }
 

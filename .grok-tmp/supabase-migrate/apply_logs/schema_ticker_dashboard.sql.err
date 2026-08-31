@@ -1,0 +1,5 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_ticker_dashboard.sql:30: NOTICE:  policy "Service role can manage edgar holdings cache" for relation "public.edgar_holdings_cache" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_ticker_dashboard.sql:37: NOTICE:  policy "Service role can manage ticker dashboard snapshots" for relation "public.ticker_dashboard_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_ticker_dashboard.sql:44: NOTICE:  policy "Publishable key can read ticker dashboard snapshots" for relation "public.ticker_dashboard_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_ticker_dashboard.sql:51: NOTICE:  policy "Publishable key can insert ticker dashboard snapshots" for relation "public.ticker_dashboard_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_ticker_dashboard.sql:58: NOTICE:  policy "Publishable key can update ticker dashboard snapshots" for relation "public.ticker_dashboard_snapshots" does not exist, skipping

@@ -1,0 +1,21 @@
+{
+  "source": "ebcjsmpqogbwaxypgllh",
+  "target": "bsammfevuefowmpvsnju",
+  "tables": {
+    "thresholds": 1,
+    "device_profiles": 1,
+    "assets_monitor_based_on_device": 7,
+    "episodes_stocks": 2,
+    "episodes_crypto": 1,
+    "episodes_etfs": 0,
+    "episodes_commodities": 0,
+    "episodes_indexes": 0,
+    "episodes_forex": 0,
+    "events_episodes": 16,
+    "research": 4,
+    "market_session_bulletins": 1,
+    "perplexity_prompts": 7,
+    "usage_daily_ledger": 209
+  },
+  "total_rows": 249
+}

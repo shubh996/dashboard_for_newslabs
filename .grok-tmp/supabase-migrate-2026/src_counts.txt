@@ -1,0 +1,18 @@
+┌────────────────────────────────┬──────┐
+│ table                          │ rows │
+├────────────────────────────────┼──────┤
+│ usage_daily_ledger             │ 209  │
+│ events_episodes                │ 16   │
+│ perplexity_prompts             │ 7    │
+│ assets_monitor_based_on_device │ 7    │
+│ research                       │ 4    │
+│ episodes_stocks                │ 2    │
+│ device_profiles                │ 1    │
+│ thresholds                     │ 1    │
+│ episodes_crypto                │ 1    │
+│ market_session_bulletins       │ 1    │
+│ episodes_etfs                  │ 0    │
+│ episodes_commodities           │ 0    │
+│ episodes_indexes               │ 0    │
+│ episodes_forex                 │ 0    │
+└────────────────────────────────┴──────┘

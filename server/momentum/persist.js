@@ -156,18 +156,9 @@ export function episodeTableFor(ticker, hint) {
   return EPISODE_CLASS_TABLES[key] || EPISODE_CLASS_TABLES.stocks
 }
 
-function isMissingRelationError(err) {
-  const msg = String(err?.message || err || '')
-  return /schema cache|does not exist|could not find the table/i.test(msg)
-}
-
 async function fromEpisodeTable(supabase, ticker, hint, run) {
-  let sourceTable = episodeTableFor(ticker, hint)
-  let res = await run(supabase.from(sourceTable), sourceTable)
-  if (res?.error && isMissingRelationError(res.error)) {
-    sourceTable = 'episodes'
-    res = await run(supabase.from(sourceTable), sourceTable)
-  }
+  const sourceTable = episodeTableFor(ticker, hint)
+  const res = await run(supabase.from(sourceTable), sourceTable)
   return res && typeof res === 'object' ? { ...res, sourceTable } : res
 }
 
@@ -981,17 +972,6 @@ export async function loadTickerHistory(ticker, opts = {}) {
           .limit(episodeLimit),
       )
     }
-    if (!epQ.error && !(epQ.data || []).length) {
-      const legacy = await supabase
-        .from('episodes')
-        .select(EPISODE_LIGHT_COLUMNS)
-        .eq('ticker', symbol)
-        .order('started_at', { ascending: false })
-        .limit(episodeLimit)
-      if (!legacy.error && (legacy.data || []).length) {
-        epQ = { ...legacy, sourceTable: 'episodes' }
-      }
-    }
     const epErr = epQ.error
     const epRows = epQ.data
     if (epErr) {
@@ -1056,16 +1036,6 @@ export async function loadTickerHistory(ticker, opts = {}) {
         .limit(1)
         .maybeSingle(),
     )
-    if (!maxRes.data) {
-      const legacyMax = await supabase
-        .from('episodes')
-        .select('episode_no')
-        .eq('ticker', symbol)
-        .order('episode_no', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-      if (legacyMax.data) maxRes = legacyMax
-    }
     const maxRow = maxRes.data
     return {
       episodes,
@@ -1185,15 +1155,6 @@ export async function applyEpisodeEdit(ticker, episodeId, patch = {}, eventPatch
           q.select('*').eq('ticker', key).eq('episode_id', eid).maybeSingle(),
       )
       if (!error && data) base = memoryEpisodeFromRow(data)
-      if (!base) {
-        const legacy = await supabase
-          .from('episodes')
-          .select('*')
-          .eq('ticker', key)
-          .eq('episode_id', eid)
-          .maybeSingle()
-        if (!legacy.error && legacy.data) base = memoryEpisodeFromRow(legacy.data)
-      }
     }
   }
   if (!base) {
@@ -1497,15 +1458,6 @@ async function reopenEpisodeAfterEndEventDeleted(key, episodeId) {
         q.select('*').eq('ticker', key).eq('episode_id', eid).maybeSingle(),
       )
       if (data) base = memoryEpisodeFromRow(data)
-      if (!base) {
-        const legacy = await supabase
-          .from('episodes')
-          .select('*')
-          .eq('ticker', key)
-          .eq('episode_id', eid)
-          .maybeSingle()
-        if (legacy.data) base = memoryEpisodeFromRow(legacy.data)
-      }
     }
   }
   if (!base) return null
@@ -1755,12 +1707,7 @@ export async function deleteEpisodeFromSupabase(ticker, episodeId) {
       q.delete({ count: 'exact' }).eq('ticker', key).eq('episode_id', eid),
     )
     const { error: epErr, count: classCount } = classDel
-    const legacyDel = await supabase
-      .from('episodes')
-      .delete({ count: 'exact' })
-      .eq('ticker', key)
-      .eq('episode_id', eid)
-    const epCount = (classCount || 0) + (legacyDel.count || 0)
+    const epCount = classCount || 0
     if (epErr) {
       console.warn('[momentum persist] delete episode failed:', epErr.message)
       return { ok: false, error: epErr.message }

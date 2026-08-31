@@ -314,8 +314,8 @@ export async function researchStartMove(input) {
   const pushTitle =
     researchMode === 'reversal'
       ? dir === 'UP'
-        ? `🔴 ${ticker} reverses lower`
-        : `🟢 ${ticker} rebounds sharply`
+        ? `🔴 ${ticker} erases its gains and reverses lower`
+        : `🟢 ${ticker} erases its losses and reverses higher`
       : buildMomentumAlertTitle({
           ticker,
           companyName,
@@ -879,8 +879,8 @@ export async function handleAutoStartResearchAlerts(opts) {
       const revCore =
         (research.ok && research.push_title) ||
         (direction === 'UP'
-          ? `${ticker} reverses lower`
-          : `${ticker} rebounds sharply`)
+          ? `${ticker} erases its gains and reverses lower`
+          : `${ticker} erases its losses and reverses higher`)
       title = /^[🟢🔴]/.test(String(revCore).trim())
         ? String(revCore).trim()
         : `${revEmoji} ${String(revCore).trim()}`

@@ -1,0 +1,22 @@
+create table if not exists public.research (
+  id uuid not null default gen_random_uuid(),
+  episode_id text,
+  ticker text not null,
+  asset_class text,
+  likely_driver text,
+  secondary_driver text,
+  model_version text,
+  request_id text,
+  citations jsonb not null default '[]'::jsonb,
+  tokens jsonb,
+  cost jsonb,
+  cost_usd double precision,
+  cost_usd_display text,
+  process_steps jsonb,
+  source_table text,
+  created_at timestamptz not null default now(),
+  alert jsonb,
+  move_classification text,
+  confidence text,
+  primary key (id)
+);

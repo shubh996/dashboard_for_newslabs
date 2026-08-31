@@ -1,0 +1,1 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/fix_yahoo_save_timeout.sql:5: NOTICE:  index "yahoo_finance_snapshots_data_idx" does not exist, skipping

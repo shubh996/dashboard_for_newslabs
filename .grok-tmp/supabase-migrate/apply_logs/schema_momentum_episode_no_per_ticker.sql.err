@@ -1,0 +1,3 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_episode_no_per_ticker.sql:12: NOTICE:  constraint "momentum_episode_events_episode_no_fkey" of relation "momentum_episode_events" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_episode_no_per_ticker.sql:29: NOTICE:  index "momentum_episodes_episode_no_key" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_episode_no_per_ticker.sql:33: NOTICE:  relation "momentum_episodes_ticker_no_uidx" already exists, skipping

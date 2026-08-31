@@ -1,0 +1,1 @@
+{"query": "CREATE INDEX IF NOT EXISTS usage_daily_ledger_provider_day_idx ON public.usage_daily_ledger USING btree (provider, day DESC)"}

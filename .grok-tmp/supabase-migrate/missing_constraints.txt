@@ -1,0 +1,14 @@
+        table_name        | constraint_type |             constraint_name              |                                                 def                                                  
+--------------------------+-----------------+------------------------------------------+------------------------------------------------------------------------------------------------------
+ app_admin_users          | PRIMARY KEY     | app_admin_users_pkey                     | PRIMARY KEY (email)
+ app_feature_flags        | PRIMARY KEY     | app_feature_flags_pkey                   | PRIMARY KEY (key)
+ app_releases             | PRIMARY KEY     | app_releases_pkey                        | PRIMARY KEY (id)
+ device_monitored_tickers | PRIMARY KEY     | device_monitored_tickers_pkey            | PRIMARY KEY (ticker)
+ device_profiles          | PRIMARY KEY     | device_profiles_pkey                     | PRIMARY KEY (device_id)
+ trigger_device_monitor   | PRIMARY KEY     | trigger_device_monitor_pkey              | PRIMARY KEY (ticker)
+ trigger_device_profiles  | PRIMARY KEY     | trigger_device_profiles_pkey             | PRIMARY KEY (device_id)
+ waitlist_signups         | CHECK           | waitlist_signups_asset_class_check       | CHECK ((asset_class = ANY (ARRAY['crypto'::text, 'forex'::text, 'index'::text, 'commodity'::text])))
+ waitlist_signups         | PRIMARY KEY     | waitlist_signups_pkey                    | PRIMARY KEY (id)
+ waitlist_signups         | UNIQUE          | waitlist_signups_user_id_asset_class_key | UNIQUE (user_id, asset_class)
+(10 rows)
+

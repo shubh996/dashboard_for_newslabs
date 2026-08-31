@@ -1,0 +1,4 @@
+WARNING: Docker is not running
+Uploading asset (market-close-run): supabase/functions/market-close-run/index.ts
+Deployed Functions on project bsammfevuefowmpvsnju: market-close-run
+You can inspect your deployment in the Dashboard: https://supabase.com/dashboard/project/bsammfevuefowmpvsnju/functions

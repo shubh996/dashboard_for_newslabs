@@ -1,0 +1,20 @@
+        tablename         |                  indexname                  |                                                                           indexdef                                                                           
+--------------------------+---------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ app_admin_users          | app_admin_users_pkey                        | CREATE UNIQUE INDEX app_admin_users_pkey ON public.app_admin_users USING btree (email)
+ app_feature_flags        | app_feature_flags_pkey                      | CREATE UNIQUE INDEX app_feature_flags_pkey ON public.app_feature_flags USING btree (key)
+ app_releases             | app_releases_pkey                           | CREATE UNIQUE INDEX app_releases_pkey ON public.app_releases USING btree (id)
+ device_monitored_tickers | device_monitored_tickers_pkey               | CREATE UNIQUE INDEX device_monitored_tickers_pkey ON public.device_monitored_tickers USING btree (ticker)
+ device_monitored_tickers | device_monitored_tickers_subscribers_gin    | CREATE INDEX device_monitored_tickers_subscribers_gin ON public.device_monitored_tickers USING gin (subscribers)
+ device_monitored_tickers | device_monitored_tickers_ticker_idx         | CREATE INDEX device_monitored_tickers_ticker_idx ON public.device_monitored_tickers USING btree (ticker)
+ device_profiles          | device_profiles_expo_push_token_idx         | CREATE INDEX device_profiles_expo_push_token_idx ON public.device_profiles USING btree (expo_push_token) WHERE (expo_push_token IS NOT NULL)
+ device_profiles          | device_profiles_pkey                        | CREATE UNIQUE INDEX device_profiles_pkey ON public.device_profiles USING btree (device_id)
+ trigger_device_monitor   | trigger_device_monitor_pkey                 | CREATE UNIQUE INDEX trigger_device_monitor_pkey ON public.trigger_device_monitor USING btree (ticker)
+ trigger_device_monitor   | trigger_device_monitor_subscribers_gin      | CREATE INDEX trigger_device_monitor_subscribers_gin ON public.trigger_device_monitor USING gin (subscribers)
+ trigger_device_profiles  | trigger_device_profiles_expo_push_token_idx | CREATE INDEX trigger_device_profiles_expo_push_token_idx ON public.trigger_device_profiles USING btree (expo_push_token) WHERE (expo_push_token IS NOT NULL)
+ trigger_device_profiles  | trigger_device_profiles_pkey                | CREATE UNIQUE INDEX trigger_device_profiles_pkey ON public.trigger_device_profiles USING btree (device_id)
+ waitlist_signups         | waitlist_signups_asset_class_idx            | CREATE INDEX waitlist_signups_asset_class_idx ON public.waitlist_signups USING btree (asset_class)
+ waitlist_signups         | waitlist_signups_email_idx                  | CREATE INDEX waitlist_signups_email_idx ON public.waitlist_signups USING btree (email)
+ waitlist_signups         | waitlist_signups_pkey                       | CREATE UNIQUE INDEX waitlist_signups_pkey ON public.waitlist_signups USING btree (id)
+ waitlist_signups         | waitlist_signups_user_id_asset_class_key    | CREATE UNIQUE INDEX waitlist_signups_user_id_asset_class_key ON public.waitlist_signups USING btree (user_id, asset_class)
+(16 rows)
+

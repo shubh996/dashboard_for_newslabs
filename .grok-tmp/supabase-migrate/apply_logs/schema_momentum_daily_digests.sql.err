@@ -1,0 +1,1 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_daily_digests.sql:7: NOTICE:  extension "pgcrypto" already exists, skipping

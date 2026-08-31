@@ -1,0 +1,12 @@
+         relname          | relrowsecurity | relforcerowsecurity 
+--------------------------+----------------+---------------------
+ app_admin_users          | t              | f
+ app_feature_flags        | t              | f
+ app_releases             | t              | f
+ device_monitored_tickers | t              | f
+ device_profiles          | t              | f
+ trigger_device_monitor   | t              | f
+ trigger_device_profiles  | t              | f
+ waitlist_signups         | t              | f
+(8 rows)
+

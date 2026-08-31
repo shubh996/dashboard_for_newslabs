@@ -8,23 +8,130 @@ import { HEADLINE_PROBES, resolveMarketProfile } from './marketProfile.js'
 import { evaluateSymbolGate } from './engineGate.js'
 import { extractQuoteTimestampMs } from './freshness.js'
 import { resolveLifecycle, LIFECYCLE } from './lifecycle.js'
-import { formatHmInTimeZone, UK_ZONE } from './usEquitySession.js'
+import { formatHmInTimeZone, UK_ZONE, ET_ZONE } from './usEquitySession.js'
 
-function formatLondonStamp(iso) {
+/** Fallback IANA zone per headline probe when Yahoo omits exchangeTimezoneName. */
+const PROBE_LOCAL_TIME_ZONE = {
+  'us-stocks': ET_ZONE,
+  'us-nasdaq': ET_ZONE,
+  'cash-index': ET_ZONE,
+  canada: 'America/Toronto',
+  brazil: 'America/Sao_Paulo',
+  'uk-stocks': UK_ZONE,
+  'uk-ftse': UK_ZONE,
+  germany: 'Europe/Berlin',
+  france: 'Europe/Paris',
+  switzerland: 'Europe/Zurich',
+  'india-nse': 'Asia/Kolkata',
+  'india-bse': 'Asia/Kolkata',
+  japan: 'Asia/Tokyo',
+  china: 'Asia/Shanghai',
+  'hong-kong': 'Asia/Hong_Kong',
+  korea: 'Asia/Seoul',
+  singapore: 'Asia/Singapore',
+  australia: 'Australia/Sydney',
+  dubai: 'Asia/Dubai',
+  'south-africa': 'Africa/Johannesburg',
+  forex: ET_ZONE,
+  crypto: 'UTC',
+  commodities: ET_ZONE,
+  indices: ET_ZONE,
+}
+
+function resolveProbeTimeZone(entry, quote) {
+  const fromYahoo = String(
+    quote?.exchangeTimezoneName || quote?.timezone || '',
+  ).trim()
+  if (fromYahoo) return fromYahoo
+  const id = String(entry?.id || '')
+    .trim()
+    .toLowerCase()
+  if (PROBE_LOCAL_TIME_ZONE[id]) return PROBE_LOCAL_TIME_ZONE[id]
+  return UK_ZONE
+}
+
+/** Locale that yields recognisable short zone names (EDT, BST, IST…). */
+function localeForMarketZone(timeZone) {
+  const zone = String(timeZone || '').trim()
+  if (zone === UK_ZONE) return 'en-GB'
+  if (zone === 'Asia/Kolkata' || zone === 'Asia/Calcutta') return 'en-IN'
+  if (zone === 'Asia/Tokyo') return 'ja-JP'
+  if (zone.startsWith('America/')) return 'en-US'
+  if (zone.startsWith('Australia/')) return 'en-AU'
+  return 'en-US'
+}
+
+function shortZoneName(ms, timeZone) {
+  const zone = String(timeZone || '').trim() || UK_ZONE
+  if (zone === 'Asia/Kolkata' || zone === 'Asia/Calcutta') return 'IST'
+  if (zone === 'Asia/Tokyo') return 'JST'
+  if (zone === 'Asia/Seoul') return 'KST'
+  if (zone === 'Asia/Shanghai' || zone === 'Asia/Chongqing') return 'CST'
+  if (zone === 'Asia/Hong_Kong') return 'HKT'
+  if (zone === 'Asia/Singapore') return 'SGT'
+  if (zone === 'Asia/Dubai') return 'GST'
+  if (zone === 'UTC' || zone === 'Etc/UTC') return 'UTC'
+  try {
+    const raw =
+      new Intl.DateTimeFormat(localeForMarketZone(zone), {
+        timeZone: zone,
+        timeZoneName: 'short',
+      })
+        .formatToParts(new Date(ms))
+        .find((part) => part.type === 'timeZoneName')
+        ?.value?.trim() || ''
+    if (raw && !/^GMT[+-]/i.test(raw) && !/^UTC[+-]/i.test(raw)) return raw
+    // Fallback recognisable labels when Intl only gives GMT±N
+    if (zone === ET_ZONE || zone === 'America/Toronto') {
+      // Rough DST window; good enough for desk stamps.
+      const m = new Date(ms).getUTCMonth()
+      return m >= 2 && m <= 9 ? 'EDT' : 'EST'
+    }
+    if (zone === UK_ZONE) {
+      const m = new Date(ms).getUTCMonth()
+      return m >= 2 && m <= 9 ? 'BST' : 'GMT'
+    }
+    if (
+      zone === 'Europe/Berlin' ||
+      zone === 'Europe/Paris' ||
+      zone === 'Europe/Zurich'
+    ) {
+      const m = new Date(ms).getUTCMonth()
+      return m >= 2 && m <= 9 ? 'CEST' : 'CET'
+    }
+    if (zone === 'Australia/Sydney' || zone === 'Australia/Melbourne') {
+      const m = new Date(ms).getUTCMonth()
+      // Southern hemisphere: DST roughly Oct–Apr
+      return m >= 9 || m <= 3 ? 'AEDT' : 'AEST'
+    }
+    if (zone === 'America/Sao_Paulo') return 'BRT'
+    if (zone === 'Africa/Johannesburg') return 'SAST'
+    return raw || zone
+  } catch {
+    return zone
+  }
+}
+
+/** Stamp an instant in that market's local zone (EDT / BST / IST / JST…), never force London. */
+function formatMarketLocalStamp(iso, timeZone) {
   if (!iso) return null
   const ms = Date.parse(iso)
   if (!Number.isFinite(ms)) return null
+  const zone = String(timeZone || '').trim() || UK_ZONE
   try {
-    return new Intl.DateTimeFormat('en-GB', {
-      timeZone: UK_ZONE,
+    // Always English clock digits; zone abbrev comes from shortZoneName.
+    const clock = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone,
       weekday: 'short',
       hour: 'numeric',
       minute: '2-digit',
       hour12: true,
-      timeZoneName: 'short',
     }).format(new Date(ms))
+    const suffix = shortZoneName(ms, zone)
+    return suffix ? `${clock} ${suffix}` : clock
   } catch {
-    return formatHmInTimeZone(ms, UK_ZONE)
+    const hm = formatHmInTimeZone(ms, zone)
+    return hm || null
   }
 }
 
@@ -181,8 +288,15 @@ function probeSymbolFromQuote(entry, nowUtc, quote, batchError = null) {
               : 'Yahoo probe failed — no quote timestamp',
         }
       : gate
-  const lastUpdateLondon = formatLondonStamp(gateWithError.quoteTimestampUtc)
-  const resumeLondon = formatLondonStamp(gateWithError.nextExpectedOpenUtc)
+  const timeZone = resolveProbeTimeZone(entry, quote)
+  const lastUpdateLocal = formatMarketLocalStamp(
+    gateWithError.quoteTimestampUtc,
+    timeZone,
+  )
+  const resumeAtLocal = formatMarketLocalStamp(
+    gateWithError.nextExpectedOpenUtc,
+    timeZone,
+  )
   const marketStateRaw =
     quote?.marketState != null ? String(quote.marketState).trim() : null
   const marketState = marketStateRaw ? marketStateRaw.toUpperCase() : null
@@ -197,14 +311,19 @@ function probeSymbolFromQuote(entry, nowUtc, quote, batchError = null) {
     symbol,
     region: entry.region || null,
     exchange: exchangeName,
+    timeZone,
     profilePolicy: profile?.sessionPolicyId || null,
     calendarState: gateWithError.calendarState,
     sessionName: gateWithError.sessionName,
     marketState,
     currentSession: currentSessionLabel(life, entry.id, marketState),
     status: statusLabel(life, gateWithError.freshnessState, batchError),
-    lastUpdateLondon,
-    resumeAtLondon: resumeLondon,
+    lastUpdateLocal,
+    resumeAtLocal,
+    /** @deprecated Use lastUpdateLocal — kept so older clients still render a stamp. */
+    lastUpdateLondon: lastUpdateLocal,
+    /** @deprecated Use resumeAtLocal */
+    resumeAtLondon: resumeAtLocal,
     freshnessState: gateWithError.freshnessState,
     engineGate: gateWithError.engineGate,
     uiStatus: uiStatus(gateWithError, batchError),

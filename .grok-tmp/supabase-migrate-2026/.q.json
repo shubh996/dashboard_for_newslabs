@@ -1,0 +1,1 @@
+{"query": "\nselect n.nspname as schema, c.relname as name, c.relkind::text as kind\nfrom pg_class c\njoin pg_namespace n on n.oid=c.relnamespace\nwhere n.nspname in ('public','storage')\n  and c.relname ilike '%episode%'\norder by 1,2;\n"}

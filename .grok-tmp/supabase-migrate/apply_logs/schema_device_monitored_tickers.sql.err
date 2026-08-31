@@ -1,0 +1,1 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_device_monitored_tickers.sql:6: ERROR:  relation "public.device_monitored_tickers" does not exist

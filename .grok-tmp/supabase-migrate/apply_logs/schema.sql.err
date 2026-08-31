@@ -1,0 +1,7 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:1: NOTICE:  extension "pgcrypto" already exists, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:57: NOTICE:  trigger "set_market_news_articles_updated_at" for relation "public.market_news_articles" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:66: NOTICE:  policy "Service role can manage market news articles" for relation "public.market_news_articles" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:67: NOTICE:  policy "Publishable key can read market news articles" for relation "public.market_news_articles" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:68: NOTICE:  policy "Publishable key can insert market news articles" for relation "public.market_news_articles" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:69: NOTICE:  policy "Publishable key can update market news articles" for relation "public.market_news_articles" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema.sql:70: NOTICE:  policy "Publishable key can delete market news articles" for relation "public.market_news_articles" does not exist, skipping

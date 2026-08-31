@@ -394,11 +394,7 @@ describe('notification copy', () => {
         referenceTime: '2026-01-01T13:00:00.000Z',
       },
     })
-    // 🟢 SNDK +3.1% in last 10 minutes
-    assert.ok(copy?.title.includes('🟢'))
-    assert.ok(copy?.title.includes('SNDK'))
-    assert.ok(copy?.title.includes('+3.1%'))
-    assert.ok(copy?.title.includes('in last 10 minutes'))
+    assert.equal(copy?.title, '🟢 SNDK +3.1% rally in last 10 mins')
     assert.ok(!copy?.title.toLowerCase().includes('sandisk'))
   })
 
@@ -476,7 +472,7 @@ describe('notification copy', () => {
       movePercent: 2.5,
       exactMinutes: 42,
     })
-    assert.ok(m42?.title.includes('in last 42 minutes'))
+    assert.ok(m42?.title.includes('in last 42 mins'))
 
     const m90 = buildNotificationCopy({
       ticker: 'AAPL',
@@ -566,8 +562,10 @@ describe('notification copy', () => {
     })
     assert.ok(ng?.title.includes('Natural Gas'))
     assert.ok(!ng?.title.includes('NG=F'))
-    // 2–4% UP → rally
-    assert.ok(ng?.title.includes('rally'), ng?.title)
+    assert.equal(
+      ng?.title,
+      '🟢 Natural Gas +3.2% rally in last 15 mins',
+    )
 
     const plunge = buildNotificationCopy({
       ticker: 'SNAP',
@@ -577,7 +575,7 @@ describe('notification copy', () => {
       exactMinutes: 45,
     })
     assert.ok(plunge?.title.includes('plunge'), plunge?.title)
-    assert.ok(plunge?.title.includes('in last 45 minutes'), plunge?.title)
+    assert.ok(plunge?.title.includes('in last 45 mins'), plunge?.title)
 
     const cl = buildNotificationCopy({
       ticker: 'CL=F',
@@ -642,7 +640,7 @@ describe('notification copy', () => {
     assert.ok(overnightDay?.title.includes('overnight so far'), overnightDay?.title)
 
     // Rolling 60m/5m during PRE (e.g. ref 9:10 AM): duration, NOT “pre-market so far”
-    // Example: 🟢 AAPL +3.1% rally in last 5 minutes
+    // Example: 🟢 AAPL +3.1% rally in last 5 mins
     const pre5m = buildNotificationCopy({
       ticker: 'AAPL',
       eventType: 'MOMENTUM_STARTED',
@@ -652,7 +650,8 @@ describe('notification copy', () => {
       detectedWindow: '5m',
       marketSession: 'PRE',
     })
-    assert.ok(pre5m?.title.includes('in last 5 minutes'), pre5m?.title)
+    assert.equal(pre5m?.title, '🟢 AAPL +3.1% rally in last 5 mins')
+    assert.ok(pre5m?.title.includes('in last 5 mins'), pre5m?.title)
     assert.ok(!pre5m?.title.includes('pre-market so far'), pre5m?.title)
 
     const pre60m = buildNotificationCopy({
@@ -688,6 +687,7 @@ describe('notification copy', () => {
     assert.ok(copy?.title.toLowerCase().includes('adds another'))
     assert.ok(copy?.body.toLowerCase().includes('surge'))
     assert.ok(copy?.body.includes('+5.2%') || copy?.body.includes('5.2%'))
+    assert.ok(!/\bminutes?\b/i.test(`${copy?.title} ${copy?.body}`))
   })
 
   it('push policy', () => {
@@ -715,8 +715,10 @@ describe('notification copy', () => {
     })
     // UP episode fade → 🔴 (inverted vs original surge)
     assert.equal(copy?.title, '🔴 SNDK has given back 60% of its surge')
-    assert.ok(copy?.body.includes('+10.0%') || copy?.body.includes('+10%'))
-    assert.ok(copy?.body.includes('+4.0%') || copy?.body.includes('+4%'))
+    assert.equal(
+      copy?.body,
+      'The move now stands at +4.0%, after reaching +10.0% earlier.',
+    )
 
     const downFade = buildNotificationCopy({
       ticker: 'SNAP',
@@ -731,6 +733,10 @@ describe('notification copy', () => {
     assert.equal(
       downFade?.title,
       '🟢 SNAP has given back 60% of its decline',
+    )
+    assert.equal(
+      downFade?.body,
+      'The decline now stands at -4.0%, after reaching -10.0% earlier.',
     )
   })
 
@@ -748,6 +754,46 @@ describe('notification copy', () => {
     assert.equal(copy?.title, '🟢 SNDK is accelerating again')
     assert.ok(copy?.body.includes('+4.0%') || copy?.body.includes('+4%'))
     assert.ok(copy?.body.includes('+6.0%') || copy?.body.includes('+6%'))
+  })
+
+  it('downward re-accel says the stock is dropping again', () => {
+    const copy = buildNotificationCopy({
+      ticker: 'TSLA',
+      eventType: 'MOMENTUM_ACCELERATING',
+      direction: 'DOWN',
+      movePercent: -4.9,
+      reason: 'RE_ACCELERATION',
+      accelKind: 'RE_ACCELERATING',
+      recoveryFromMovePercent: -2.8,
+      previousAlertMovePercent: -2.8,
+    })
+    assert.equal(copy?.title, '🔴 TSLA is dropping again')
+    assert.equal(
+      copy?.body,
+      'The decline has deepened from -2.8% to -4.9% after the earlier rebound.',
+    )
+  })
+
+  it('reversal copy names the erased leg and new direction', () => {
+    const lower = buildNotificationCopy({
+      ticker: 'TSLA',
+      eventType: 'MOMENTUM_REVERSED',
+      direction: 'UP',
+    })
+    assert.equal(
+      lower?.title,
+      '🔴 TSLA erases its gains and reverses lower',
+    )
+
+    const higher = buildNotificationCopy({
+      ticker: 'TSLA',
+      eventType: 'MOMENTUM_REVERSED',
+      direction: 'DOWN',
+    })
+    assert.equal(
+      higher?.title,
+      '🟢 TSLA erases its losses and reverses higher',
+    )
   })
 })
 

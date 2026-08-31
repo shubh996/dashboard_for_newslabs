@@ -1405,7 +1405,6 @@ app.get('/api/desk/supabase-episode-link', async (request, response) => {
       'episodes_forex',
       'episodes_crypto',
       'episodes_commodities',
-      'episodes',
     ]
     const unionEpisode = episodeTables
       .map(
@@ -1491,7 +1490,6 @@ select
         'episodes_forex',
         'episodes_crypto',
         'episodes_commodities',
-        'episodes',
         'events_episodes',
         'research',
       ],

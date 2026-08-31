@@ -1,0 +1,1 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_thresholds.sql:6: NOTICE:  extension "pgcrypto" already exists, skipping

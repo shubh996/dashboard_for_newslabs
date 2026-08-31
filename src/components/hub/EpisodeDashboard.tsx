@@ -96,6 +96,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { PlatformsMenuSub } from '@/components/hub/PlatformsMenu'
 import {
   fetchMomentumMonitoredTickers,
   fetchYahooQuote,
@@ -111,7 +112,11 @@ import {
 } from '@/components/yahoo/YahooMarketStateLabel'
 import { CompanyLogo } from '@/components/hub/company-logo'
 import { SubscriberHoverCard } from '@/components/hub/subscriber-hover-card'
-import { timeZoneSuffix } from '@/lib/localTimeZone'
+import {
+  formatLocalDateTimeWithZone,
+  formatLocalTimeWithZone,
+  timeZoneSuffix,
+} from '@/lib/localTimeZone'
 import {
   formatExchangeTime,
   resolveExchangeTimeZone,
@@ -4132,6 +4137,24 @@ function detectAssetClass(ticker: string): string {
   return 'equity'
 }
 
+/**
+ * Mirror the episode engine's calendar + Yahoo gates for threshold animations.
+ * Crypto is evaluated continuously while its calendar/loop gate is open; every
+ * other asset additionally requires Yahoo to report REGULAR/OPEN.
+ */
+function marketStateAllowsEpisodeEvaluation(
+  ticker: string,
+  marketState: string | null | undefined,
+  calendarOpen: boolean,
+): boolean {
+  if (!calendarOpen) return false
+  if (detectAssetClass(ticker) === 'crypto') return true
+  const state = String(marketState || '')
+    .trim()
+    .toUpperCase()
+  return state === 'REGULAR' || state === 'OPEN'
+}
+
 function expectedEpisodeSourceTable(ticker: string): string {
   const assetClass = detectAssetClass(ticker)
   if (assetClass === 'etf') return 'episodes_etfs'
@@ -4434,7 +4457,7 @@ function yahooFinanceQuoteUrl(symbol: string): string {
   return `https://finance.yahoo.com/quote/${encodeURIComponent(s)}`
 }
 
-/** Live episode class tables in Supabase (post rename_strip_prefixes). */
+/** Live episode class tables in Supabase (single `episodes` table retired). */
 const SUPABASE_EPISODE_CLASS_TABLES = [
   'episodes_stocks',
   'episodes_etfs',
@@ -4442,7 +4465,6 @@ const SUPABASE_EPISODE_CLASS_TABLES = [
   'episodes_forex',
   'episodes_crypto',
   'episodes_commodities',
-  'episodes',
 ] as const
 
 /**
@@ -4752,6 +4774,36 @@ function fmtTime(iso: string | null | undefined) {
       withZone: true,
     }) || iso
   )
+}
+
+/**
+ * Activity-log clock in the operator's browser zone (Europe/London → BST/GMT
+ * when sitting in the UK), not the listing exchange zone.
+ */
+function fmtLogTime(iso: string | null | undefined) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return String(iso)
+  return formatLocalTimeWithZone(d, {
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+/** Activity-log date + time in the operator's browser zone. */
+function fmtLogDateTime(iso: string | null | undefined) {
+  if (!iso) return null
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return String(iso)
+  return formatLocalDateTimeWithZone(d, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }
 
 /** Date + time for previous close / session prints (exchange zone). */
@@ -5327,6 +5379,8 @@ type MarketStatusRow = {
   symbol: string
   region?: string | null
   exchange?: string | null
+  /** IANA zone for this venue (America/New_York, Europe/London, Asia/Kolkata…). */
+  timeZone?: string | null
   uiStatus: string
   engineLabel: string
   engineGate?: string
@@ -5336,7 +5390,12 @@ type MarketStatusRow = {
   marketState?: string | null
   currentSession?: string
   status?: string
+  /** Last quote stamp in the market's own local zone. */
+  lastUpdateLocal?: string | null
+  resumeAtLocal?: string | null
+  /** @deprecated Prefer lastUpdateLocal */
   lastUpdateLondon?: string | null
+  /** @deprecated Prefer resumeAtLocal */
   resumeAtLondon?: string | null
   quoteTimestampUtc?: string | null
   quoteAgeSec?: number | null
@@ -5406,6 +5465,65 @@ function marketSessionFlag(row: {
   if (region.includes('africa')) return '🌍'
   if (region.includes('middle')) return '🌍'
   return '🏳️'
+}
+
+/** Probe ids that match the operator's browser country/zone (home flag). */
+function homeMarketProbeIds(
+  browserTimeZone: string = Intl.DateTimeFormat().resolvedOptions().timeZone ||
+    '',
+): Set<string> {
+  const tz = String(browserTimeZone || '').trim()
+  if (tz === 'Europe/London' || tz === 'Europe/Belfast') {
+    return new Set(['uk-stocks', 'uk-ftse'])
+  }
+  if (tz === 'America/Toronto' || tz === 'America/Vancouver') {
+    return new Set(['canada'])
+  }
+  if (tz === 'America/Sao_Paulo') return new Set(['brazil'])
+  if (
+    tz === 'America/New_York' ||
+    tz === 'America/Chicago' ||
+    tz === 'America/Denver' ||
+    tz === 'America/Los_Angeles' ||
+    tz === 'America/Phoenix' ||
+    tz === 'America/Detroit' ||
+    tz === 'America/Indiana/Indianapolis' ||
+    /^America\/(New_York|Chicago|Denver|Los_Angeles|Phoenix|Detroit)/.test(tz)
+  ) {
+    return new Set(['us-stocks', 'us-nasdaq', 'cash-index', 'indices'])
+  }
+  if (tz === 'Asia/Kolkata' || tz === 'Asia/Calcutta') {
+    return new Set(['india-nse', 'india-bse'])
+  }
+  if (tz === 'Asia/Tokyo') return new Set(['japan'])
+  if (tz === 'Asia/Shanghai' || tz === 'Asia/Chongqing') return new Set(['china'])
+  if (tz === 'Asia/Hong_Kong') return new Set(['hong-kong'])
+  if (tz === 'Asia/Seoul') return new Set(['korea'])
+  if (tz === 'Asia/Singapore') return new Set(['singapore'])
+  if (tz === 'Australia/Sydney' || tz === 'Australia/Melbourne') {
+    return new Set(['australia'])
+  }
+  if (tz === 'Asia/Dubai') return new Set(['dubai'])
+  if (tz === 'Africa/Johannesburg') return new Set(['south-africa'])
+  if (tz === 'Europe/Berlin') return new Set(['germany'])
+  if (tz === 'Europe/Paris') return new Set(['france'])
+  if (tz === 'Europe/Zurich') return new Set(['switzerland'])
+  return new Set()
+}
+
+function isHomeMarketCard(
+  row: { id?: string },
+  homeIds: Set<string>,
+): boolean {
+  return homeIds.has(String(row.id || '').toLowerCase())
+}
+
+function marketSessionLatestLabel(row: MarketStatusRow): string {
+  return (
+    row.lastUpdateLocal ||
+    row.lastUpdateLondon ||
+    (row.quoteAgeSec != null ? `${Math.round(row.quoteAgeSec)}s ago` : '—')
+  )
 }
 
 /** Footer session label — exact Yahoo marketState when known (else ET clock). */
@@ -6277,7 +6395,7 @@ function EpisodeStatusGuideButton({
       pushes: true,
       alertExample: {
         title: 'SNDK has given back 60% of its surge',
-        body: 'The earlier +10.0% move has faded sharply, with about +4.0% remaining.',
+        body: 'The move now stands at +4.0%, after reaching +10.0% earlier.',
       },
     },
     {
@@ -6325,8 +6443,9 @@ function EpisodeStatusGuideButton({
         'Yes — one push for the reverse. The new opposite episode may open silently (no second start push on AFTER_REVERSAL).',
       pushes: true,
       alertExample: {
-        title: 'NVDA reverses lower',
-        body: 'Earlier gains have been erased as downside momentum builds.',
+        title: 'NVDA erases its gains and reverses lower',
+        body:
+          'The earlier gains have been fully erased, and downside momentum has crossed the reversal threshold.',
       },
     },
     {
@@ -6367,8 +6486,9 @@ function EpisodeStatusGuideButton({
         'The push already fired on Reversal (live). This close label itself does not send a second alert.',
       pushes: false,
       alertExample: {
-        title: 'NVDA reverses lower',
-        body: 'Earlier gains have been erased as downside momentum builds.',
+        title: 'NVDA erases its gains and reverses lower',
+        body:
+          'The earlier gains have been fully erased, and downside momentum has crossed the reversal threshold.',
       },
     },
     {
@@ -6949,12 +7069,19 @@ export function EpisodeDashboard({
   /** Live Yahoo quote for the selected tab (any ticker) */
   const [tabQuote, setTabQuote] = useState<YahooLiveQuote | null>(null)
   const [tabQuoteLoading, setTabQuoteLoading] = useState(false)
+  /** Set when Yahoo quote fetch fails or returns an empty quote payload. */
+  const [tabQuoteError, setTabQuoteError] = useState<string | null>(null)
+  /** Mini/main 1D chart feed: empty or errored while session expects live pricing. */
+  const [chartFeedDown, setChartFeedDown] = useState(false)
   /** Batch quotes for all watchlist tabs (label % + blink) */
   const [watchQuotes, setWatchQuotes] = useState<Record<string, YahooLiveQuote>>({})
   /** Active episode hint per watchlist ticker (from /api/momentum overview) */
   const [episodeByTicker, setEpisodeByTicker] = useState<
     Record<string, { direction: 'UP' | 'DOWN'; window?: string | null } | null>
   >({})
+  /** Backend calendar/loop gate; quote marketState is checked separately. */
+  const [episodeEvaluationOpenByTicker, setEpisodeEvaluationOpenByTicker] =
+    useState<Record<string, boolean>>({})
   /** Right-click remove menu for watchlist rows */
   const [watchContextMenu, setWatchContextMenu] = useState<{
     ticker: string
@@ -6965,7 +7092,7 @@ export function EpisodeDashboard({
   /** Right rail content: activity log, subscribers, recent events, thresholds, all active episodes, or Yahoo chart */
   const [rightRailMode, setRightRailMode] = useState<
     'logs' | 'subscribers' | 'events' | 'settings' | 'activeEpisodes' | 'yahoo'
-  >('yahoo')
+  >('logs')
   /** Main panel under chart: rolling-return table vs active-episode story */
   const [mainPanelTab, setMainPanelTab] = useState<'returns' | 'episode'>(
     'episode',
@@ -7079,6 +7206,8 @@ export function EpisodeDashboard({
   const marketStatusHoverCloseRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   )
+  /** Enlarge the operator's home-country flag in the market-sessions panel. */
+  const homeMarketIds = useMemo(() => homeMarketProbeIds(), [])
   const [navSettingsOpen, setNavSettingsOpen] = useState(false)
   const [perplexityPromptsOpen, setPerplexityPromptsOpen] = useState(false)
   const navSettingsCloseRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -7590,7 +7719,29 @@ export function EpisodeDashboard({
   // Collapse expanded chart when switching entities
   useEffect(() => {
     setChartExpanded(false)
+    setChartFeedDown(false)
   }, [displayTicker])
+
+  const onYahooChartFeedStatus = useCallback(
+    (status: {
+      ticker: string
+      loading: boolean
+      ok: boolean
+      empty: boolean
+      error: string | null
+    }) => {
+      if (
+        displayTicker &&
+        status.ticker &&
+        status.ticker.toUpperCase() !== displayTicker.toUpperCase()
+      ) {
+        return
+      }
+      if (status.loading) return
+      setChartFeedDown(Boolean(status.error || status.empty || !status.ok))
+    },
+    [displayTicker],
+  )
 
   /**
    * Ticker pick → Rolling returns by default; flip to Episodes once we know
@@ -7793,7 +7944,10 @@ export function EpisodeDashboard({
 
   const clearDeskEpisodeFocus = useCallback(() => {
     setDeskEpisodeFocus(null)
-  }, [])
+    setRightRailMode('logs')
+    setLogCollapsedPersist(false)
+    setRailChartExpanded(false)
+  }, [setLogCollapsedPersist])
 
   const loadDeskDevices = useCallback(async () => {
     setDeskDevicesLoading(true)
@@ -8231,7 +8385,7 @@ export function EpisodeDashboard({
       setDeskEpisodeFocus(null)
       setDeskUserFocus(null)
       setDeskLeftTab('episodes')
-      setRightRailMode('yahoo')
+      setRightRailMode('logs')
       setLogCollapsedPersist(false)
       setMainPanelTab('episode')
       // Memory/cache only — Supabase pull is boot + manual Refresh.
@@ -8452,15 +8606,22 @@ export function EpisodeDashboard({
     void loadDeskUserActivities(deskUserFocus)
   }, [deskUsersMode, deskUserFocus, loadDeskUserActivities])
 
-  // Yahoo / user-profile detail rail after focus from the center lists
+  // All episodes owns the final column: logs while nothing is selected, then
+  // the selected episode's detail. Other desk tabs keep their own detail mode.
   useEffect(() => {
     if (!leftShowsActiveEpisodes) return
-    if (deskEpisodeFocus || deskUserFocus) {
+    if (showAllEpisodesCenter) {
+      setRightRailMode(deskEpisodeFocus ? 'yahoo' : 'logs')
+      setLogCollapsedPersist(false)
+      return
+    }
+    if (deskUserFocus) {
       setRightRailMode('yahoo')
       setLogCollapsedPersist(false)
     }
   }, [
     leftShowsActiveEpisodes,
+    showAllEpisodesCenter,
     deskEpisodeFocus,
     deskUserFocus,
     setLogCollapsedPersist,
@@ -8840,11 +9001,13 @@ export function EpisodeDashboard({
             string,
             { direction: 'UP' | 'DOWN'; window?: string | null } | null
           > = {}
+          const evaluationOpen: Record<string, boolean> = {}
           for (const row of body.tickers || []) {
             const t = String(row.ticker || '')
               .trim()
               .toUpperCase()
             if (!t) continue
+            evaluationOpen[t] = Boolean(row.episodeEvaluationOpen)
             if (row.hasEpisode) {
               next[t] = {
                 direction: row.episodeDirection === 'DOWN' ? 'DOWN' : 'UP',
@@ -8855,6 +9018,7 @@ export function EpisodeDashboard({
             }
           }
           setEpisodeByTicker((prev) => ({ ...prev, ...next }))
+          setEpisodeEvaluationOpenByTicker(evaluationOpen)
           if (Array.isArray(body.activeEpisodes)) {
             setActiveEpisodesList(body.activeEpisodes as ActiveEpisodeRow[])
           }
@@ -8960,6 +9124,11 @@ export function EpisodeDashboard({
         const body = await fetchYahooQuote(displayTicker)
         const q = body.quote || null
         setTabQuote(q)
+        setTabQuoteError(
+          q
+            ? null
+            : 'Yahoo Finance returned no quote for this symbol.',
+        )
         if (q) {
           setWatchQuotes((prev) => ({
             ...prev,
@@ -8968,6 +9137,9 @@ export function EpisodeDashboard({
           }))
         }
       } catch {
+        setTabQuoteError(
+          'Yahoo Finance quote request failed — live data is not reaching the desk.',
+        )
         if (!opts?.silent) setTabQuote(null)
       } finally {
         if (!opts?.silent) setTabQuoteLoading(false)
@@ -8980,16 +9152,23 @@ export function EpisodeDashboard({
     if (!displayTicker) {
       setTabQuote(null)
       setTabQuoteLoading(false)
+      setTabQuoteError(null)
       return
     }
     let cancelled = false
     setTabQuote(null)
+    setTabQuoteError(null)
     setTabQuoteLoading(true)
     void fetchYahooQuote(displayTicker)
       .then((body) => {
         if (cancelled) return
         const q = body.quote || null
         setTabQuote(q)
+        setTabQuoteError(
+          q
+            ? null
+            : 'Yahoo Finance returned no quote for this symbol.',
+        )
         if (q) {
           setWatchQuotes((prev) => ({
             ...prev,
@@ -8999,7 +9178,11 @@ export function EpisodeDashboard({
         }
       })
       .catch(() => {
-        if (!cancelled) setTabQuote(null)
+        if (cancelled) return
+        setTabQuote(null)
+        setTabQuoteError(
+          'Yahoo Finance quote request failed — live data is not reaching the desk.',
+        )
       })
       .finally(() => {
         if (!cancelled) setTabQuoteLoading(false)
@@ -9011,6 +9194,11 @@ export function EpisodeDashboard({
           if (cancelled) return
           const q = body.quote || null
           setTabQuote(q)
+          setTabQuoteError(
+            q
+              ? null
+              : 'Yahoo Finance returned no quote for this symbol.',
+          )
           if (q) {
             setWatchQuotes((prev) => ({
               ...prev,
@@ -9020,7 +9208,11 @@ export function EpisodeDashboard({
           }
         })
         .catch(() => {
-          /* keep last good quote */
+          if (cancelled) return
+          // Keep last good quote, but surface that the live Yahoo refresh failed.
+          setTabQuoteError(
+            'Yahoo Finance refresh failed — live quote may be stale or missing. Check finance.yahoo.com for this symbol.',
+          )
         })
     }, 30_000)
     return () => {
@@ -9379,24 +9571,125 @@ export function EpisodeDashboard({
     snap?.assetClass ||
     sq?.assetClass ||
     detectAssetClass(displayTicker)
-  /** Equity/index/etc. off REGULAR — rolling returns are not being calculated. */
-  const rollingReturnsClosed = (() => {
+  /**
+   * Session where live Yahoo pricing / rolling / chart should be available.
+   * Crypto & FX: always. Equities etc.: Yahoo REGULAR/OPEN, else ET cash RTH.
+   */
+  const sessionExpectsLivePricing = (() => {
     const cls = String(activeAssetClass || 'equity').toLowerCase()
-    if (cls === 'crypto' || cls === 'forex') return false
+    if (cls === 'crypto' || cls === 'forex') return true
     const sess = String(sessionFromQuote || snap?.marketSession || '')
       .trim()
       .toUpperCase()
-    return (
+    if (sess === 'REGULAR' || sess === 'OPEN') return true
+    if (
       sess === 'CLOSED' ||
       sess === 'CLOSE' ||
       sess === 'PRE' ||
       sess === 'PREPRE' ||
       sess === 'POST' ||
-      sess === 'POSTPOST' ||
-      !sess
-    )
+      sess === 'POSTPOST'
+    ) {
+      return false
+    }
+    return usEquitySessionFromEtClock(nowMs).id === 'regular'
+  })()
+  /**
+   * Yahoo quote gap: fetch failed / empty quote / no usable live print.
+   */
+  const yahooQuoteDown = (() => {
+    if (tabQuoteLoading) return false
+    if (tabQuoteError) return true
+    if (!tabQuote) return true
+    const price =
+      yahooActive?.price ??
+      quoteLivePrice(tabQuote) ??
+      tabQuote.regularMarketPrice ??
+      null
+    if (price == null || !Number.isFinite(Number(price))) return true
+    return false
+  })()
+  /** Momentum short-window returns all blank while we expect live pricing. */
+  const rollingReturnsBlank = (() => {
+    if (!sessionExpectsLivePricing) return false
+    // Avoid flash before the first momentum snapshot arrives.
+    if (loading && !status) return false
+    if (!returns) return true
+    const keys = [
+      '1m',
+      '5m',
+      '10m',
+      '15m',
+      '30m',
+      '45m',
+      '60m',
+      '90m',
+      '2h',
+      '3h',
+      '6h',
+      '8h',
+      '16h',
+      '24h',
+      'day',
+    ] as const
+    return !keys.some((key) => {
+      const v = (returns as Record<string, number | null | undefined>)[key]
+      return v != null && Number.isFinite(Number(v))
+    })
+  })()
+  /**
+   * Regular (or 24/7) session but pricing surfaces are empty: quote and/or
+   * chart and/or rolling returns — even when Yahoo labels the session REGULAR.
+   */
+  const yahooFeedDown =
+    sessionExpectsLivePricing &&
+    (yahooQuoteDown || chartFeedDown || rollingReturnsBlank)
+  /** Equity/index/etc. off REGULAR — rolling returns are not being calculated. */
+  const rollingReturnsClosed = (() => {
+    if (yahooFeedDown) return false
+    if (sessionExpectsLivePricing) return false
+    const cls = String(activeAssetClass || 'equity').toLowerCase()
+    if (cls === 'crypto' || cls === 'forex') return false
+    const sess = String(sessionFromQuote || snap?.marketSession || '')
+      .trim()
+      .toUpperCase()
+    if (
+      sess === 'CLOSED' ||
+      sess === 'CLOSE' ||
+      sess === 'PRE' ||
+      sess === 'PREPRE' ||
+      sess === 'POST' ||
+      sess === 'POSTPOST'
+    ) {
+      return true
+    }
+    // Yahoo omitted marketState but we still have a quote — use ET clock so we
+    // don't falsely say "market closed" during regular cash hours.
+    if (!sess) {
+      return usEquitySessionFromEtClock(nowMs).id !== 'regular'
+    }
+    return false
+  })()
+  const yahooFeedDownReason = (() => {
+    if (!yahooFeedDown) return null
+    // Prefer human copy over raw HTTP/chart error strings (those stay in the chart empty state).
+    if (yahooQuoteDown && tabQuoteError) return tabQuoteError
+    if (chartFeedDown) {
+      return 'Yahoo Finance chart pricing is not coming through for this symbol right now — even though the session looks open. Check finance.yahoo.com; the desk chart stays blank until bars recover.'
+    }
+    if (rollingReturnsBlank && !yahooQuoteDown) {
+      return 'Yahoo Finance session looks open, but rolling-return pricing is not arriving yet — their feed can lag or gap. Short windows stay blank until live returns recover.'
+    }
+    if (yahooQuoteDown) {
+      return (
+        tabQuoteError ||
+        'Yahoo Finance data is not coming through for this symbol right now — even their site can lag or gap. Rolling returns stay blank until the live quote feed recovers.'
+      )
+    }
+    return 'Yahoo Finance pricing is not coming through right now — even though the session looks open. Check finance.yahoo.com; chart and rolling returns stay blank until the feed recovers.'
   })()
   const rollingReturnsClosedReason = (() => {
+    if (yahooFeedDownReason) return null
     if (!rollingReturnsClosed) return null
     const sess = String(sessionFromQuote || snap?.marketSession || '')
       .trim()
@@ -9409,6 +9702,13 @@ export function EpisodeDashboard({
     }
     return 'Market closed — momentum is not calculating rolling returns for this asset class until the regular session is open again.'
   })()
+  const rollingReturnsBannerReason =
+    yahooFeedDownReason || rollingReturnsClosedReason
+  const rollingReturnsBannerKind: 'yahoo' | 'closed' | null = yahooFeedDownReason
+    ? 'yahoo'
+    : rollingReturnsClosedReason
+      ? 'closed'
+      : null
   // Asset-aware last session (stocks ≠ gold ≠ bitcoin)
   const lastSessionMeta = resolveLastSessionMetaClient(displayTicker, activeAssetClass)
   // Time: Yahoo regularMarketTime when it is the frozen last print; else class estimate
@@ -10974,7 +11274,7 @@ export function EpisodeDashboard({
                       setDeskEpisodeFocus(null)
                       setDeskBulletinFocus(null)
                       setMainPanelTab('episode')
-                      setRightRailMode('yahoo')
+                      setRightRailMode('logs')
                       setLogCollapsedPersist(false)
                       void loadActiveEpisodesList()
                       void loadAllEpisodesHistory()
@@ -11149,6 +11449,10 @@ export function EpisodeDashboard({
                     <ScrollText className="size-3.5" strokeWidth={1.75} />
                     Perplexity prompts
                   </DropdownMenuItem>
+                  <PlatformsMenuSub
+                    onKeepOpen={openNavSettings}
+                    onPointerLeave={scheduleNavSettingsClose}
+                  />
                   <DropdownMenuItem
                     className="gap-2 text-rose-700 focus:text-rose-700 dark:text-rose-300 dark:focus:text-rose-300"
                     onSelect={() => void clearDeskCache()}
@@ -11855,8 +12159,23 @@ export function EpisodeDashboard({
                         className={cn(
                           'h-auto min-h-10 w-full justify-start gap-2 rounded-lg px-2 py-1.5 text-left',
                           active && 'bg-transparent hover:bg-transparent',
-                          // Blink only when day % crosses configured day threshold
-                          hotBlinkClass(dayPct, thrSnap?.day ?? null, 'day'),
+                          // Match the episode engine: a hot quote only blinks
+                          // while this ticker is eligible for evaluation.
+                          hotBlinkClass(
+                            marketStateAllowsEpisodeEvaluation(
+                              tab.ticker,
+                              rowQuote?.marketState,
+                              Boolean(
+                                episodeEvaluationOpenByTicker[
+                                  tab.ticker.toUpperCase()
+                                ],
+                              ),
+                            )
+                              ? dayPct
+                              : null,
+                            thrSnap?.day ?? null,
+                            'day',
+                          ),
                         )}
                         title={
                           [
@@ -13030,7 +13349,17 @@ export function EpisodeDashboard({
                           active
                             ? 'border-foreground/20 bg-background text-foreground shadow-sm'
                             : 'border-border bg-background/60 text-foreground hover:bg-background',
-                          hotBlinkClass(dayPct, thrSnap?.day ?? null, 'day'),
+                          hotBlinkClass(
+                            marketStateAllowsEpisodeEvaluation(
+                              ticker,
+                              rowQuote?.marketState,
+                              Boolean(episodeEvaluationOpenByTicker[ticker]),
+                            )
+                              ? dayPct
+                              : null,
+                            thrSnap?.day ?? null,
+                            'day',
+                          ),
                         )}
                         title={`${ticker} · ${subscriberCount ?? 0} subscribers`}
                       >
@@ -13343,6 +13672,7 @@ export function EpisodeDashboard({
                       timeZone={exchangeDisplayTz}
                       showTimeZone
                       disableCache
+                      onFeedStatusChange={onYahooChartFeedStatus}
                     />
                   </div>
                   <span className="pointer-events-none absolute bottom-0.5 right-1 z-10 inline-flex items-center gap-0.5 rounded bg-background/70 px-1 text-[9px] font-medium text-muted-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
@@ -13399,6 +13729,20 @@ export function EpisodeDashboard({
             </div>
           ) : null}
 
+          {/* Off-hours / Yahoo pricing gap — directly under the price header so it is not missed */}
+          {rollingReturnsBannerReason ? (
+            <p
+              className={cn(
+                'rounded-xl border px-4 py-3 text-[11px] leading-relaxed sm:px-4 sm:py-3.5',
+                rollingReturnsBannerKind === 'yahoo'
+                  ? 'border-amber-500/70 bg-amber-500/10 text-amber-950 dark:border-amber-400/60 dark:bg-amber-500/10 dark:text-amber-100'
+                  : 'border-rose-500/70 bg-rose-500/10 text-rose-800 dark:border-rose-400/60 dark:bg-rose-500/10 dark:text-rose-200',
+              )}
+            >
+              {rollingReturnsBannerReason}
+            </p>
+          ) : null}
+
           {/* Expanded chart — between header/mini chart and rolling returns */}
           {chartExpanded ? (
             <div className="min-w-0 space-y-2 border-t border-border pt-3">
@@ -13427,15 +13771,9 @@ export function EpisodeDashboard({
                 timeZone={exchangeDisplayTz}
                 showTimeZone
                 disableCache
+                onFeedStatusChange={onYahooChartFeedStatus}
               />
             </div>
-          ) : null}
-
-          {/* Off-hours note sits above the whole Rolling returns / Episodes card */}
-          {rollingReturnsClosedReason ? (
-            <p className="!my-5 rounded-xl border border-rose-500/70 bg-rose-500/10 px-4 py-3 text-[11px] leading-relaxed text-rose-800 dark:border-rose-400/60 dark:bg-rose-500/10 dark:text-rose-200 sm:!my-6 sm:px-4 sm:py-3.5">
-              {rollingReturnsClosedReason}
-            </p>
           ) : null}
 
           {/* Row 2: Rolling returns | Episodes — shared Tabs (cn) */}
@@ -13454,7 +13792,14 @@ export function EpisodeDashboard({
                     className="gap-2 px-3 text-[13px]"
                   >
                     <span>Rolling returns</span>
-                    {rollingReturnsClosed ? (
+                    {yahooFeedDown ? (
+                      <Badge
+                        variant="outline"
+                        className="ml-0.5 h-5 shrink-0 rounded-full border-amber-500/50 px-2 text-[10px] font-semibold tracking-wide text-amber-800 dark:text-amber-200"
+                      >
+                        Yahoo
+                      </Badge>
+                    ) : rollingReturnsClosed ? (
                       <Badge
                         variant="outline"
                         className="ml-0.5 h-5 shrink-0 rounded-full px-2 text-[10px] font-semibold tracking-wide text-muted-foreground"
@@ -13673,7 +14018,22 @@ export function EpisodeDashboard({
                                   (snap?.strongestMomentum?.direction === 'DOWN'
                                     ? 'bg-rose-500/10'
                                     : 'bg-emerald-500/10'),
-                                hotBlinkClass(val, thr, key),
+                                hotBlinkClass(
+                                  marketStateAllowsEpisodeEvaluation(
+                                    displayTicker,
+                                    tabQuote?.marketState ??
+                                      status?.snapshot?.marketState,
+                                    Boolean(
+                                      episodeEvaluationOpenByTicker[
+                                        displayTicker.toUpperCase()
+                                      ],
+                                    ),
+                                  )
+                                    ? val
+                                    : null,
+                                  thr,
+                                  key,
+                                ),
                               )}
                             >
                               <span className="min-w-0 truncate text-[12px] font-medium text-foreground sm:text-[13px]">
@@ -14050,6 +14410,8 @@ export function EpisodeDashboard({
                               }`
                             : 'User profile'}
                         </span>
+                      ) : rightRailMode === 'logs' && !displayTicker ? (
+                        <span className="truncate">Activity log</span>
                       ) : displayTicker ? (
                         <>
                           <span className="shrink-0 text-muted-foreground">
@@ -16256,7 +16618,7 @@ export function EpisodeDashboard({
                         >
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
-                              {fmtTime(log.at)}
+                              {fmtLogTime(log.at)}
                             </span>
                             <span
                               className={cn(
@@ -16475,6 +16837,7 @@ export function EpisodeDashboard({
                   <ScrollText className="size-3.5" strokeWidth={1.75} />
                   Perplexity prompts
                 </DropdownMenuItem>
+                <PlatformsMenuSub />
                 <DropdownMenuItem
                   className="gap-2 text-rose-700 focus:text-rose-700 dark:text-rose-300 dark:focus:text-rose-300"
                   onSelect={() => {
@@ -16595,7 +16958,8 @@ export function EpisodeDashboard({
                       Market sessions
                     </p>
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      Global session status · click a card for Yahoo Finance
+                      Each stamp is that venue&apos;s local time · click a card
+                      for Yahoo Finance
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -16636,12 +17000,9 @@ export function EpisodeDashboard({
                       : row.currentSession && row.currentSession !== '—'
                         ? String(row.currentSession).trim().toUpperCase()
                         : '—'
-                    const latestLabel =
-                      row.lastUpdateLondon ||
-                      (row.quoteAgeSec != null
-                        ? `${Math.round(row.quoteAgeSec)}s ago`
-                        : '—')
+                    const latestLabel = marketSessionLatestLabel(row)
                     const flag = marketSessionFlag(row)
+                    const homeCard = isHomeMarketCard(row, homeMarketIds)
                     const href = yahooFinanceQuoteUrl(row.symbol)
                     return (
                       <a
@@ -16650,18 +17011,39 @@ export function EpisodeDashboard({
                         target="_blank"
                         rel="noopener noreferrer"
                         title={`Open ${row.symbol} on Yahoo Finance`}
-                        className="flex w-full flex-col gap-1 rounded-xl border border-border/80 bg-card/80 p-3 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        className={cn(
+                          'flex w-full flex-col gap-1 rounded-xl border bg-card/80 p-3 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                          homeCard
+                            ? 'border-foreground/35 ring-1 ring-foreground/10'
+                            : 'border-border/80',
+                        )}
                       >
                         <div className="flex min-w-0 items-start gap-2.5">
                           <span
-                            className="shrink-0 text-[2.75rem] leading-none"
+                            className={cn(
+                              'shrink-0 leading-none',
+                              homeCard
+                                ? 'text-[4.25rem] drop-shadow-sm'
+                                : 'text-[2.75rem]',
+                            )}
                             aria-hidden
+                            title={
+                              homeCard
+                                ? 'Your local market'
+                                : undefined
+                            }
                           >
                             {flag}
                           </span>
                           <div className="min-w-0 flex-1">
                             <p className="truncate text-[13px] font-semibold tracking-tight text-foreground">
                               {row.label}
+                              {homeCard ? (
+                                <span className="ml-1.5 align-middle text-[9px] font-bold uppercase tracking-wide text-muted-foreground">
+                                  {' '}
+                                  You
+                                </span>
+                              ) : null}
                             </p>
                             <p className="truncate font-mono text-[10px] text-muted-foreground">
                               {row.exchange ? `${row.exchange} · ` : ''}
@@ -16695,7 +17077,12 @@ export function EpisodeDashboard({
                           <p className="mt-0.5 border-t border-border/60 pt-1 text-[10px] text-muted-foreground">
                             <span
                               aria-hidden
-                              className="mr-1.5 inline-block align-middle text-[1.35rem] leading-none"
+                              className={cn(
+                                'mr-1.5 inline-block align-middle leading-none',
+                                isHomeMarketCard(row.child, homeMarketIds)
+                                  ? 'text-[2.1rem]'
+                                  : 'text-[1.35rem]',
+                              )}
                             >
                               {marketSessionFlag(row.child)}
                             </span>
@@ -16752,7 +17139,7 @@ export function EpisodeDashboard({
             <DialogTitle className="text-base">Activity log detail</DialogTitle>
             <DialogDescription className="font-mono text-[11px]">
               {logDetail
-                ? `${fmtDateTime(logDetail.at) || logDetail.at} · ${logDetail.source} · ${logDetail.level}`
+                ? `${fmtLogDateTime(logDetail.at) || logDetail.at} · ${logDetail.source} · ${logDetail.level}`
                 : ''}
             </DialogDescription>
           </DialogHeader>

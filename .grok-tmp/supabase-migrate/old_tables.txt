@@ -1,0 +1,67 @@
+ current_database | current_user 
+------------------+--------------
+ postgres         | postgres
+(1 row)
+
+ schemaname |             tablename              
+------------+------------------------------------
+ auth       | audit_log_entries
+ auth       | custom_oauth_providers
+ auth       | flow_state
+ auth       | identities
+ auth       | instances
+ auth       | mfa_amr_claims
+ auth       | mfa_challenges
+ auth       | mfa_factors
+ auth       | oauth_authorizations
+ auth       | oauth_client_states
+ auth       | oauth_clients
+ auth       | oauth_consents
+ auth       | one_time_tokens
+ auth       | refresh_tokens
+ auth       | saml_providers
+ auth       | saml_relay_states
+ auth       | schema_migrations
+ auth       | sessions
+ auth       | sso_domains
+ auth       | sso_providers
+ auth       | users
+ auth       | webauthn_challenges
+ auth       | webauthn_credentials
+ public     | app_admin_users
+ public     | app_feature_flags
+ public     | app_releases
+ public     | device_monitored_tickers
+ public     | device_profiles
+ public     | edgar_holdings_cache
+ public     | etf_snapshots
+ public     | institution_snapshots
+ public     | market_close_run_tickers
+ public     | market_close_runs
+ public     | market_news_articles
+ public     | momentum_episode_events
+ public     | momentum_episodes
+ public     | momentum_research_commodities
+ public     | momentum_research_crypto
+ public     | momentum_research_forex
+ public     | momentum_research_indexes
+ public     | momentum_research_monitored_stocks
+ public     | momentum_thresholds
+ public     | pinned_monitored_tickers
+ public     | politician_snapshots
+ public     | ticker_dashboard_snapshots
+ public     | trigger_device_monitor
+ public     | trigger_device_profiles
+ public     | usage_daily_ledger
+ public     | waitlist_signups
+ public     | yahoo_finance_snapshots
+ storage    | buckets
+ storage    | buckets_analytics
+ storage    | buckets_vectors
+ storage    | migrations
+ storage    | objects
+ storage    | s3_multipart_uploads
+ storage    | s3_multipart_uploads_parts
+ storage    | vector_indexes
+(58 rows)
+

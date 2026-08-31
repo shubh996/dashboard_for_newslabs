@@ -1,0 +1,3 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_app_release_settings.sql:36: NOTICE:  trigger "set_app_release_settings_updated_at" for relation "public.app_release_settings" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_app_release_settings.sql:53: NOTICE:  policy "Service role can manage app release settings" for relation "public.app_release_settings" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_app_release_settings.sql:55: NOTICE:  policy "Publishable key can read app release settings" for relation "public.app_release_settings" does not exist, skipping

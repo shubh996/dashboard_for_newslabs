@@ -5,7 +5,6 @@ declare
   tbl text;
 begin
   foreach tbl in array array[
-    'episodes',
     'episodes_stocks',
     'episodes_indexes',
     'episodes_forex',

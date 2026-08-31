@@ -60,6 +60,8 @@ import { createClient } from '@supabase/supabase-js'
 import { buildMarketStatusPopup } from './marketStatusPopup.js'
 import { rerunResearchForEpisode } from './autoStartAlert.js'
 import { evaluateSymbolGate } from './engineGate.js'
+import { resolveMarketProfile } from './marketProfile.js'
+import { resolveSessionState } from './sessionCalendar.js'
 
 function getSupabaseForMonitoredTickers() {
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -303,6 +305,11 @@ export function createMomentumRouter() {
   router.get('/', (_request, response) => {
     const watched = store.listWatchedTickers()
     const focus = store.getFocusTicker()
+    const loopStatus = getMomentumStatus(focus || watched[0] || MOMENTUM_TICKER)
+    const episodeEngineRunning = Boolean(
+      loopStatus.engineEnabled && loopStatus.loopRunning,
+    )
+    const nowMs = Date.now()
     const activeEpisodes = store
       .listActiveEpisodes()
       .map((ep) => activeEpisodeSummary(ep, ep.ticker))
@@ -317,12 +324,19 @@ export function createMomentumRouter() {
       activeEpisodes,
       tickers: watched.map((t) => {
         const s = store.getDebugState(t)
+        const calendarState = resolveSessionState(
+          resolveMarketProfile(t),
+          nowMs,
+        )
         const ep = s.episode
         const summary = activeEpisodeSummary(ep, t)
         const active = Boolean(summary)
         return {
           ticker: t,
           isFocus: t === focus,
+          episodeEvaluationOpen:
+            episodeEngineRunning && calendarState.state === 'OPEN',
+          episodeCalendarState: calendarState.state || null,
           lastFetchAt: s.lastFetchAt,
           lastError: s.lastError,
           tickCount: s.tickCount,

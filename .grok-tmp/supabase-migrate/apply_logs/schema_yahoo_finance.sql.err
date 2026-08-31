@@ -1,0 +1,5 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_yahoo_finance.sql:28: NOTICE:  index "yahoo_finance_snapshots_data_idx" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_yahoo_finance.sql:32: NOTICE:  policy "Service role can manage yahoo finance snapshots" for relation "public.yahoo_finance_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_yahoo_finance.sql:39: NOTICE:  policy "Publishable key can read yahoo finance snapshots" for relation "public.yahoo_finance_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_yahoo_finance.sql:46: NOTICE:  policy "Publishable key can insert yahoo finance snapshots" for relation "public.yahoo_finance_snapshots" does not exist, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_yahoo_finance.sql:53: NOTICE:  policy "Publishable key can update yahoo finance snapshots" for relation "public.yahoo_finance_snapshots" does not exist, skipping

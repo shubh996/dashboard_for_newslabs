@@ -1,0 +1,2 @@
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_episodes.sql:11: NOTICE:  extension "pgcrypto" already exists, skipping
+psql:/Users/shubh./Desktop/dashboard_for_newslabs/supabase/schema_momentum_episodes.sql:109: NOTICE:  column "updated_at" of relation "momentum_episode_events" already exists, skipping

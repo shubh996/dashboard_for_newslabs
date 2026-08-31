@@ -264,6 +264,15 @@ function intervalOptionsFor(range: YahooChartRange): YahooChartInterval[] {
   return CHART_INTERVAL_BY_RANGE[range].options
 }
 
+export type YahooChartFeedStatus = {
+  ticker: string
+  loading: boolean
+  /** True when we have a plottable series (≥2 points). */
+  ok: boolean
+  empty: boolean
+  error: string | null
+}
+
 export function YahooInteractiveChart({
   ticker,
   initialChart,
@@ -275,6 +284,7 @@ export function YahooInteractiveChart({
   timeZone,
   showTimeZone = true,
   disableCache = false,
+  onFeedStatusChange,
 }: {
   ticker: string
   /** Optional already-fetched chart payload used as a daily seed for longer ranges. */
@@ -298,6 +308,8 @@ export function YahooInteractiveChart({
   showTimeZone?: boolean
   /** Momentum desk: never reuse in-memory chart series — always refetch. */
   disableCache?: boolean
+  /** Report chart load / empty / error so the desk can show a feed disclaimer. */
+  onFeedStatusChange?: (status: YahooChartFeedStatus) => void
 }) {
   const [range, setRange] = useState<YahooChartRange>(defaultRange)
   const [barInterval, setBarInterval] = useState<YahooChartInterval>(() => defaultIntervalFor(defaultRange))
@@ -521,6 +533,18 @@ export function YahooInteractiveChart({
     resolvedTimeZone,
     showTimeZone,
   ])
+
+  useEffect(() => {
+    if (!onFeedStatusChange) return
+    const ok = Boolean(geometry)
+    onFeedStatusChange({
+      ticker,
+      loading,
+      ok,
+      empty: !loading && !ok && !error,
+      error,
+    })
+  }, [onFeedStatusChange, ticker, loading, geometry, error])
 
   function handlePointer(event: ReactPointerEvent<SVGSVGElement>) {
     if (!geometry || !svgRef.current) return
