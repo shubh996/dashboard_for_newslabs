@@ -7151,6 +7151,9 @@ export function EpisodeDashboard({
     useState<YahooExtremeMover | null>(null)
   const [deskExtremeSharePayload, setDeskExtremeSharePayload] =
     useState<TriggerSharePayload | null>(null)
+  /** null = all classes; set = only that Yahoo asset-class list. */
+  const [deskExtremeClassFilter, setDeskExtremeClassFilter] =
+    useState<AssetClassTabId | null>(null)
   type DeskMarketBulletin = {
     id: string
     market: 'us' | 'india' | string
@@ -7345,6 +7348,11 @@ export function EpisodeDashboard({
   const [alertWindowKey, setAlertWindowKey] = useState<string | null>(null)
   const [alertTitle, setAlertTitle] = useState('')
   const [alertBody, setAlertBody] = useState('')
+  /** Optional subject override when notifying from Yahoo extremes (not watch tab). */
+  const [alertSubjectTicker, setAlertSubjectTicker] = useState<string | null>(
+    null,
+  )
+  const [alertSubjectLabel, setAlertSubjectLabel] = useState<string | null>(null)
   const [alertDevices, setAlertDevices] = useState<AlertDevice[]>([])
   const [alertDeviceKeys, setAlertDeviceKeys] = useState<string[]>([])
   const [alertDevicesLoading, setAlertDevicesLoading] = useState(false)
@@ -8485,6 +8493,7 @@ export function EpisodeDashboard({
       setDeskUserFocus(null)
       setDeskExtremeFocus(null)
       setDeskExtremeSharePayload(null)
+      setDeskExtremeClassFilter(null)
       return
     }
     if (!was && leftShowsActiveEpisodes) {
@@ -8492,6 +8501,7 @@ export function EpisodeDashboard({
       setDeskUserFocus(null)
       setDeskExtremeFocus(null)
       setDeskExtremeSharePayload(null)
+      setDeskExtremeClassFilter(null)
       setDeskLeftTab('episodes')
       setRightRailMode('logs')
       setLogCollapsedPersist(false)
@@ -8725,6 +8735,27 @@ export function EpisodeDashboard({
     return () => window.clearInterval(timer)
   }, [leftShowsActiveEpisodes, deskExtremesMode, loadDeskExtremes])
 
+  function extremeMoverAssetClass(item: YahooExtremeMover): AssetClassTabId {
+    const raw = String(item.assetClass || item.quoteType || '')
+      .trim()
+      .toLowerCase()
+    if (raw === 'etf' || raw === 'mutualfund') return 'etf'
+    if (raw === 'index' || raw === 'indices' || raw === 'indexes') return 'index'
+    if (raw === 'forex' || raw === 'fx' || raw === 'currency') return 'forex'
+    if (raw === 'crypto' || raw === 'cryptocurrency') return 'crypto'
+    if (
+      raw === 'commodity' ||
+      raw === 'commodities' ||
+      raw === 'future' ||
+      raw === 'futures'
+    ) {
+      return 'commodity'
+    }
+    if (raw === 'equity' || raw === 'stock' || raw === 'stocks') return 'equity'
+    return (detectAssetClass(item.ticker) || 'equity') as AssetClassTabId
+  }
+
+  /** Strict ±5% (or API minPercent) across every asset class. */
   const deskExtremePositiveMovers = useMemo(() => {
     const list = deskExtremeMovers.filter(
       (item) => Number(item.regularMarketChangePercent) >= EXTREME_MIN_PERCENT,
@@ -8751,11 +8782,27 @@ export function EpisodeDashboard({
     return list
   }, [deskExtremeMovers])
 
-  const deskFilteredExtremeMovers = deskExtremesPositiveMode
+  const deskExtremeDirectionMovers = deskExtremesPositiveMode
     ? deskExtremePositiveMovers
     : deskExtremesNegativeMode
       ? deskExtremeNegativeMovers
       : []
+
+  const deskExtremeClassCounts = useMemo(() => {
+    const counts: Partial<Record<AssetClassTabId, number>> = {}
+    for (const item of deskExtremeDirectionMovers) {
+      const cls = extremeMoverAssetClass(item)
+      counts[cls] = (counts[cls] || 0) + 1
+    }
+    return counts
+  }, [deskExtremeDirectionMovers])
+
+  const deskFilteredExtremeMovers = useMemo(() => {
+    if (!deskExtremeClassFilter) return deskExtremeDirectionMovers
+    return deskExtremeDirectionMovers.filter(
+      (item) => extremeMoverAssetClass(item) === deskExtremeClassFilter,
+    )
+  }, [deskExtremeDirectionMovers, deskExtremeClassFilter])
 
   // Load push activity for the focused desk user
   useEffect(() => {
@@ -10181,6 +10228,8 @@ export function EpisodeDashboard({
       marketSession: sessionCode,
     })
     setAlertWindowKey(windowKey)
+    setAlertSubjectTicker(null)
+    setAlertSubjectLabel(null)
     setAlertTitle(copy.title)
     setAlertBody(copy.body)
     setAlertSendMessage('')
@@ -11576,6 +11625,7 @@ export function EpisodeDashboard({
                       setDeskBulletinFocus(null)
                       setDeskExtremeFocus(null)
                       setDeskExtremeSharePayload(null)
+                      setDeskExtremeClassFilter(null)
                       setRightRailMode('yahoo')
                       setLogCollapsedPersist(false)
                       void loadDeskExtremes()
@@ -11598,7 +11648,7 @@ export function EpisodeDashboard({
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
-                  Positive extremes · ≥{EXTREME_MIN_PERCENT}%
+                  Positive extremes · ≥{EXTREME_MIN_PERCENT}% any class
                 </TooltipContent>
               </Tooltip>
 
@@ -11617,6 +11667,7 @@ export function EpisodeDashboard({
                       setDeskBulletinFocus(null)
                       setDeskExtremeFocus(null)
                       setDeskExtremeSharePayload(null)
+                      setDeskExtremeClassFilter(null)
                       setRightRailMode('yahoo')
                       setLogCollapsedPersist(false)
                       void loadDeskExtremes()
@@ -11639,7 +11690,7 @@ export function EpisodeDashboard({
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
-                  Negative extremes · ≤−{EXTREME_MIN_PERCENT}%
+                  Negative extremes · ≤−{EXTREME_MIN_PERCENT}% any class
                 </TooltipContent>
               </Tooltip>
             </div>
@@ -12784,10 +12835,19 @@ export function EpisodeDashboard({
                     {EXTREME_MIN_PERCENT}%
                     <span className="ml-2 text-[12px] font-medium tabular-nums text-muted-foreground">
                       · {deskFilteredExtremeMovers.length}
+                      {deskExtremeClassFilter
+                        ? ` / ${deskExtremeDirectionMovers.length}`
+                        : ''}
                     </span>
                   </p>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">
-                    Stocks · ETFs · crypto · forex · commodities · indices
+                    {deskExtremeClassFilter
+                      ? `Showing ${
+                          ASSET_CLASS_TABS.find(
+                            (t) => t.id === deskExtremeClassFilter,
+                          )?.label || deskExtremeClassFilter
+                        } only · click again for all`
+                      : 'All classes · click a handle to filter'}
                     {deskExtremesFetchedAt
                       ? ` · ${formatLocalTimeWithZone(deskExtremesFetchedAt)}`
                       : ''}
@@ -12811,6 +12871,65 @@ export function EpisodeDashboard({
                     )}
                   />
                 </Button>
+              </div>
+
+              <div
+                className="mb-3 flex shrink-0 flex-wrap gap-1"
+                role="tablist"
+                aria-label="Extreme asset class"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={deskExtremeClassFilter == null}
+                  onClick={() => setDeskExtremeClassFilter(null)}
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors',
+                    deskExtremeClassFilter == null
+                      ? 'border-border bg-background text-foreground shadow-sm'
+                      : 'border-transparent bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground',
+                  )}
+                >
+                  All
+                  <span className="tabular-nums opacity-80">
+                    {deskExtremeDirectionMovers.length}
+                  </span>
+                </button>
+                {ASSET_CLASS_TABS.map((tab) => {
+                  const count = deskExtremeClassCounts[tab.id] || 0
+                  const selected = deskExtremeClassFilter === tab.id
+                  const Icon = tab.Icon
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={selected}
+                      title={
+                        selected
+                          ? `${tab.label} · click to show all`
+                          : `${tab.label} · ${count} ≥${EXTREME_MIN_PERCENT}%`
+                      }
+                      onClick={() =>
+                        setDeskExtremeClassFilter((prev) =>
+                          prev === tab.id ? null : tab.id,
+                        )
+                      }
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors',
+                        selected
+                          ? 'border-border bg-background text-foreground shadow-sm'
+                          : count > 0
+                            ? 'border-transparent bg-muted/60 text-foreground hover:bg-muted'
+                            : 'border-transparent bg-muted/40 text-muted-foreground/70 hover:bg-muted/60',
+                      )}
+                    >
+                      <Icon className="size-3 opacity-70" strokeWidth={1.75} />
+                      {tab.label}
+                      <span className="tabular-nums opacity-80">{count}</span>
+                    </button>
+                  )
+                })}
               </div>
 
               <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
@@ -12847,12 +12966,31 @@ export function EpisodeDashboard({
                     )}
                     <p className="text-sm font-medium">
                       No {deskExtremesPositiveMode ? 'positive' : 'negative'}{' '}
+                      {deskExtremeClassFilter
+                        ? `${
+                            ASSET_CLASS_TABS.find(
+                              (t) => t.id === deskExtremeClassFilter,
+                            )?.label || deskExtremeClassFilter
+                          } `
+                        : ''}
                       extremes ≥{EXTREME_MIN_PERCENT}%
                     </p>
                     <p className="max-w-sm text-[12px] text-muted-foreground">
-                      Yahoo Day Gainers / Losers plus crypto, forex, and
-                      commodity universes. Retry later in the session.
+                      {deskExtremeClassFilter
+                        ? 'This class has no ±5% movers right now — pick All or another handle.'
+                        : `Only names with a ±${EXTREME_MIN_PERCENT}% day move or more — any class. Retry later in the session.`}
                     </p>
+                    {deskExtremeClassFilter ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="mt-1 h-7 text-[11px]"
+                        onClick={() => setDeskExtremeClassFilter(null)}
+                      >
+                        Show all classes
+                      </Button>
+                    ) : null}
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-1">
@@ -12868,10 +13006,10 @@ export function EpisodeDashboard({
                         Number.isFinite(Number(row.regularMarketPrice))
                           ? Number(row.regularMarketPrice)
                           : null
-                      const asset =
-                        String(row.assetClass || row.quoteType || '')
-                          .trim()
-                          .toLowerCase() || 'equity'
+                      const asset = extremeMoverAssetClass(row)
+                      const assetLabel =
+                        ASSET_CLASS_TABS.find((t) => t.id === asset)?.label ||
+                        asset
                       return (
                         <button
                           key={row.ticker}
@@ -12923,7 +13061,7 @@ export function EpisodeDashboard({
                                 variant="outline"
                                 className="shrink-0 text-[9px] font-semibold uppercase"
                               >
-                                {asset}
+                                {assetLabel}
                               </Badge>
                             </span>
                           </span>
@@ -15132,35 +15270,44 @@ export function EpisodeDashboard({
                           title,
                           body,
                         }) => {
-                          if (!onOpenInTrigger) {
-                            toast({
-                              title: 'Notify unavailable',
-                              description: 'Open /trigger to notify subscribers.',
-                            })
-                            return
-                          }
-                          const priceRaw = deskExtremeSharePayload?.price ?? null
-                          const priceNum =
-                            priceRaw != null &&
-                            Number.isFinite(Number(priceRaw))
-                              ? Number(priceRaw)
-                              : null
-                          onOpenInTrigger(ticker, {
-                            label: companyName,
-                            share: true,
-                            mode: 'direct',
-                            move: deskExtremeSharePayload?.move ?? null,
-                            price: priceNum,
-                            direction: deskExtremeSharePayload?.direction ?? null,
-                            kind: 'extreme',
-                            headline: title || null,
-                            likelyDriver: body || null,
-                          })
+                          const symbol = String(ticker || '')
+                            .trim()
+                            .toUpperCase()
+                          const label =
+                            String(companyName || symbol).trim() || symbol
+                          const pushTitle =
+                            String(title || '').trim() ||
+                            deskExtremeSharePayload?.headline ||
+                            `$${symbol}`
+                          const pushBody = String(body || '').trim()
+                          setAlertSubjectTicker(symbol)
+                          setAlertSubjectLabel(label)
+                          setAlertWindowKey('day')
+                          setAlertTitle(pushTitle)
+                          setAlertBody(pushBody)
+                          setAlertSendMessage('')
+                          setAlertSendError(false)
+                          setAlertResearchError('')
+                          setAlertResearchSteps([])
+                          setAlertGeminiPrompt('')
+                          setAlertUserMovement('')
+                          setAlertInputFacts('')
+                          setAlertPromptDirty(false)
+                          setAlertResearchMeta(
+                            pushBody
+                              ? {
+                                  likely_driver: pushBody,
+                                  reason: null,
+                                }
+                              : null,
+                          )
+                          setAlertOpen(true)
+                          void loadAlertDevices()
                           toast({
-                            title: `Notify · ${ticker}`,
+                            title: `Notify · ${symbol}`,
                             description:
-                              'Opening Trigger — review title/body, then notify.',
-                            durationMs: 3500,
+                              'Pick devices and send — title/body are prefilled.',
+                            durationMs: 3000,
                           })
                         }}
                       />
@@ -17799,6 +17946,10 @@ export function EpisodeDashboard({
           ) {
             persistEditedResearchPrompt(alertGeminiPrompt)
           }
+          if (!open) {
+            setAlertSubjectTicker(null)
+            setAlertSubjectLabel(null)
+          }
           setAlertOpen(open)
         }}
       >
@@ -17809,19 +17960,28 @@ export function EpisodeDashboard({
         >
           <DialogHeader className="shrink-0 border-b border-border px-5 py-3 pr-12 text-left">
             <DialogTitle className="text-lg">
-              Momentum alert · {activeTab?.label || displayTicker}
+              Momentum alert ·{' '}
+              {alertSubjectLabel ||
+                alertSubjectTicker ||
+                activeTab?.label ||
+                displayTicker}
               {alertWindowKey ? (
                 <span className="ml-2 text-sm font-medium text-muted-foreground">
-                  {returnKeyDisplayLabel(
-                    alertWindowKey,
-                    snap?.marketSession || sessionFromQuote,
-                  )}
+                  {alertSubjectTicker
+                    ? 'extreme'
+                    : returnKeyDisplayLabel(
+                        alertWindowKey,
+                        snap?.marketSession || sessionFromQuote,
+                      )}
                 </span>
               ) : null}
             </DialogTitle>
             <DialogDescription className="sr-only">
               Momentum alert research and push composer for{' '}
-              {activeTab?.label || displayTicker}
+              {alertSubjectLabel ||
+                alertSubjectTicker ||
+                activeTab?.label ||
+                displayTicker}
             </DialogDescription>
           </DialogHeader>
 

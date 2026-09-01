@@ -578,6 +578,7 @@ router.get('/extreme-movers', async (request, response) => {
         const marketCap = yahooScreenerNumeric(quote?.marketCap)
         const price = yahooScreenerNumeric(quote?.regularMarketPrice)
         const change = yahooScreenerNumeric(quote?.regularMarketChange)
+        // Strict ±minPercent for every class (equity, crypto, commodity, forex, index)
         if (!Number.isFinite(percent) || Math.abs(percent) < minPercent) continue
         if (
           minMarketCap > 0 &&
@@ -624,7 +625,7 @@ router.get('/extreme-movers', async (request, response) => {
     ingest(gainers, { expectedDirection: 'up', screener: 'day_gainers' })
     ingest(losers, { expectedDirection: 'down', screener: 'day_losers' })
 
-    // Crypto screener
+    // Crypto screener — only names with abs % ≥ minPercent
     await sleepMs(200)
     const cryptoQuotes = await fetchScreener('all_cryptocurrencies_us', null)
     ingest(
@@ -634,31 +635,41 @@ router.get('/extreme-movers', async (request, response) => {
       { assetClass: 'crypto', screener: 'all_cryptocurrencies_us' },
     )
 
-    // Commodity / forex / index universes (quoted live)
+    // Commodity / forex / index / crypto universes — same strict ±minPercent gate
+    const byClassCounts = {}
     for (const assetClass of ['commodity', 'forex', 'index', 'crypto']) {
       try {
         await sleepMs(120)
         const rows = await quoteMostActiveUniverse(assetClass)
-        ingest(
-          (rows || []).map((row) => ({
-            symbol: row.ticker,
-            shortName: row.label,
-            longName: row.longName,
-            regularMarketPrice: row.regularMarketPrice,
-            regularMarketChange: row.regularMarketChange,
-            regularMarketChangePercent: row.regularMarketChangePercent,
-            currency: row.currency,
-            exchange: row.exchange,
-            marketState: row.marketState,
-            quoteType: row.quoteType,
-          })),
-          { assetClass, screener: `universe:${assetClass}` },
-        )
+        const mapped = (rows || []).map((row) => ({
+          symbol: row.ticker,
+          shortName: row.label,
+          longName: row.longName,
+          regularMarketPrice: row.regularMarketPrice,
+          regularMarketChange: row.regularMarketChange,
+          regularMarketChangePercent: row.regularMarketChangePercent,
+          currency: row.currency,
+          exchange: row.exchange,
+          marketState: row.marketState,
+          quoteType: row.quoteType,
+        }))
+        const before = bySymbol.size
+        ingest(mapped, {
+          assetClass,
+          screener: `universe:${assetClass}`,
+        })
+        byClassCounts[assetClass] = {
+          universe: mapped.length,
+          matched: bySymbol.size - before,
+        }
       } catch (error) {
         console.warn(
           `[yahoo] extreme universe ${assetClass} failed:`,
           errorMessage(error, 'universe failed'),
         )
+        byClassCounts[assetClass] = {
+          error: errorMessage(error, 'universe failed'),
+        }
       }
     }
 
@@ -669,6 +680,11 @@ router.get('/extreme-movers', async (request, response) => {
     )
     const positive = movers.filter((m) => m.regularMarketChangePercent > 0)
     const negative = movers.filter((m) => m.regularMarketChangePercent < 0)
+    const byAssetClass = {}
+    for (const m of movers) {
+      const c = String(m.assetClass || 'equity')
+      byAssetClass[c] = (byAssetClass[c] || 0) + 1
+    }
 
     response.setHeader('Cache-Control', 'public, max-age=45')
     response.json({
@@ -689,6 +705,8 @@ router.get('/extreme-movers', async (request, response) => {
       loserCount: losers.length,
       positiveCount: positive.length,
       negativeCount: negative.length,
+      byAssetClass,
+      byClassCounts,
       fetchedAt: new Date().toISOString(),
       count: movers.length,
       movers,
