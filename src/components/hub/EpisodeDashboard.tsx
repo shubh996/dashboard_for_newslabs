@@ -58,6 +58,7 @@ import {
 } from '@/lib/usEquitySession'
 import { YahooInteractiveChart } from '@/components/yahoo/YahooInteractiveChart'
 import { PerplexityPromptsDialog } from '@/components/hub/PerplexityPromptsDialog'
+import { SofarResearchShareDialog } from '@/components/trigger/SofarResearchShareDialog'
 import {
   DeskUserListButton,
   DeskUserProfilePanel,
@@ -65,6 +66,8 @@ import {
   type DeskDevice,
   type DeskUserActivity,
 } from '@/components/hub/desk-users'
+import type { TriggerSharePayload } from '@/lib/triggerShare'
+import { useBottomToast } from '@/components/ui/bottom-toast'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -99,10 +102,12 @@ import {
 import { PlatformsMenuSub } from '@/components/hub/PlatformsMenu'
 import {
   fetchMomentumMonitoredTickers,
+  fetchYahooExtremeMovers,
   fetchYahooQuote,
   fetchYahooQuotes,
   fetchYahooSavedTickers,
   searchYahooSaved,
+  type YahooExtremeMover,
   type YahooLiveQuote,
 } from '@/services/yahooApi'
 import type { YahooSearchResult } from '@/types/yahoo'
@@ -4184,6 +4189,8 @@ type AssetClassTabId = (typeof ASSET_CLASS_TABS)[number]['id']
 const ASSET_CLASS_FILTER_KEY = 'momentum-asset-class-filter-v1'
 const ENTITY_LIST_PREFS_KEY = 'momentum-entity-list-prefs-v1'
 const READ_MARKET_BULLETINS_KEY = 'momentum-read-market-bulletins-v1'
+/** Yahoo extreme movers floor — same as /trigger tracker (≥5% day move). */
+const EXTREME_MIN_PERCENT = 5
 
 function loadReadMarketBulletinIds(): Set<string> {
   try {
@@ -6823,6 +6830,7 @@ export function EpisodeDashboard({
 } = {}) {
   void _appSwitcher
   void _onOpenNineAmApp
+  const { toast } = useBottomToast()
   const [watchlist, setWatchlist] = useState<WatchTab[]>(() => loadWatchlist())
   const [assetClassTab, setAssetClassTab] = useState<AssetClassTabId | null>(
     () => loadAssetClassFilter(),
@@ -7117,7 +7125,11 @@ export function EpisodeDashboard({
     useState<ActiveEpisodeRow | null>(null)
   /** Left desk tab while on Active-episodes home (assetClassTab == null). */
   const [deskLeftTab, setDeskLeftTab] = useState<
-    'episodes' | 'users' | 'bulletins'
+    | 'episodes'
+    | 'users'
+    | 'bulletins'
+    | 'extremesPositive'
+    | 'extremesNegative'
   >('episodes')
   const [deskDevices, setDeskDevices] = useState<DeskDevice[]>([])
   const [deskDevicesLoading, setDeskDevicesLoading] = useState(false)
@@ -7125,6 +7137,20 @@ export function EpisodeDashboard({
   const [deskUserFocus, setDeskUserFocus] = useState<DeskDevice | null>(null)
   const [, setDeskUserActivities] = useState<DeskUserActivity[]>([])
   const [, setDeskUserActivitiesLoading] = useState(false)
+  /** Yahoo extreme movers (≥5% day move, all asset classes) — desk left list. */
+  const [deskExtremeMovers, setDeskExtremeMovers] = useState<YahooExtremeMover[]>(
+    [],
+  )
+  const [deskExtremesLoading, setDeskExtremesLoading] = useState(false)
+  const [deskExtremesRefreshing, setDeskExtremesRefreshing] = useState(false)
+  const [deskExtremesError, setDeskExtremesError] = useState('')
+  const [deskExtremesFetchedAt, setDeskExtremesFetchedAt] = useState<string | null>(
+    null,
+  )
+  const [deskExtremeFocus, setDeskExtremeFocus] =
+    useState<YahooExtremeMover | null>(null)
+  const [deskExtremeSharePayload, setDeskExtremeSharePayload] =
+    useState<TriggerSharePayload | null>(null)
   type DeskMarketBulletin = {
     id: string
     market: 'us' | 'india' | string
@@ -7901,6 +7927,8 @@ export function EpisodeDashboard({
       setDeskLeftTab('episodes')
       setDeskUserFocus(null)
       setDeskBulletinFocus(null)
+      setDeskExtremeFocus(null)
+      setDeskExtremeSharePayload(null)
       selectTicker(ticker)
       setDeskEpisodeFocus(row)
       setRightRailMode('yahoo')
@@ -7929,6 +7957,8 @@ export function EpisodeDashboard({
       setDeskLeftTab('episodes')
       setDeskUserFocus(null)
       setDeskBulletinFocus(null)
+      setDeskExtremeFocus(null)
+      setDeskExtremeSharePayload(null)
       setDeskEpisodeFocus(null)
       setAssetClassTab(resolved)
       saveAssetClassFilter(resolved)
@@ -8032,6 +8062,80 @@ export function EpisodeDashboard({
         })
       }
       setDeskBulletinFocus(row)
+      setDeskUserFocus(null)
+      setDeskEpisodeFocus(null)
+      setDeskExtremeFocus(null)
+      setDeskExtremeSharePayload(null)
+      setRightRailMode('yahoo')
+      setLogCollapsedPersist(false)
+    },
+    [setLogCollapsedPersist],
+  )
+
+  const loadDeskExtremes = useCallback(async (opts?: { silent?: boolean }) => {
+    if (opts?.silent) setDeskExtremesRefreshing(true)
+    else setDeskExtremesLoading(true)
+    setDeskExtremesError('')
+    try {
+      const body = await fetchYahooExtremeMovers({
+        minPercent: EXTREME_MIN_PERCENT,
+        minMarketCap: 0,
+        count: 200,
+      })
+      const movers = Array.isArray(body.movers) ? body.movers : []
+      setDeskExtremeMovers(movers)
+      setDeskExtremesFetchedAt(body.fetchedAt || new Date().toISOString())
+      setDeskExtremeFocus((prev) => {
+        if (!prev) return prev
+        const sym = String(prev.ticker || '')
+          .trim()
+          .toUpperCase()
+        return movers.find((m) => m.ticker === sym) || prev
+      })
+    } catch (err) {
+      setDeskExtremesError(
+        err instanceof Error ? err.message : 'Failed to load Yahoo extremes',
+      )
+    } finally {
+      setDeskExtremesLoading(false)
+      setDeskExtremesRefreshing(false)
+    }
+  }, [])
+
+  const selectDeskExtreme = useCallback(
+    (row: YahooExtremeMover) => {
+      const symbol = String(row.ticker || '')
+        .trim()
+        .toUpperCase()
+      if (!symbol) return
+      const pct = Number(row.regularMarketChangePercent)
+      const move = Number.isFinite(pct) ? pct : null
+      const pctLabel =
+        move != null ? `${move > 0 ? '+' : ''}${move.toFixed(2)}%` : null
+      const label = String(row.company_name || symbol).trim() || symbol
+      const dir = move != null && move < 0 ? 'DOWN' : 'UP'
+      const headline = pctLabel
+        ? `$${symbol} ${pctLabel}`
+        : `$${symbol} extreme move`
+      const price =
+        row.regularMarketPrice != null &&
+        Number.isFinite(Number(row.regularMarketPrice))
+          ? Number(row.regularMarketPrice)
+          : null
+      const payload: TriggerSharePayload = {
+        ticker: symbol,
+        mode: 'research',
+        label,
+        move,
+        price,
+        window: 'day',
+        direction: dir,
+        kind: 'extreme',
+        headline,
+      }
+      setDeskExtremeFocus(row)
+      setDeskExtremeSharePayload(payload)
+      setDeskBulletinFocus(null)
       setDeskUserFocus(null)
       setDeskEpisodeFocus(null)
       setRightRailMode('yahoo')
@@ -8379,11 +8483,15 @@ export function EpisodeDashboard({
     if (!leftShowsActiveEpisodes) {
       setDeskEpisodeFocus(null)
       setDeskUserFocus(null)
+      setDeskExtremeFocus(null)
+      setDeskExtremeSharePayload(null)
       return
     }
     if (!was && leftShowsActiveEpisodes) {
       setDeskEpisodeFocus(null)
       setDeskUserFocus(null)
+      setDeskExtremeFocus(null)
+      setDeskExtremeSharePayload(null)
       setDeskLeftTab('episodes')
       setRightRailMode('logs')
       setLogCollapsedPersist(false)
@@ -8396,10 +8504,19 @@ export function EpisodeDashboard({
   const deskUsersMode = leftShowsActiveEpisodes && deskLeftTab === 'users'
   const deskBulletinsMode =
     leftShowsActiveEpisodes && deskLeftTab === 'bulletins'
+  const deskExtremesPositiveMode =
+    leftShowsActiveEpisodes && deskLeftTab === 'extremesPositive'
+  const deskExtremesNegativeMode =
+    leftShowsActiveEpisodes && deskLeftTab === 'extremesNegative'
+  const deskExtremesMode =
+    deskExtremesPositiveMode || deskExtremesNegativeMode
 
   /** Center stays on All episodes while desk is open — focus only updates the 3rd column. */
   const showAllEpisodesCenter =
-    leftShowsActiveEpisodes && !deskUsersMode && !deskBulletinsMode
+    leftShowsActiveEpisodes &&
+    !deskUsersMode &&
+    !deskBulletinsMode &&
+    !deskExtremesMode
 
   /** Ticker → enabled Trigger subscriber count (from device_monitor). */
   const subscriberCountByTicker = useMemo(() => {
@@ -8596,6 +8713,49 @@ export function EpisodeDashboard({
     if (!leftShowsActiveEpisodes && !deskBulletinsMode) return
     void loadDeskBulletins()
   }, [leftShowsActiveEpisodes, deskBulletinsMode, loadDeskBulletins])
+
+  // Yahoo extremes (≥5%) — prefetch for nav badges; poll while extremes tab is open
+  useEffect(() => {
+    if (!leftShowsActiveEpisodes && !deskExtremesMode) return
+    void loadDeskExtremes(deskExtremesMode ? undefined : { silent: true })
+    if (!deskExtremesMode) return
+    const timer = window.setInterval(() => {
+      void loadDeskExtremes({ silent: true })
+    }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [leftShowsActiveEpisodes, deskExtremesMode, loadDeskExtremes])
+
+  const deskExtremePositiveMovers = useMemo(() => {
+    const list = deskExtremeMovers.filter(
+      (item) => Number(item.regularMarketChangePercent) >= EXTREME_MIN_PERCENT,
+    )
+    list.sort(
+      (a, b) =>
+        Math.abs(Number(b.regularMarketChangePercent) || 0) -
+          Math.abs(Number(a.regularMarketChangePercent) || 0) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    return list
+  }, [deskExtremeMovers])
+
+  const deskExtremeNegativeMovers = useMemo(() => {
+    const list = deskExtremeMovers.filter(
+      (item) => Number(item.regularMarketChangePercent) <= -EXTREME_MIN_PERCENT,
+    )
+    list.sort(
+      (a, b) =>
+        Math.abs(Number(b.regularMarketChangePercent) || 0) -
+          Math.abs(Number(a.regularMarketChangePercent) || 0) ||
+        a.ticker.localeCompare(b.ticker),
+    )
+    return list
+  }, [deskExtremeMovers])
+
+  const deskFilteredExtremeMovers = deskExtremesPositiveMode
+    ? deskExtremePositiveMovers
+    : deskExtremesNegativeMode
+      ? deskExtremeNegativeMovers
+      : []
 
   // Load push activity for the focused desk user
   useEffect(() => {
@@ -11136,6 +11296,8 @@ export function EpisodeDashboard({
           setDeskLeftTab('episodes')
           setDeskUserFocus(null)
           setDeskBulletinFocus(null)
+          setDeskExtremeFocus(null)
+          setDeskExtremeSharePayload(null)
           void loadAllEpisodesHistory()
         }}
         className={cn(
@@ -11159,6 +11321,8 @@ export function EpisodeDashboard({
           setDeskEpisodeFocus(null)
           setDeskUserFocus(null)
           setDeskBulletinFocus(null)
+          setDeskExtremeFocus(null)
+          setDeskExtremeSharePayload(null)
           setRightRailMode('yahoo')
           setLogCollapsedPersist(false)
           void loadDeskDevices()
@@ -11182,6 +11346,8 @@ export function EpisodeDashboard({
           setDeskEpisodeFocus(null)
           setDeskUserFocus(null)
           setDeskBulletinFocus(null)
+          setDeskExtremeFocus(null)
+          setDeskExtremeSharePayload(null)
           setRightRailMode('yahoo')
           setLogCollapsedPersist(false)
           void loadDeskBulletins()
@@ -11264,7 +11430,8 @@ export function EpisodeDashboard({
                     aria-pressed={
                       leftShowsActiveEpisodes &&
                       !deskUsersMode &&
-                      !deskBulletinsMode
+                      !deskBulletinsMode &&
+                      !deskExtremesMode
                     }
                     onClick={() => {
                       setAssetClassTab(null)
@@ -11273,6 +11440,8 @@ export function EpisodeDashboard({
                       setDeskUserFocus(null)
                       setDeskEpisodeFocus(null)
                       setDeskBulletinFocus(null)
+                      setDeskExtremeFocus(null)
+                      setDeskExtremeSharePayload(null)
                       setMainPanelTab('episode')
                       setRightRailMode('logs')
                       setLogCollapsedPersist(false)
@@ -11283,7 +11452,8 @@ export function EpisodeDashboard({
                       'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
                       leftShowsActiveEpisodes &&
                         !deskUsersMode &&
-                        !deskBulletinsMode
+                        !deskBulletinsMode &&
+                        !deskExtremesMode
                         ? 'border-border bg-background text-foreground shadow-sm'
                         : 'text-muted-foreground hover:bg-background hover:text-foreground',
                     )}
@@ -11316,6 +11486,8 @@ export function EpisodeDashboard({
                       setDeskEpisodeFocus(null)
                       setDeskUserFocus(null)
                       setDeskBulletinFocus(null)
+                      setDeskExtremeFocus(null)
+                      setDeskExtremeSharePayload(null)
                       setRightRailMode('yahoo')
                       setLogCollapsedPersist(false)
                       void loadDeskDevices()
@@ -11357,6 +11529,8 @@ export function EpisodeDashboard({
                       setDeskEpisodeFocus(null)
                       setDeskUserFocus(null)
                       setDeskBulletinFocus(null)
+                      setDeskExtremeFocus(null)
+                      setDeskExtremeSharePayload(null)
                       setRightRailMode('yahoo')
                       setLogCollapsedPersist(false)
                       void loadDeskBulletins()
@@ -11382,6 +11556,90 @@ export function EpisodeDashboard({
                   {unreadDeskBulletinCount > 0
                     ? `Market bulletins · ${unreadDeskBulletinCount} unread`
                     : 'Market bulletins'}
+                </TooltipContent>
+              </Tooltip>
+
+              <div className="my-2 h-px w-7 shrink-0 bg-border" />
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Yahoo positive extremes"
+                    aria-pressed={deskExtremesPositiveMode}
+                    onClick={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('extremesPositive')
+                      setDeskEpisodeFocus(null)
+                      setDeskUserFocus(null)
+                      setDeskBulletinFocus(null)
+                      setDeskExtremeFocus(null)
+                      setDeskExtremeSharePayload(null)
+                      setRightRailMode('yahoo')
+                      setLogCollapsedPersist(false)
+                      void loadDeskExtremes()
+                    }}
+                    className={cn(
+                      'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      deskExtremesPositiveMode
+                        ? 'border-border bg-background text-emerald-600 shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-emerald-600',
+                    )}
+                  >
+                    <ArrowUp className="size-4" strokeWidth={1.75} />
+                    {deskExtremePositiveMovers.length > 0 ? (
+                      <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-600 px-0.5 text-[9px] font-bold leading-none text-white">
+                        {deskExtremePositiveMovers.length > 99
+                          ? '99+'
+                          : deskExtremePositiveMovers.length}
+                      </span>
+                    ) : null}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  Positive extremes · ≥{EXTREME_MIN_PERCENT}%
+                </TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Yahoo negative extremes"
+                    aria-pressed={deskExtremesNegativeMode}
+                    onClick={() => {
+                      setAssetClassTab(null)
+                      saveAssetClassFilter(null)
+                      setDeskLeftTab('extremesNegative')
+                      setDeskEpisodeFocus(null)
+                      setDeskUserFocus(null)
+                      setDeskBulletinFocus(null)
+                      setDeskExtremeFocus(null)
+                      setDeskExtremeSharePayload(null)
+                      setRightRailMode('yahoo')
+                      setLogCollapsedPersist(false)
+                      void loadDeskExtremes()
+                    }}
+                    className={cn(
+                      'relative inline-flex size-10 items-center justify-center rounded-xl border border-transparent transition-colors',
+                      deskExtremesNegativeMode
+                        ? 'border-border bg-background text-rose-600 shadow-sm'
+                        : 'text-muted-foreground hover:bg-background hover:text-rose-600',
+                    )}
+                  >
+                    <ArrowDown className="size-4" strokeWidth={1.75} />
+                    {deskExtremeNegativeMovers.length > 0 ? (
+                      <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-600 px-0.5 text-[9px] font-bold leading-none text-white">
+                        {deskExtremeNegativeMovers.length > 99
+                          ? '99+'
+                          : deskExtremeNegativeMovers.length}
+                      </span>
+                    ) : null}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  Negative extremes · ≤−{EXTREME_MIN_PERCENT}%
                 </TooltipContent>
               </Tooltip>
             </div>
@@ -12507,6 +12765,168 @@ export function EpisodeDashboard({
                               {row.body}
                             </p>
                           ) : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : deskExtremesMode ? (
+            <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+              <div className="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                    Yahoo extremes
+                  </p>
+                  <p className="mt-0.5 text-sm font-semibold">
+                    {deskExtremesPositiveMode ? 'Positive' : 'Negative'} · ≥
+                    {EXTREME_MIN_PERCENT}%
+                    <span className="ml-2 text-[12px] font-medium tabular-nums text-muted-foreground">
+                      · {deskFilteredExtremeMovers.length}
+                    </span>
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    Stocks · ETFs · crypto · forex · commodities · indices
+                    {deskExtremesFetchedAt
+                      ? ` · ${formatLocalTimeWithZone(deskExtremesFetchedAt)}`
+                      : ''}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  className="size-7"
+                  onClick={() => void loadDeskExtremes()}
+                  disabled={deskExtremesLoading || deskExtremesRefreshing}
+                  title="Refresh Yahoo extremes"
+                  aria-label="Refresh Yahoo extremes"
+                >
+                  <RefreshCw
+                    className={cn(
+                      'size-3.5',
+                      (deskExtremesLoading || deskExtremesRefreshing) &&
+                        'animate-spin',
+                    )}
+                  />
+                </Button>
+              </div>
+
+              <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+                {deskExtremesError ? (
+                  <div className="space-y-2 rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-8 text-center">
+                    <p className="text-xs text-destructive">{deskExtremesError}</p>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-[11px]"
+                      onClick={() => void loadDeskExtremes()}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                ) : deskExtremesLoading && !deskExtremeMovers.length ? (
+                  <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-sm text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" />
+                    Loading Yahoo extremes…
+                  </div>
+                ) : !deskFilteredExtremeMovers.length ? (
+                  <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border px-4 py-16 text-center">
+                    {deskExtremesPositiveMode ? (
+                      <ArrowUp
+                        className="size-6 text-muted-foreground/70"
+                        strokeWidth={1.5}
+                      />
+                    ) : (
+                      <ArrowDown
+                        className="size-6 text-muted-foreground/70"
+                        strokeWidth={1.5}
+                      />
+                    )}
+                    <p className="text-sm font-medium">
+                      No {deskExtremesPositiveMode ? 'positive' : 'negative'}{' '}
+                      extremes ≥{EXTREME_MIN_PERCENT}%
+                    </p>
+                    <p className="max-w-sm text-[12px] text-muted-foreground">
+                      Yahoo Day Gainers / Losers plus crypto, forex, and
+                      commodity universes. Retry later in the session.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-1">
+                    {deskFilteredExtremeMovers.map((row) => {
+                      const active =
+                        deskExtremeFocus?.ticker === row.ticker
+                      const pct = Number(row.regularMarketChangePercent)
+                      const pctLabel = Number.isFinite(pct)
+                        ? `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`
+                        : '—'
+                      const price =
+                        row.regularMarketPrice != null &&
+                        Number.isFinite(Number(row.regularMarketPrice))
+                          ? Number(row.regularMarketPrice)
+                          : null
+                      const asset =
+                        String(row.assetClass || row.quoteType || '')
+                          .trim()
+                          .toLowerCase() || 'equity'
+                      return (
+                        <button
+                          key={row.ticker}
+                          type="button"
+                          onClick={() => selectDeskExtreme(row)}
+                          className={cn(
+                            'flex w-full items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors',
+                            active
+                              ? 'border-border bg-muted'
+                              : 'border-transparent hover:bg-muted/60',
+                          )}
+                        >
+                          <CompanyLogo
+                            ticker={row.ticker}
+                            companyName={row.company_name}
+                            size="sm"
+                            className="mt-0.5 size-7 bg-background"
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                              <span className="font-mono text-[13px] font-semibold tracking-tight">
+                                {row.ticker}
+                              </span>
+                              {price != null ? (
+                                <span className="text-[12px] font-semibold tabular-nums text-foreground/80">
+                                  {price >= 1
+                                    ? price.toFixed(2)
+                                    : price.toPrecision(4)}
+                                </span>
+                              ) : null}
+                              <span
+                                className={cn(
+                                  'text-[12px] font-semibold tabular-nums',
+                                  pct > 0
+                                    ? 'text-emerald-600'
+                                    : pct < 0
+                                      ? 'text-rose-600'
+                                      : 'text-muted-foreground',
+                                )}
+                              >
+                                {pctLabel}
+                              </span>
+                            </span>
+                            <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                              <span className="truncate">
+                                {row.company_name || row.ticker}
+                              </span>
+                              <Badge
+                                variant="outline"
+                                className="shrink-0 text-[9px] font-semibold uppercase"
+                              >
+                                {asset}
+                              </Badge>
+                            </span>
+                          </span>
                         </button>
                       )
                     })}
@@ -14410,6 +14830,14 @@ export function EpisodeDashboard({
                               }`
                             : 'User profile'}
                         </span>
+                      ) : rightRailMode === 'yahoo' && deskExtremesMode ? (
+                        <span className="truncate">
+                          {deskExtremeFocus
+                            ? `Extreme · ${deskExtremeFocus.ticker}`
+                            : deskExtremesPositiveMode
+                              ? 'Positive extremes'
+                              : 'Negative extremes'}
+                        </span>
                       ) : rightRailMode === 'logs' && !displayTicker ? (
                         <span className="truncate">Activity log</span>
                       ) : displayTicker ? (
@@ -14559,7 +14987,14 @@ export function EpisodeDashboard({
             </div>
             {rightRailMode === 'yahoo' ? (
               <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                <div className="mom-hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+                <div
+                  className={cn(
+                    'min-h-0 flex-1',
+                    deskExtremesMode && deskExtremeFocus
+                      ? 'flex flex-col overflow-hidden'
+                      : 'mom-hide-scrollbar overflow-y-auto',
+                  )}
+                >
                   {deskUsersMode ? (
                     deskUserFocus ? (
                       <DeskUserProfilePanel
@@ -14581,6 +15016,173 @@ export function EpisodeDashboard({
                         <p className="max-w-[16rem] text-[12px] text-muted-foreground">
                           Click a device in All users to see iOS / build / photo
                           and profile fields here.
+                        </p>
+                      </div>
+                    )
+                  ) : deskExtremesMode ? (
+                    deskExtremeFocus && deskExtremeSharePayload ? (
+                      <SofarResearchShareDialog
+                        variant="panel"
+                        open
+                        onOpenChange={(open) => {
+                          if (!open) {
+                            setDeskExtremeFocus(null)
+                            setDeskExtremeSharePayload(null)
+                          }
+                        }}
+                        payload={deskExtremeSharePayload}
+                        onRenderPreview={async () => ({ imageUrl: null })}
+                        onEditShare={async ({ ticker, companyName, event }) => {
+                          const pctRaw = String(
+                            event.price_change || event.momentum || '',
+                          ).replace(/%/g, '')
+                          const move = Number.parseFloat(pctRaw)
+                          const driver = String(event.summary || '')
+                            .split('\n')
+                            .map((l) => l.replace(/^Likely driver:\s*/i, '').trim())
+                            .find((l) => l && !l.startsWith('$'))
+                          if (!onOpenInTrigger) {
+                            toast({
+                              title: 'Trigger share unavailable',
+                              description: 'Open /trigger to edit the share card.',
+                            })
+                            return
+                          }
+                          const priceRaw =
+                            deskExtremeSharePayload?.price ??
+                            deskExtremeFocus?.regularMarketPrice ??
+                            null
+                          const priceNum =
+                            priceRaw != null &&
+                            Number.isFinite(Number(priceRaw))
+                              ? Number(priceRaw)
+                              : null
+                          onOpenInTrigger(ticker, {
+                            label: companyName,
+                            share: true,
+                            mode: 'direct',
+                            move: Number.isFinite(move) ? move : null,
+                            price: priceNum,
+                            direction:
+                              event.direction === 'down' ? 'DOWN' : 'UP',
+                            kind: 'extreme',
+                            headline:
+                              String(event.summary || '')
+                                .split('\n')[0]
+                                ?.trim() || null,
+                            likelyDriver: driver || null,
+                          })
+                          toast({
+                            title: `Edit · ${ticker}`,
+                            description: 'Opening Trigger share editor…',
+                            durationMs: 3000,
+                          })
+                        }}
+                        onShareSocial={async ({ ticker, companyName, event }) => {
+                          const pctRaw = String(
+                            event.price_change || event.momentum || '',
+                          ).replace(/%/g, '')
+                          const move = Number.parseFloat(pctRaw)
+                          const driver = String(event.summary || '')
+                            .split('\n')
+                            .map((l) =>
+                              l.replace(/^Likely driver:\s*/i, '').trim(),
+                            )
+                            .find((l) => l && !l.startsWith('$'))
+                          if (!onOpenInTrigger) {
+                            toast({
+                              title: 'Trigger share unavailable',
+                              description: 'Open /trigger to share on social.',
+                            })
+                            return
+                          }
+                          const priceRaw =
+                            deskExtremeSharePayload?.price ??
+                            deskExtremeFocus?.regularMarketPrice ??
+                            null
+                          const priceNum =
+                            priceRaw != null &&
+                            Number.isFinite(Number(priceRaw))
+                              ? Number(priceRaw)
+                              : null
+                          onOpenInTrigger(ticker, {
+                            label: companyName,
+                            share: true,
+                            mode: 'direct',
+                            move: Number.isFinite(move) ? move : null,
+                            price: priceNum,
+                            direction:
+                              event.direction === 'down' ? 'DOWN' : 'UP',
+                            kind: 'extreme',
+                            headline:
+                              String(event.summary || '')
+                                .split('\n')[0]
+                                ?.trim() || null,
+                            likelyDriver: driver || null,
+                          })
+                          toast({
+                            title: `Share · ${ticker}`,
+                            description: 'Opening Trigger share desk…',
+                            durationMs: 3000,
+                          })
+                        }}
+                        onNotify={async ({
+                          ticker,
+                          companyName,
+                          title,
+                          body,
+                        }) => {
+                          if (!onOpenInTrigger) {
+                            toast({
+                              title: 'Notify unavailable',
+                              description: 'Open /trigger to notify subscribers.',
+                            })
+                            return
+                          }
+                          const priceRaw = deskExtremeSharePayload?.price ?? null
+                          const priceNum =
+                            priceRaw != null &&
+                            Number.isFinite(Number(priceRaw))
+                              ? Number(priceRaw)
+                              : null
+                          onOpenInTrigger(ticker, {
+                            label: companyName,
+                            share: true,
+                            mode: 'direct',
+                            move: deskExtremeSharePayload?.move ?? null,
+                            price: priceNum,
+                            direction: deskExtremeSharePayload?.direction ?? null,
+                            kind: 'extreme',
+                            headline: title || null,
+                            likelyDriver: body || null,
+                          })
+                          toast({
+                            title: `Notify · ${ticker}`,
+                            description:
+                              'Opening Trigger — review title/body, then notify.',
+                            durationMs: 3500,
+                          })
+                        }}
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 px-4 py-12 text-center">
+                        {deskExtremesPositiveMode ? (
+                          <ArrowUp
+                            className="size-6 text-muted-foreground/70"
+                            strokeWidth={1.5}
+                          />
+                        ) : (
+                          <ArrowDown
+                            className="size-6 text-muted-foreground/70"
+                            strokeWidth={1.5}
+                          />
+                        )}
+                        <p className="text-sm font-medium">
+                          Select an extreme mover
+                        </p>
+                        <p className="max-w-[16rem] text-[12px] text-muted-foreground">
+                          Click a Yahoo ≥{EXTREME_MIN_PERCENT}% mover to open
+                          Perplexity research and share in this panel.
                         </p>
                       </div>
                     )

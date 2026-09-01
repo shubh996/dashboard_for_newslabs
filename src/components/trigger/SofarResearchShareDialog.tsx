@@ -12,6 +12,7 @@ import {
   Pencil,
   Search,
   Share2,
+  X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -65,6 +66,12 @@ type Props = {
   open: boolean
   onOpenChange: (open: boolean) => void
   payload: TriggerSharePayload | null
+  /**
+   * dialog = fullscreen Trigger tab overlay (default).
+   * panel = embed in episode-desk right rail (no window.close).
+   */
+  variant?: 'dialog' | 'panel'
+  className?: string
   /** Full share-card editor (layout / text / platforms). */
   onEditShare: (args: ShareArgs) => void | Promise<void>
   /** Direct social sharing flow (opens share desk ready to post). */
@@ -146,13 +153,24 @@ function fmtSharePriceRange(
   return null
 }
 
-function kindLabel(kind?: string | null): 'peak' | 'sofar' | 'research' {
+function kindLabel(
+  kind?: string | null,
+): 'peak' | 'sofar' | 'extreme' | 'research' {
   const k = String(kind || '')
     .trim()
     .toLowerCase()
   if (k === 'peak') return 'peak'
   if (k === 'sofar') return 'sofar'
+  if (k === 'extreme' || k === 'extremes') return 'extreme'
   return 'research'
+}
+
+function flowTitle(kind?: string | null): string {
+  const which = kindLabel(kind)
+  if (which === 'peak') return 'Peak research'
+  if (which === 'extreme') return 'Extreme research'
+  if (which === 'sofar') return 'So Far research'
+  return 'Research'
 }
 
 function buildDefaultTitle(
@@ -167,6 +185,9 @@ function buildDefaultTitle(
   const which = kindLabel(kind)
   if (which === 'peak') {
     return pct ? `$${ticker} ${pct}` : `$${ticker} peak move`
+  }
+  if (which === 'extreme') {
+    return pct ? `$${ticker} ${pct}` : `$${ticker} extreme move`
   }
   return pct
     ? `$${ticker} ${pct} so far in regular trading`
@@ -206,11 +227,14 @@ export function SofarResearchShareDialog({
   open,
   onOpenChange,
   payload,
+  variant = 'dialog',
+  className,
   onEditShare,
   onShareSocial,
   onRenderPreview,
   onNotify,
 }: Props) {
+  const isPanel = variant === 'panel'
   const ticker = String(payload?.ticker || '')
     .trim()
     .toUpperCase()
@@ -575,9 +599,11 @@ export function SofarResearchShareDialog({
   async function handleEdit() {
     if (!ticker || actionBusy) return
     setActionBusy('edit')
-    // Park composer under the share editor — do not close this browser tab
-    suppressLeaveTabRef.current = true
-    onOpenChange(false)
+    if (!isPanel) {
+      // Park composer under the share editor — do not close this browser tab
+      suppressLeaveTabRef.current = true
+      onOpenChange(false)
+    }
     try {
       await onEditShare({
         ticker,
@@ -592,8 +618,10 @@ export function SofarResearchShareDialog({
   async function handleShareSocial() {
     if (!ticker || actionBusy) return
     setActionBusy('share')
-    suppressLeaveTabRef.current = true
-    onOpenChange(false)
+    if (!isPanel) {
+      suppressLeaveTabRef.current = true
+      onOpenChange(false)
+    }
     try {
       await onShareSocial({
         ticker,
@@ -613,6 +641,7 @@ export function SofarResearchShareDialog({
         suppressLeaveTabRef.current = false
         return
       }
+      if (isPanel) return
       // X / Escape on Peak Research — close this Trigger tab → desk tab
       closeResearchTab()
     }
@@ -622,35 +651,41 @@ export function SofarResearchShareDialog({
     body.trim() || meta?.likely_driver || seededDriver,
   )
 
-  return (
-    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-      <DialogContent
-        showCloseButton
-        className="fixed inset-0 z-50 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:max-w-none"
-      >
-        <DialogHeader className="shrink-0 border-b border-border px-5 py-3 pr-14 text-left">
-          <DialogTitle className="text-lg">
-            {flowKind === 'peak' ? 'Peak research' : 'So Far research'} ·{' '}
-            {ticker}
-            {move != null ? (
-              <span
-                className={cn(
-                  'ml-2 text-sm font-semibold tabular-nums',
-                  move < 0 ? 'text-rose-600' : 'text-emerald-600',
-                )}
-              >
-                {fmtPct(move)}
-              </span>
-            ) : null}
-          </DialogTitle>
-          <DialogDescription className="text-[12px] text-muted-foreground">
-            Research · notification · share image. Close (X) returns to the
-            episode desk tab.
-            {companyName && companyName !== ticker ? ` · ${companyName}` : ''}
-          </DialogDescription>
-        </DialogHeader>
+  const headerTitle = (
+    <>
+      {flowTitle(payload?.kind)} · {ticker}
+      {move != null ? (
+        <span
+          className={cn(
+            'ml-2 text-sm font-semibold tabular-nums',
+            move < 0 ? 'text-rose-600' : 'text-emerald-600',
+          )}
+        >
+          {fmtPct(move)}
+        </span>
+      ) : null}
+    </>
+  )
 
-        <div className="grid min-h-0 flex-1 grid-cols-1 divide-y divide-border overflow-hidden lg:grid-cols-3 lg:divide-x lg:divide-y-0">
+  const headerDescription = (
+    <>
+      Research · notification · share image
+      {isPanel
+        ? '. Edit / Share opens Trigger.'
+        : '. Close (X) returns to the episode desk tab.'}
+      {companyName && companyName !== ticker ? ` · ${companyName}` : ''}
+    </>
+  )
+
+  const bodyGrid = (
+        <div
+          className={cn(
+            'grid min-h-0 flex-1 grid-cols-1 divide-y divide-border overflow-hidden',
+            isPanel
+              ? 'lg:grid-cols-1 xl:grid-cols-3 xl:divide-x xl:divide-y-0'
+              : 'lg:grid-cols-3 lg:divide-x lg:divide-y-0',
+          )}
+        >
           {/* ── 1 · Perplexity: findings TOP, prompt below ── */}
           <div className="flex min-h-0 flex-col overflow-hidden">
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
@@ -908,6 +943,58 @@ export function SofarResearchShareDialog({
             </div>
           </div>
         </div>
+  )
+
+  if (!open || !ticker) return null
+
+  if (isPanel) {
+    return (
+      <div
+        className={cn(
+          'flex h-full min-h-0 flex-col overflow-hidden bg-background',
+          className,
+        )}
+      >
+        <div className="shrink-0 border-b border-border px-4 py-3 pr-3 text-left">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-base font-semibold leading-snug">
+                {headerTitle}
+              </p>
+              <p className="mt-0.5 text-[12px] text-muted-foreground">
+                {headerDescription}
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="size-7 shrink-0"
+              aria-label="Close research panel"
+              onClick={() => onOpenChange(false)}
+            >
+              <X className="size-3.5" />
+            </Button>
+          </div>
+        </div>
+        {bodyGrid}
+      </div>
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
+      <DialogContent
+        showCloseButton
+        className="fixed inset-0 z-50 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:max-w-none"
+      >
+        <DialogHeader className="shrink-0 border-b border-border px-5 py-3 pr-14 text-left">
+          <DialogTitle className="text-lg">{headerTitle}</DialogTitle>
+          <DialogDescription className="text-[12px] text-muted-foreground">
+            {headerDescription}
+          </DialogDescription>
+        </DialogHeader>
+        {bodyGrid}
       </DialogContent>
     </Dialog>
   )
