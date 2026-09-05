@@ -1,6 +1,6 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom'
 import { BottomToastProvider } from '@/components/ui/bottom-toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { SitePasscodeGate } from '@/components/SitePasscodeGate'
@@ -9,6 +9,8 @@ import { apiUrl, hasExternalApiBase } from '@/lib/apiBase'
 import './index.css'
 import EpisodePage from '@/pages/EpisodePage.tsx'
 import NotificationsPage from '@/pages/NotificationsPage.tsx'
+import PrivacyPage from '@/pages/PrivacyPage.tsx'
+import SupportPage from '@/pages/SupportPage.tsx'
 
 /**
  * When VITE_API_BASE_URL is set (Cloudflare Pages → remote Node API), rewrite
@@ -73,16 +75,25 @@ createRoot(document.getElementById('root')!).render(
     <TooltipProvider>
       <BottomToastProvider>
         <BrowserRouter>
-          <SitePasscodeGate>
-            <ServiceErrorGate>
-              <Routes>
-                <Route path="/" element={<EpisodePage />} />
-                <Route path="/trigger" element={<NotificationsPage />} />
-                <Route path="/notifications" element={<NotificationsPage />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-            </ServiceErrorGate>
-          </SitePasscodeGate>
+          <Routes>
+            {/* Public App Store / support pages — no passcode */}
+            <Route path="/privacy" element={<PrivacyPage />} />
+            <Route path="/support" element={<SupportPage />} />
+            <Route
+              element={
+                <SitePasscodeGate>
+                  <ServiceErrorGate>
+                    <Outlet />
+                  </ServiceErrorGate>
+                </SitePasscodeGate>
+              }
+            >
+              <Route path="/" element={<EpisodePage />} />
+              <Route path="/trigger" element={<NotificationsPage />} />
+              <Route path="/notifications" element={<NotificationsPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
         </BrowserRouter>
       </BottomToastProvider>
     </TooltipProvider>
