@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { ArrowLeft, ExternalLink, Globe, Mail, ShieldCheck, Trash2 } from 'lucide-react'
+import { ExternalLink, Globe, Mail, ShieldCheck, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 
 const CONTACTS = [
@@ -66,14 +66,7 @@ export default function SupportPage() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="sticky top-0 z-20 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-        <div className="mx-auto flex h-14 max-w-3xl items-center gap-3 px-4">
-          <a
-            href="https://9am.site"
-            className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            aria-label="Website"
-          >
-            <ArrowLeft className="size-5" />
-          </a>
+        <div className="mx-auto flex h-14 max-w-3xl items-center px-4">
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-semibold tracking-tight">Trigger</p>
             <p className="truncate text-xs text-muted-foreground">Support</p>
