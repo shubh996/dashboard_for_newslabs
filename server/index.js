@@ -68,7 +68,7 @@ app.use((req, res, next) => {
   )
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-Requested-With, X-Cron-Secret',
+    'Content-Type, Authorization, X-Requested-With, X-Cron-Secret, Cache-Control, Pragma',
   )
   res.setHeader('Access-Control-Max-Age', '86400')
   if (req.method === 'OPTIONS') {
