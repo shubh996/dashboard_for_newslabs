@@ -2461,6 +2461,45 @@ export const MONITOR_TABLE_DEVICE_CANDIDATES = [
 const MONITOR_TABLE_DEVICE = MONITOR_TABLE_DEVICE_CANDIDATES[0]
 const MONITOR_TABLE_PINNED = 'pinned_monitored_tickers'
 
+const DEVICE_MONITOR_COLUMNS = ['ticker', 'subscribers', 'updated_at', 'created_at', 'asset_class']
+
+/** Keep only columns that exist on assets_monitor_based_on_device. */
+function toDeviceMonitorRow(row) {
+  const out = {}
+  for (const k of DEVICE_MONITOR_COLUMNS) if (row && row[k] !== undefined) out[k] = row[k]
+  return out
+}
+
+/**
+ * Merge company_name / notable_price_movements from pinned_monitored_tickers by ticker.
+ * Optional: values are null when no pinned row exists or the lookup fails.
+ */
+async function mergePinnedMeta(supabase, rows) {
+  const list = Array.isArray(rows) ? rows : []
+  const meta = new Map()
+  const tickers = [...new Set(list.map((r) => r?.ticker).filter(Boolean))]
+  if (tickers.length) {
+    try {
+      const { data, error } = await supabase
+        .from(MONITOR_TABLE_PINNED)
+        .select('ticker, company_name, notable_price_movements')
+        .in('ticker', tickers)
+      if (error) console.warn('[notifications] pinned meta read failed:', error.message)
+      for (const p of data || []) meta.set(String(p.ticker).toUpperCase(), p)
+    } catch (e) {
+      console.warn('[notifications] pinned meta read failed:', e?.message || e)
+    }
+  }
+  return list.map((r) => {
+    const p = meta.get(String(r?.ticker || '').toUpperCase())
+    return {
+      ...r,
+      company_name: p?.company_name ?? null,
+      notable_price_movements: p?.notable_price_movements ?? null,
+    }
+  })
+}
+
 /**
  * Read ticker/subscriber rows from the first monitor table that exists.
  * @param {import('@supabase/supabase-js').SupabaseClient} supabase
@@ -4765,9 +4804,9 @@ export function createNotificationsRouter({ getSupabase }) {
         let lastError = null
         for (const row of candidates) {
           const result = await supabase
-            .from('device_monitor')
-            .insert(row)
-            .select('ticker, company_name, created_at, updated_at')
+            .from(MONITOR_TABLE_DEVICE)
+            .insert(toDeviceMonitorRow(row))
+            .select('ticker, created_at, updated_at')
             .limit(1)
           if (!result.error) {
             data = result.data
@@ -5696,7 +5735,7 @@ export function createNotificationsRouter({ getSupabase }) {
 
         const supabase = getSupabase()
         const { data, error } = await supabase
-          .from('device_monitor')
+          .from(MONITOR_TABLE_DEVICE)
           .select('ticker, subscribers')
         if (error) throw error
 
@@ -5728,7 +5767,7 @@ export function createNotificationsRouter({ getSupabase }) {
 
           const nextSubs = subs.filter((sub) => !matchSub(sub))
           const { error: upErr } = await supabase
-            .from('device_monitor')
+            .from(MONITOR_TABLE_DEVICE)
             .update({
               subscribers: nextSubs,
               updated_at: new Date().toISOString(),
@@ -6266,7 +6305,7 @@ export function createNotificationsRouter({ getSupabase }) {
         }
 
         const { data: rows, error: rowsError } = await supabase
-          .from('device_monitor')
+          .from(MONITOR_TABLE_DEVICE)
           .select('subscribers')
         if (rowsError) throw rowsError
 
@@ -6483,10 +6522,11 @@ export function createNotificationsRouter({ getSupabase }) {
     async alertTriggerDigest(request, response) {
       try {
         const supabase = getSupabase()
-        const { data: rows, error } = await supabase
-          .from('device_monitor')
-          .select('ticker, subscribers, notable_price_movements')
+        const { data: rawRows, error } = await supabase
+          .from(MONITOR_TABLE_DEVICE)
+          .select('ticker, subscribers')
         if (error) throw error
+        const rows = await mergePinnedMeta(supabase, rawRows)
 
         let recipients = collectPushRecipients(rows || [], 'trigger')
         const selectedIds = Array.isArray(request.body?.device_ids)
@@ -6659,18 +6699,19 @@ export function createNotificationsRouter({ getSupabase }) {
 
         const supabase = getSupabase()
         let { data: rows, error } = await supabase
-          .from('device_monitor')
-          .select('ticker, company_name, subscribers, notable_price_movements')
+          .from(MONITOR_TABLE_DEVICE)
+          .select('ticker, subscribers')
           .eq('ticker', ticker)
 
         if (error) throw error
         if (!rows?.length) {
           ;({ data: rows, error } = await supabase
-            .from('device_monitor')
-            .select('ticker, company_name, subscribers, notable_price_movements')
+            .from(MONITOR_TABLE_DEVICE)
+            .select('ticker, subscribers')
             .ilike('ticker', ticker))
           if (error) throw error
         }
+        rows = await mergePinnedMeta(supabase, rows)
 
         // Non-monitored Extreme/Pinned tickers: still build copy from body.event / company_name.
         const hasEventBody =
@@ -6711,7 +6752,7 @@ export function createNotificationsRouter({ getSupabase }) {
         let recipients = collectPushRecipients(rows, appKey)
         if (allRecipients) {
           const { data: allRows, error: allError } = await supabase
-            .from('device_monitor')
+            .from(MONITOR_TABLE_DEVICE)
             .select('subscribers')
           if (allError) throw allError
           recipients = collectPushRecipients(allRows || [], appKey)
@@ -6759,18 +6800,19 @@ export function createNotificationsRouter({ getSupabase }) {
 
         const supabase = getSupabase()
         let { data: rows, error } = await supabase
-          .from('device_monitor')
-          .select('ticker, company_name, subscribers, notable_price_movements')
+          .from(MONITOR_TABLE_DEVICE)
+          .select('ticker, subscribers')
           .eq('ticker', ticker)
 
         if (error) throw error
         if (!rows?.length) {
           ;({ data: rows, error } = await supabase
-            .from('device_monitor')
-            .select('ticker, company_name, subscribers, notable_price_movements')
+            .from(MONITOR_TABLE_DEVICE)
+            .select('ticker, subscribers')
             .ilike('ticker', ticker))
           if (error) throw error
         }
+        rows = await mergePinnedMeta(supabase, rows)
 
         const selectedIds = Array.isArray(request.body?.device_ids)
           ? request.body.device_ids.map((id) => String(id || '').trim()).filter(Boolean)
@@ -6804,7 +6846,7 @@ export function createNotificationsRouter({ getSupabase }) {
         let recipients = collectPushRecipients(rows, appKey)
         if (allRecipients || (!recipients.length && (selectedIds.length || selectedTokens.length))) {
           const { data: allRows, error: allError } = await supabase
-            .from('device_monitor')
+            .from(MONITOR_TABLE_DEVICE)
             .select('subscribers')
           if (allError) throw allError
           recipients = collectPushRecipients(allRows || [], appKey)
@@ -8213,7 +8255,7 @@ export function createNotificationsRouter({ getSupabase }) {
         const days = Math.min(90, Math.max(1, Number(request.query?.days) || 30))
         const supabase = getSupabase()
         const { data: rows, error } = await supabase
-          .from('device_monitor')
+          .from(MONITOR_TABLE_PINNED)
           .select('ticker, notable_price_movements')
         if (error) throw error
         const daily = aggregateGeminiSpendByDay(rows || [], { days })
@@ -8360,10 +8402,11 @@ export function createNotificationsRouter({ getSupabase }) {
         }
         runId = runRow.id
 
-        const { data: rows, error: listErr } = await supabase
-          .from('device_monitor')
-          .select('ticker, company_name, subscribers, notable_price_movements')
+        const { data: rawListRows, error: listErr } = await supabase
+          .from(MONITOR_TABLE_DEVICE)
+          .select('ticker, subscribers')
         if (listErr) throw listErr
+        const rows = await mergePinnedMeta(supabase, rawListRows)
 
         const tickers = []
         for (const row of rows || []) {
