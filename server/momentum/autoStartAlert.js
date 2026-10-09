@@ -221,7 +221,7 @@ export async function researchStartMove(input) {
 
   const preferredModel =
     String(process.env.PERPLEXITY_MODEL || '').trim() ||
-    'perplexity/deepseek-v4-flash-0731'
+    'openai/gpt-6-luna'
   const maxOutputTokens = geminiMaxOutputTokens()
 
   let result

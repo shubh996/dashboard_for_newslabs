@@ -74,7 +74,7 @@ function perplexityFinanceUrl(ticker) {
 
 /**
  * Perplexity Agent API — multi-provider models with web_search tool.
- * Model default: perplexity/deepseek-v4-flash-0731
+ * Model default: openai/gpt-6-luna
  *
  * Endpoint: POST https://api.perplexity.ai/v1/agent
  * (NOT legacy /chat/completions Sonar-only path)
@@ -91,8 +91,8 @@ export async function callPerplexityResearch({
     String(
       model ||
         process.env.PERPLEXITY_MODEL ||
-        'perplexity/deepseek-v4-flash-0731',
-    ).trim() || 'perplexity/deepseek-v4-flash-0731'
+        'openai/gpt-6-luna',
+    ).trim() || 'openai/gpt-6-luna'
   const url = 'https://api.perplexity.ai/v1/agent'
   // Keep Agent "instructions" short; full rules live in the user prompt (INSTRUCTIONS → OUTPUT → INPUT).
   const instructions = [
@@ -106,7 +106,7 @@ export async function callPerplexityResearch({
     model: resolvedModel,
     input: String(prompt || ''),
     instructions,
-    tools: [{ type: 'web_search' }],
+    tools: [{ type: 'web_search', search_type: 'fast' }],
     max_output_tokens: Math.min(Math.max(Number(maxTokens) || 4096, 256), 8192),
     tool_choice: 'auto',
   }
@@ -7629,7 +7629,7 @@ export function createNotificationsRouter({ getSupabase }) {
         const preferredModel =
           String(
             process.env.PERPLEXITY_MODEL || request.body?.model || '',
-          ).trim() || 'perplexity/deepseek-v4-flash-0731'
+          ).trim() || 'openai/gpt-6-luna'
 
         if (phase === 'prepare') {
           response.json({

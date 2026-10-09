@@ -10442,13 +10442,13 @@ export function EpisodeDashboard({
             ? {
                 ...s,
                 status: 'done',
-                detail: `${builtPrompt.length.toLocaleString()} chars · ${prep.model || 'perplexity/deepseek-v4-flash-0731'}`,
+                detail: `${builtPrompt.length.toLocaleString()} chars · ${prep.model || 'openai/gpt-6-luna'}`,
               }
             : s.id === 'call_perplexity'
               ? {
                   ...s,
                   status: 'running',
-                  detail: `POST /v1/agent · ${prep.model || 'perplexity/deepseek-v4-flash-0731'}`,
+                  detail: `POST /v1/agent · ${prep.model || 'openai/gpt-6-luna'}`,
                 }
               : s,
         ),
@@ -10505,7 +10505,7 @@ export function EpisodeDashboard({
         model:
           body.model_version ||
           body.model ||
-          'perplexity/deepseek-v4-flash-0731',
+          'openai/gpt-6-luna',
         provider: body.provider || 'perplexity',
         request_id: body.request_id ?? null,
         tokens: body.tokens ?? {
@@ -10557,7 +10557,7 @@ export function EpisodeDashboard({
                 model:
                   body.model_version ||
                   body.model ||
-                  'perplexity/deepseek-v4-flash-0731',
+                  'openai/gpt-6-luna',
                 citations: Array.isArray(body.citations)
                   ? body.citations
                   : [],
@@ -18021,7 +18021,7 @@ export function EpisodeDashboard({
                         </p>
                         <p className="font-mono text-[10px] text-muted-foreground">
                           {alertResearchMeta.model ||
-                            'perplexity/deepseek-v4-flash-0731'}
+                            'openai/gpt-6-luna'}
                         </p>
                         {alertResearchMeta.request_id ? (
                           <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">
